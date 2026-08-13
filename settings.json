@@ -1,0 +1,19 @@
+{
+  "llm": {
+    "base_url": "https://api.deepseek.com",
+    "api_key": "",
+    "default_model": "deepseek-v4-pro",
+    "observer_model": "deepseek-v4-pro"
+  },
+  "docker": {
+    "image_name": "ctf-agent-solver",
+    "network_mode": "host",
+    "workspace_dir": "./workspace"
+  },
+  "solver": {
+    "max_rounds": 100,
+    "observer_every_rounds": 6,
+    "memory_limit": 10,
+    "idea_limit": 8
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "id": "swpuctf2024-no-gags02",
+  "name": "[SWPUCTF 2024 秋季新生赛]我没活儿整辣!",
+  "category": "web",
+  "difficulty": "difficult",
+  "description": "两关挑战。\n\n【第一关 index.php】\n- POST captcha=1476944489 即可通过，响应含：密码正确！下一关：/leve2.php\n- index.php 不下发 Set-Cookie，无 session 机制\n\n【第二关 leve2.php 源码】\nhighlight_file(__FILE__); if (isset($_GET['a'],$_GET['b'],$_POST['c'],$_POST['d'])) { if ($a!=$b && md5($a)==md5($b) && $c!=$d && md5($c)===md5($d)) echo $FLAG; else echo '没活儿'; } else echo '不传参';\n\n【已验证】\n- GET a=QNKCDZO&b=240610708 满足 0e 弱比较 ✓\n- array bypass c[]=1&d[]=2 无效（PHP 7.3 的 md5(array) 返回 false 而非 null，PHP 8 下返回 false 并报 TypeError，两者 === 比较均失败）\n- 服务器 PHP 版本为 PHP/7.3.33（X-Powered-By 响应头确认）\n\n【已知失败】\n- array bypass（PHP 8 无效）\n- requests files={'c':(None,c)} 方式：数据进入 $_FILES 而非 $_POST，isset 检查失败\n- 含 null byte 的 64 字节碰撞对：PHP $_POST 接收时截断于 null byte 导致 md5 不匹配",
+  "url": "http://node6.anna.nssctf.cn:26872/",
+  "flag_format": "NSSCTF{...}",
+  "attachments": [],
+  "hints": [
+    "第一关：POST index.php 加 captcha=1476944489，无需 session",
+    "第二关 a/b 用 0e 弱比较：GET a=QNKCDZO&b=240610708",
+    "第二关 c/d 需要真实 MD5 二进制碰撞（array bypass 在 PHP 7.3 和 PHP 8 均无效）",
+    "容器内用 fastcoll 生成碰撞对：/tmp/fastcoll -o /tmp/msg1.bin /tmp/msg2.bin，需无 null byte",
+    "传输方式：手动构造 multipart/form-data body（不能用 requests files={}，那会进入 $_FILES 而非 $_POST）",
+    "读取结果：只看 </code> 标签之后的内容，highlight_file 的源码着色输出中永远含有所有 echo 字符串"
+  ],
+  "submit_url": "",
+  "api_key": ""
+}

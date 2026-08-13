@@ -1,0 +1,10 @@
+# Python 依赖 — 精简版（不含 z3-solver，节省 ~100MB）
+# 当镜像体积超过 1GB 时切换到此文件：
+#   docker build --build-arg REQUIREMENTS=docker/requirements-slim.txt ...
+openai>=1.0.0
+pwntools>=4.12.0
+pycryptodome>=3.20.0
+requests>=2.31.0
+gmpy2>=2.1.0
+factordb-pycli>=0.2.1
+owiener>=1.0.0

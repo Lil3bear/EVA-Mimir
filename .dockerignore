@@ -1,0 +1,42 @@
+# Git
+.git
+.gitignore
+
+# 开发记录（不进镜像）
+开发记录/
+docs/
+
+# 测试
+tests/
+
+# 本地配置（含密钥）
+settings.local.json
+.env
+
+# 运行日志
+run_log*
+workspace/
+
+# 构建产物
+agent.tar*
+*.tar
+*.tar.gz
+
+# Python 缓存
+__pycache__
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# Host 进程（不在容器内运行）
+host/
+
+# 调试文件
+debug_*.py
+exploit_*.py
+
+# README（不需要在容器内）
+README.md
