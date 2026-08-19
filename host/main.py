@@ -28,7 +28,7 @@ def load_challenge(challenge_path: Path) -> ChallengeConfig:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="CTF Agent - Host 主进程")
+    parser = argparse.ArgumentParser(description="EVA-Mimir - Host 主进程")
     parser.add_argument("--challenge", required=True, help="challenge.json 路径")
     parser.add_argument("--build", action="store_true", help="强制重新构建 Docker 镜像")
     args = parser.parse_args()
@@ -44,16 +44,16 @@ def main():
     config = load_challenge(challenge_path)
     workspace_dir = Path(settings.get("docker", {}).get("workspace_dir", "./workspace")).resolve()
     skills_dir = project_root / "skills"
-    image_name = settings.get("docker", {}).get("image_name", "ctf-agent-solver")
+    image_name = settings.get("docker", {}).get("image_name", "eva-mimir-solver")
 
     # 初始化题目工作目录
     challenge_dir = workspace_dir / config.id
     challenge_dir.mkdir(parents=True, exist_ok=True)
     store.save_challenge_config(workspace_dir, config)
 
-    print(f"[CTF Agent] 题目：{config.name} ({config.category} / {config.difficulty})")
-    print(f"[CTF Agent] 目标：{config.url}")
-    print(f"[CTF Agent] 工作目录：{challenge_dir}")
+    print(f"[EVA-Mimir] 题目：{config.name} ({config.category} / {config.difficulty})")
+    print(f"[EVA-Mimir] 目标：{config.url}")
+    print(f"[EVA-Mimir] 工作目录：{challenge_dir}")
 
     # 构建 Docker 镜像
     from host.docker_manager import DockerManager
@@ -81,7 +81,7 @@ def main():
     # 初始化日志文件（UTF-8，带时间戳）
     log_path = project_root / f"run_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
     log_file = open(log_path, "w", encoding="utf-8", buffering=1)
-    print(f"[CTF Agent] 日志文件：{log_path}")
+    print(f"[EVA-Mimir] 日志文件：{log_path}")
 
     def _log_event(event):
         log_file.write(serialize({"type": event.type, "data": event.data}))

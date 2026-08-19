@@ -121,7 +121,7 @@ class TUI:
             status = self._status
             round_num = self._round
         text = Text()
-        text.append("CTF Agent  ", style="bold cyan")
+        text.append("EVA-Mimir  ", style="bold cyan")
         text.append(f"{self.challenge_name}  ", style="bold white")
         text.append(f"轮次: {round_num}  ", style="dim")
         text.append(status, style="green" if "运行" in status else "yellow")

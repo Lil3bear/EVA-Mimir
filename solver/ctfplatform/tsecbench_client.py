@@ -151,7 +151,7 @@ class TsecbenchClient:
         base_url: str,
         token: str,
         *,
-        timeout: float = 60.0,
+        timeout: float = 15.0,
         vpn_check_url: str = DEFAULT_VPN_CHECK_URL,
         session: requests.Session | None = None,
     ) -> None:
@@ -167,7 +167,7 @@ class TsecbenchClient:
         self.base_url = base_url
         self.token = token
         self.timeout = timeout
-        self.start_timeout = 120.0  # start_challenge 可能需要更长时间启动容器
+        self.start_timeout = 90.0  # start_challenge 启动容器
         self.vpn_check_url = vpn_check_url
         self._session = session or requests.Session()
         self._owns_session = session is None

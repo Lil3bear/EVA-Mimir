@@ -1,4 +1,4 @@
-# CTF Agent — 自动化 CTF 攻防 Agent
+# EVA-Mimir — 自动化 CTF 攻防 Agent
 
 基于大语言模型的自动化 CTF 解题 Agent，支持 Web 漏洞挖掘、多阶段渗透等多种攻防场景。
 
@@ -65,7 +65,7 @@
 
 ```bash
 # 确保 docker/fastcoll 存在（linux/amd64 二进制）
-docker build -t ctf-agent -f docker/Dockerfile .
+docker build -t eva-mimir -f docker/Dockerfile .
 ```
 
 ### 2. 本地测试（单题模式）
@@ -98,7 +98,7 @@ python -m solver.main
 ### 4. 打包上传
 
 ```bash
-docker save -o agent.tar ctf-agent:latest
+docker save -o agent.tar eva-mimir:latest
 gzip agent.tar
 # 上传 agent.tar.gz（需 < 1GB）
 ```
@@ -121,7 +121,7 @@ Tsecbench 平台沙箱内无法直接访问公网，LLM API 地址需按以下�
 ## 项目结构
 
 ```
-CTF-agent/
+EVA-Mimir/
 ├── solver/              # Solver Agent（容器内运行）
 │   ├── agent.py         # 主循环：ReAct + 工具调用
 │   ├── main.py          # 入口：自动检测运行模式

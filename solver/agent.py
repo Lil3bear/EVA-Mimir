@@ -149,6 +149,16 @@ _PENTEST_EXTRA_ROUNDS = {
 }
 
 
+def _extract_content(msg) -> str:
+    """从 LLM 响应中提取文本内容，兼容 thinking 模型（reasoning_content）。"""
+    content = getattr(msg, "content", None)
+    if content:
+        return content
+    # thinking 模型（如 deepseek-v4-flash）将回复放在 model_extra 中
+    extra = getattr(msg, "model_extra", {}) or {}
+    return extra.get("reasoning_content", "") or ""
+
+
 class SolverAgent:
     def __init__(self, task: str, settings: dict, skills_dir: str):
         self.task = task
@@ -182,6 +192,7 @@ class SolverAgent:
         self.client = OpenAI(
             base_url=llm_cfg.get("base_url") or os.environ.get("LLM_BASE_URL", ""),
             api_key=llm_cfg.get("api_key") or os.environ.get("LLM_API_KEY", ""),
+            timeout=__import__("httpx2").Timeout(120.0, connect=15.0),
         )
         self.model = llm_cfg.get("default_model") or os.environ.get("LLM_MODEL", "deepseek-chat")
         # 摘要压缩用主模型 — 摘要质量直接影响压缩后的解题能力
@@ -191,6 +202,8 @@ class SolverAgent:
         self.messages: list[dict] = []
         self._pending_injections: list[str] = []  # 缓冲 observer 注入，下一轮开始时注入
         self.round = 0
+        self.solved = False  # 是否已解出全部 flag
+        self._stop_event = None  # Multi-Solver 用：另一个 Solver 解出时置位
         # 纠偏不服从检测
         self._last_correction: str | None = None
         self._last_correction_round: int = 0
@@ -226,6 +239,11 @@ class SolverAgent:
         consecutive_empty = 0
         while self.round < self.max_rounds:
             self.round += 1
+
+            # ━━ Multi-Solver：另一个 Solver 已解出，本实例停止 ━━
+            if self._stop_event is not None and self._stop_event.is_set():
+                _emit("agent_end", {"rounds": self.round, "reason": "multi_solver_other_won"})
+                return
 
             # ━━ 硬约束：无进展强制停止（代码层，不靠 Observer） ━━
             difficulty = self._extract_difficulty(self.task)
@@ -380,6 +398,7 @@ class SolverAgent:
             self._write_history()
 
             if solved:
+                self.solved = True
                 self.observer.on_agent_end()
                 _emit("agent_end", {"rounds": self.round, "reason": "solved"})
                 return
@@ -529,7 +548,7 @@ class SolverAgent:
                 tool_choice=None,
                 max_tokens=400,
             )
-            return resp.choices[0].message.content or "（摘要生成失败）"
+            return _extract_content(resp.choices[0].message) or "（摘要生成失败）"
         except Exception as e:
             # 兜底：摘要 LLM 调用失败时，用 Memory + Ideas 状态拼接最小可用摘要
             # 防止压缩后上下文完全丢失（"失忆"导致全题报废）
@@ -570,7 +589,7 @@ class SolverAgent:
         ]
 
         # 列出所有凭据类 memory
-        credentials = [m for m in memories if m.kind in ('credential', 'evidence', 'discovery')]
+        credentials = [m for m in memories if m.kind in ('evidence', 'fact')]
         if credentials:
             lines.append("\U0001f511 \u5df2\u83b7\u53d6\u7684\u51ed\u636e/\u53d1\u73b0\uff1a")
             for m in credentials:

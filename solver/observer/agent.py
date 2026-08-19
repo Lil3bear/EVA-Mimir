@@ -159,6 +159,15 @@ OBSERVER_SYSTEM_PROMPT = """你是 CTF 解题 Agent 的 Observer（旁路审查�
 2. Solver 是否在重复尝试同一个 patch 方案？如果 patch 后程序仍然失败，应该换 patch 位置或改变策略
 3. Solver 是否用了 ltrace/strace 进行动态分析？如果只做静态分析且卡住，建议动态分析
 
+## 计划对照审查（极重要）
+当 prompt 中包含「## 攻击计划」章节时，说明系统已为本题生成了专属攻击计划。
+你需要对照计划检查 Solver 的进度：
+
+1. **卡在某一步超过 10 轮**：如果 Solver 持续在计划第 N 步徘徊超过 10 轮，send_correction 指出「计划第 N 步已卡 10+ 轮，建议跳过该步先执行后续步骤，或换子方向」
+2. **跳过了关键步骤**：如果 Solver 跳过了计划中的关键步骤（如计划要求先做框架识别再做爆破，但 Solver 直接爆破），send_correction 提醒
+3. **某一步已被确认不可行**：如果计划中的某一步已被实证无效（如「框架识别」已确认是自研系统），用 memory_add 记录，不要再让 Solver 回到那一步
+4. **计划已完成但未找到 flag**：如果所有计划步骤都已尝试但未成功，send_correction 建议跳出计划框架，探索计划外的方向
+
 ## Output Contract
 无需改动时，直接回复 NO_CHANGE。
 有改动时，简短说明做了什么（1-3 句话）。
@@ -195,6 +204,21 @@ def _build_observer_prompt(recent_rounds: list[dict], challenge_dir: Path) -> st
     history_path = str((challenge_dir / ".solver-history.jsonl").resolve())
     lines.append(f"\n## history_path\n`{history_path}`")
 
+    # ━━ 读取攻击计划（如果存在）━━
+    plan_path = challenge_dir / ".attack-plan.json"
+    if plan_path.exists():
+        try:
+            import json
+            plan_data = json.loads(plan_path.read_text(encoding="utf-8"))
+            steps = plan_data.get("steps", [])
+            if steps:
+                lines.append("\n## 攻击计划（系统自动生成，请对照审查）")
+                for i, step in enumerate(steps, 1):
+                    lines.append(f"{i}. {step}")
+                lines.append("")
+        except Exception:
+            pass
+
     lines.append("\n## Solver 最近行为摘要")
     for r in recent_rounds[-6:]:
         round_num = r.get("round", "?")
@@ -228,7 +252,7 @@ def _build_observer_prompt(recent_rounds: list[dict], challenge_dir: Path) -> st
             keywords = []
             # IP 地址
             keywords.extend(re.findall(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', content))
-            # 密码/token/key 值
+            # 密码/token/key 值（key=value 格式）
             keywords.extend(re.findall(
                 r'(?:password|passwd|pwd|token|key|secret|密码|口令)[=：:\s]+([^\s,，。;；]+)',
                 content, re.IGNORECASE
@@ -238,6 +262,24 @@ def _build_observer_prompt(recent_rounds: list[dict], challenge_dir: Path) -> st
                 r'(?:user|username|用户名|账号)[=：:\s]+([^\s,，。;；]+)',
                 content, re.IGNORECASE
             ))
+            # user/password 格式（如 admin/admin123、root/toor）
+            # 匹配「单词/单词」的凭据对，并分别提取
+            cred_pairs = re.findall(r'([a-zA-Z0-9_]{2,20})/([a-zA-Z0-9_@!*#$%^&+=]{2,30})', content)
+            for u, p in cred_pairs:
+                keywords.append(u)
+                keywords.append(p)
+            # user:password 格式
+            cred_pairs2 = re.findall(r'([a-zA-Z0-9_]{2,20}):([a-zA-Z0-9_@!*#$%^&+=]{2,30})', content)
+            for u, p in cred_pairs2:
+                keywords.append(u)
+                keywords.append(p)
+            # 中文语境：凭据/泄露/密码/账号 后紧跟的单词（如「泄露 admin/admin123」）
+            cn_creds = re.findall(
+                r'(?:凭据|泄露|密码|口令|账号|默认)[：:\s]*([a-zA-Z0-9_/@!*#$%^&+=]{2,40})',
+                content
+            )
+            for c in cn_creds:
+                keywords.append(c)
             # URL 路径
             paths = re.findall(r'(/[a-zA-Z0-9_\-./]+)', content)
             keywords.extend([p for p in paths if len(p) > 3])
@@ -286,6 +328,7 @@ class ObserverAgent:
         self.client = OpenAI(
             base_url=llm_cfg.get("base_url") or os.environ.get("LLM_BASE_URL", ""),
             api_key=llm_cfg.get("api_key") or os.environ.get("LLM_API_KEY", ""),
+            timeout=__import__("httpx2").Timeout(60.0, connect=10.0),
         )
         self.model = llm_cfg.get("observer_model") or llm_cfg.get("default_model") or os.environ.get("LLM_MODEL", "deepseek-chat")
 
@@ -323,7 +366,7 @@ class ObserverAgent:
             messages.append(msg.model_dump(exclude_none=True))
 
             if not msg.tool_calls:
-                summary = msg.content or "NO_CHANGE"
+                summary = getattr(msg, "content", None) or getattr(msg, "model_extra", {}).get("reasoning_content", "") or "NO_CHANGE"
                 _emit("observer_end", {"summary": summary})
                 return summary
 

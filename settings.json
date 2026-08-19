@@ -6,7 +6,7 @@
     "observer_model": "deepseek-v4-pro"
   },
   "docker": {
-    "image_name": "ctf-agent-solver",
+    "image_name": "eva-mimir-solver",
     "network_mode": "host",
     "workspace_dir": "./workspace"
   },

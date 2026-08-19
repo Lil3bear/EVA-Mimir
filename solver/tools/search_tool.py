@@ -4,14 +4,15 @@
 使用独立的 LLM 接口做安全知识搜索，与 Solver 主模型分开配置。
 支持三种搜索后端（按优先级）：
 
-1. Kimi（moonshot-v1-auto）— 原生联网搜索，能获取真实 writeup
-2. DeepSeek（deepseek-chat）— 用模型训练知识回答，无联网
-3. 任意 OpenAI 兼容 API — 通过 settings.search_llm 配置
+1. Tavily — 真实搜索 API，CTF 友好，能提取代码块和 writeup
+2. Kimi（moonshot-v1-auto）— 原生联网搜索，能获取真实 writeup
+3. DeepSeek（deepseek-chat）— 用模型训练知识回答，无联网
 
 配置方式：
-  settings.json 中添加 search_llm 节（可选，不配则复用 llm 节）：
+  settings.json 中添加：
   {
-    "search_llm": {
+    "tavily_api_key": "tvly-xxx",                    // Tavily API key（优先）
+    "search_llm": {                                   // Kimi/DeepSeek fallback
       "base_url": "https://api.moonshot.cn/v1",
       "api_key": "sk-xxx",
       "model": "moonshot-v1-auto"
@@ -19,13 +20,22 @@
   }
 
   或环境变量：
-    SEARCH_LLM_BASE_URL, SEARCH_LLM_API_KEY, SEARCH_LLM_MODEL
+    TAVILY_API_KEY, SEARCH_LLM_BASE_URL, SEARCH_LLM_API_KEY, SEARCH_LLM_MODEL
 """
 
 import os
 from typing import Optional
 
 from openai import OpenAI
+
+def _msg_content(msg) -> str:
+    """从 LLM 消息中提取内容，兼容 thinking 模型。"""
+    c = getattr(msg, "content", None)
+    if c:
+        return c
+    extra = getattr(msg, "model_extra", {}) or {}
+    return extra.get("reasoning_content", "") or ""
+
 
 TOOL_DEF = {
     "type": "function",
@@ -64,23 +74,37 @@ _SEARCH_SYSTEM = (
 # 搜索专用 LLM 客户端（与 Solver 主模型独立）
 _search_client: Optional[OpenAI] = None
 _search_model: str = ""
-_search_source: str = ""  # 标记搜索来源（kimi/deepseek/custom）
+_search_source: str = ""  # 标记搜索来源
+
+# Tavily 客户端
+_tavily_api_key: str = ""
+_tavily_client = None
 
 
 def init(settings: dict) -> None:
-    global _search_client, _search_model, _search_source
+    global _search_client, _search_model, _search_source, _tavily_api_key, _tavily_client
 
-    # 优先使用独立的 search_llm 配置
+    # --- Tavily 配置 ---
+    _tavily_api_key = (
+        settings.get("tavily_api_key", "")
+        or os.environ.get("TAVILY_API_KEY", "")
+    )
+    if _tavily_api_key:
+        try:
+            from tavily import TavilyClient
+            _tavily_client = TavilyClient(api_key=_tavily_api_key)
+        except Exception:
+            _tavily_client = None
+
+    # --- Fallback: Kimi / DeepSeek ---
     search_cfg = settings.get("search_llm", {})
 
     if search_cfg.get("base_url") or os.environ.get("SEARCH_LLM_BASE_URL"):
-        # 有独立搜索 LLM 配置
         base_url = search_cfg.get("base_url") or os.environ.get("SEARCH_LLM_BASE_URL", "")
         api_key = search_cfg.get("api_key") or os.environ.get("SEARCH_LLM_API_KEY", "")
         _search_model = search_cfg.get("model") or os.environ.get("SEARCH_LLM_MODEL", "moonshot-v1-auto")
         _search_client = OpenAI(base_url=base_url, api_key=api_key)
 
-        # 判断来源
         if "moonshot" in base_url or "kimi" in base_url:
             _search_source = "kimi"
         elif "deepseek" in base_url:
@@ -88,7 +112,6 @@ def init(settings: dict) -> None:
         else:
             _search_source = "custom"
     else:
-        # fallback：复用 Solver 主 LLM 配置
         llm_cfg = settings.get("llm", {})
         base_url = llm_cfg.get("base_url") or os.environ.get("LLM_BASE_URL", "")
         api_key = llm_cfg.get("api_key") or os.environ.get("LLM_API_KEY", "")
@@ -101,67 +124,144 @@ def init(settings: dict) -> None:
         _search_source = "deepseek" if "deepseek" in base_url else "fallback"
 
 
-def search(args: dict) -> str:
-    query = args.get("query", "").strip()
-    if not query:
-        return "[错误] query 不能为空"
-    if _search_client is None:
-        return "[错误] search_tool 未初始化，请先调用 init(settings)"
-
-    # Kimi 支持联网搜索（通过 tool_choice 触发内置 web_search）
-    # DeepSeek/其他模型走纯知识查询
+def _search_tavily(query: str) -> Optional[str]:
+    """使用 Tavily 真实搜索，返回格式化结果。失败返回 None。"""
+    if _tavily_client is None:
+        return None
     try:
-        messages = [
-            {"role": "system", "content": _SEARCH_SYSTEM},
-            {"role": "user", "content": query},
-        ]
+        result = _tavily_client.search(
+            query,
+            search_depth="advanced",
+            include_raw_content=True,
+            max_results=5,
+        )
+        return _format_tavily_results(result)
+    except Exception:
+        return None
 
-        extra_kwargs = {}
-        if _search_source == "kimi":
-            extra_kwargs["tools"] = [{
-                "type": "builtin_function",
-                "function": {"name": "$web_search"},
-            }]
 
-        resp = _search_client.chat.completions.create(
+def _format_tavily_results(result: dict) -> str:
+    """把 Tavily 搜索结果格式化为 Solver 可用的文本。"""
+    parts = ["[Tavily 真实搜索]"]
+
+    answer = result.get("answer")
+    if answer:
+        parts.append(f"AI 摘要：{answer}")
+
+    results = result.get("results", [])
+    if results:
+        parts.append(f"\n搜索到 {len(results)} 个相关结果：")
+        for i, r in enumerate(results[:5], 1):
+            title = r.get("title", "无标题")
+            url = r.get("url", "")
+            content = r.get("content", "")
+            # 截断过长内容
+            if len(content) > 400:
+                content = content[:400] + "..."
+            parts.append(f"\n[{i}] {title}")
+            if url:
+                parts.append(f"    URL: {url}")
+            parts.append(f"    {content}")
+
+    return "\n".join(parts)
+
+
+def _search_kimi(query: str) -> str:
+    """使用 Kimi 联网搜索（两步：tool_calls → 最终回答）。"""
+    if _search_client is None:
+        return "[错误] search_tool 未初始化"
+
+    messages = [
+        {"role": "system", "content": _SEARCH_SYSTEM},
+        {"role": "user", "content": query},
+    ]
+    extra_kwargs = {
+        "tools": [{
+            "type": "builtin_function",
+            "function": {"name": "$web_search"},
+        }]
+    }
+
+    resp = _search_client.chat.completions.create(
+        model=_search_model,
+        messages=messages,
+        max_tokens=800,
+        **extra_kwargs,
+    )
+
+    msg = resp.choices[0].message
+
+    if msg.tool_calls:
+        messages.append(msg.model_dump(exclude_none=True))
+        for tc in msg.tool_calls:
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "name": tc.function.name,
+                "content": tc.function.arguments,
+            })
+        resp2 = _search_client.chat.completions.create(
             model=_search_model,
             messages=messages,
             max_tokens=800,
             **extra_kwargs,
         )
+        content = _msg_content(resp2.choices[0].message) or "（无结果）"
+    else:
+        content = _msg_content(msg) or "（无结果）"
 
-        msg = resp.choices[0].message
+    return f"[Kimi 联网搜索结果]\n{content}"
 
-        # Kimi 联网搜索是两步：
-        # 第一轮返回 tool_calls（搜索结果），需要塞回去让 Kimi 生成最终回答
-        if msg.tool_calls and _search_source == "kimi":
-            messages.append(msg.model_dump(exclude_none=True))
-            for tc in msg.tool_calls:
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "name": tc.function.name,
-                    "content": tc.function.arguments,
-                })
-            resp2 = _search_client.chat.completions.create(
-                model=_search_model,
-                messages=messages,
-                max_tokens=800,
-                **extra_kwargs,
-            )
-            content = resp2.choices[0].message.content or "（无结果）"
-        else:
-            content = msg.content or "（无结果）"
 
-        # 标记搜索来源，让 Solver 知道数据可信度
-        if _search_source == "kimi":
-            prefix = "[Kimi 联网搜索结果]"
-        elif _search_source == "deepseek":
-            prefix = "[DeepSeek 知识查询结果（非实时搜索）]"
-        else:
-            prefix = f"[{_search_source} 搜索结果]"
+def _search_llm(query: str) -> str:
+    """使用 DeepSeek / 其他 LLM 纯知识查询。"""
+    if _search_client is None:
+        return "[错误] search_tool 未初始化"
 
-        return f"{prefix}\n{content}"
+    messages = [
+        {"role": "system", "content": _SEARCH_SYSTEM},
+        {"role": "user", "content": query},
+    ]
 
-    except Exception as e:
-        return f"[错误] 搜索失败：{e}"
+    resp = _search_client.chat.completions.create(
+        model=_search_model,
+        messages=messages,
+        max_tokens=800,
+    )
+
+    content = _msg_content(resp.choices[0].message) or "（无结果）"
+
+    if _search_source == "deepseek":
+        prefix = "[DeepSeek 知识查询结果（非实时搜索）]"
+    else:
+        prefix = f"[{_search_source} 搜索结果]"
+
+    return f"{prefix}\n{content}"
+
+
+def search(args: dict) -> str:
+    query = args.get("query", "").strip()
+    if not query:
+        return "[错误] query 不能为空"
+
+    # 优先级 1: Tavily 真实搜索
+    if _tavily_client is not None:
+        tavily_result = _search_tavily(query)
+        if tavily_result is not None:
+            return tavily_result
+
+    # 优先级 2: Kimi 联网搜索
+    if _search_client is not None and _search_source == "kimi":
+        try:
+            return _search_kimi(query)
+        except Exception as e:
+            pass  # fall through to next
+
+    # 优先级 3: DeepSeek / 其他 LLM 知识查询
+    if _search_client is not None:
+        try:
+            return _search_llm(query)
+        except Exception as e:
+            return f"[错误] 搜索失败：{e}"
+
+    return "[错误] search_tool 未初始化，请先调用 init(settings)"

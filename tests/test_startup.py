@@ -26,7 +26,7 @@ class StartupTests(unittest.TestCase):
         self.assertNotIn("读取初始化文件失败", result.stdout)
 
     def test_build_reports_missing_fastcoll_before_calling_docker(self):
-        manager = DockerManager(image_name="ctf-agent-test", settings={})
+        manager = DockerManager(image_name="eva-mimir-test", settings={})
 
         with patch("host.docker_manager.subprocess.run") as run:
             with self.assertRaisesRegex(RuntimeError, "fastcoll"):

@@ -1,7 +1,6 @@
 import json
 import os
 import time
-import uuid
 from pathlib import Path
 from shared.types import ChallengeConfig, SubmissionRecord
 
@@ -37,7 +36,7 @@ def append_submission(workspace_dir: Path, challenge_id: str,
                       flag: str, correct: bool,
                       writeup: str = "", solver_id: str = "") -> SubmissionRecord:
     record = SubmissionRecord(
-        id=f"sub_{uuid.uuid4().hex[:8]}",
+        id=f"sub_{os.urandom(4).hex()}",
         flag=flag,
         correct=correct,
         submitted_at=time.time(),

@@ -2,7 +2,6 @@ import json
 import os
 import sys
 import time
-import uuid
 from pathlib import Path
 from contextlib import contextmanager
 from shared.types import IdeaRecord
@@ -74,7 +73,7 @@ def add_idea(challenge_dir: Path, content: str, source: str = "solver") -> IdeaR
                 return IdeaRecord(**idea)
         now = time.time()
         idea = IdeaRecord(
-            id=f"idea_{uuid.uuid4().hex[:8]}",
+            id=f"idea_{os.urandom(4).hex()}",
             content=content,
             status="pending",
             created_at=now,

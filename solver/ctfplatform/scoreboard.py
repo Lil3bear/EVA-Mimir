@@ -125,7 +125,7 @@ class Scoreboard:
         running_str = ", ".join(running_codes) if running_codes else "无"
 
         lines = [
-            f"# 📊 CTF Agent 实时看板",
+            f"# 📊 EVA-Mimir 实时看板",
             f"",
             f"> 更新: {now} | 已运行: {elapsed_str}",
             f"",

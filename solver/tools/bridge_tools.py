@@ -1,5 +1,5 @@
 import sys
-import uuid
+import os
 import threading
 from typing import Any
 
@@ -43,7 +43,7 @@ def register_response(request_id: str, response: dict) -> None:
 
 
 def _request_bridge(action: str, params: dict, timeout: float = 30.0) -> dict:
-    request_id = uuid.uuid4().hex[:8]
+    request_id = os.urandom(4).hex()
     done = threading.Event()
     with _lock:
         _pending[request_id] = done

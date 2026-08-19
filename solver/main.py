@@ -85,6 +85,27 @@ def _run_tsecbench_mode() -> None:
         sys.exit(1)
     _emit("llm_config", {"base_url": llm_url, "model": llm_cfg.get("default_model", "deepseek-chat")})
 
+    # ━━ LLM 连通性测试 ━━
+    _emit("llm_probe", {"status": "testing", "url": llm_url})
+    try:
+        import httpx2 as httpx
+        from openai import OpenAI
+        probe_client = OpenAI(
+            base_url=llm_url,
+            api_key=llm_key,
+            timeout=httpx.Timeout(10.0, connect=8.0),
+        )
+        probe_model = llm_cfg.get("default_model") or os.environ.get("LLM_MODEL", "deepseek-chat")
+        probe_resp = probe_client.chat.completions.create(
+            model=probe_model,
+            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=4,
+        )
+        probe_content = getattr(probe_resp.choices[0].message, "content", None) or getattr(probe_resp.choices[0].message, "model_extra", {}).get("reasoning_content", "")
+        _emit("llm_probe_ok", {"model": probe_model, "response": (probe_content or "")[:50]})
+    except Exception as e:
+        _emit("llm_probe_fail", {"url": llm_url, "error": str(e), "type": type(e).__name__})
+
     workspace_dir = os.environ.get("CTF_WORKSPACE", "/workspace")
     skills_dir = os.environ.get("CTF_SKILLS_DIR", "/skills")
     os.environ.setdefault("CTF_WORKSPACE", workspace_dir)
@@ -101,6 +122,9 @@ def _run_tsecbench_mode() -> None:
     max_parallel = settings.get('solver', {}).get('max_parallel', 3)
     if os.environ.get('SOLVER_MAX_PARALLEL'):
         max_parallel = int(os.environ['SOLVER_MAX_PARALLEL'])
+
+    # 前缀过滤：只跑指定前缀的题目（如 SOLVER_PREFIX_FILTER=b- 只跑多阶段渗透）
+    prefix_filter = os.environ.get('SOLVER_PREFIX_FILTER', '').strip() or None
 
     # 多轮重跑参数
     total_timeout_min = int(os.environ.get('SOLVER_TOTAL_TIMEOUT', '350'))
@@ -155,6 +179,7 @@ def _run_tsecbench_mode() -> None:
             max_parallel=max_parallel,
             skip_completed=True,
             skip_codes=abandoned_codes | skip_hard_new,
+            prefix_filter=prefix_filter,
         )
 
         try:
@@ -275,6 +300,15 @@ def _load_settings_from_env() -> dict:
         llm["api_key"] = os.environ["LLM_API_KEY"]
     if os.environ.get("LLM_MODEL"):
         llm["default_model"] = os.environ["LLM_MODEL"]
+
+    # search_llm 配置
+    search_llm = settings.setdefault("search_llm", {})
+    if os.environ.get("SEARCH_LLM_BASE_URL"):
+        search_llm["base_url"] = os.environ["SEARCH_LLM_BASE_URL"]
+    if os.environ.get("SEARCH_LLM_API_KEY"):
+        search_llm["api_key"] = os.environ["SEARCH_LLM_API_KEY"]
+    if os.environ.get("SEARCH_LLM_MODEL"):
+        search_llm["model"] = os.environ["SEARCH_LLM_MODEL"]
 
     solver = settings.setdefault("solver", {})
     if os.environ.get("SOLVER_MAX_ROUNDS"):

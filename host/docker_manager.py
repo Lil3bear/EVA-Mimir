@@ -64,7 +64,7 @@ class DockerManager:
             "docker", "run", "--rm", "--interactive",
             "--platform", "linux/amd64",
             "--network", self.settings.get("network_mode", "host"),
-            "--name", f"ctf-agent-{self._solver_id}",
+            "--name", f"eva-mimir-{self._solver_id}",
             "-v", f"{project_root / 'shared'}:/opt/ctf-agent/shared:ro",
             "-v", f"{project_root / 'solver'}:/opt/ctf-agent/solver:ro",
             "-v", f"{project_root / 'prompts'}:/opt/ctf-agent/prompts:ro",
@@ -162,7 +162,7 @@ class DockerManager:
 
     def stop(self) -> None:
         if self._proc:
-            solver_name = f"ctf-agent-{self._solver_id}"
+            solver_name = f"eva-mimir-{self._solver_id}"
             subprocess.run(["docker", "stop", solver_name],
                            capture_output=True, timeout=15)
 

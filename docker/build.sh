@@ -4,11 +4,11 @@
 
 set -e
 
-IMAGE_NAME="ctf-agent"
+IMAGE_NAME="eva-mimir-solver"
 MAX_SIZE_MB=1024  # 1GB 限制
 
 echo "============================================"
-echo "  CTF Agent Docker 镜像构建"
+echo "  EVA-Mimir Docker 镜像构建"
 echo "============================================"
 
 # 确保 fastcoll-src 目录存在（即使为空也不影响构建）

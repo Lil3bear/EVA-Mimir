@@ -7,8 +7,8 @@ docker run --rm -it \
   -e LLM_BASE_URL="https://api.deepseek.com" \
   -e LLM_API_KEY="sk-xxx" \
   -e LLM_MODEL="deepseek-chat" \
-  -v D:/AgentProjectPractice/CTF-agent/tests/e2e_test.py:/tmp/e2e_test.py \
-  ctf-agent:latest \
+  -v D:/AgentProjectPractice/EVA-Mimir/tests/e2e_test.py:/tmp/e2e_test.py \
+  eva-mimir:latest \
   python3 /tmp/e2e_test.py
 """
 
@@ -93,7 +93,7 @@ main_mod._emit = _stderr_emit
 # ---- 运行 ----
 def main():
     print(f"{'='*60}", file=sys.stderr)
-    print(f"  CTF Agent 端到端测试", file=sys.stderr)
+    print(f"  EVA-Mimir 端到端测试", file=sys.stderr)
     print(f"  题目: {CHALLENGE_NAME}", file=sys.stderr)
     print(f"  目标: {TARGET_URL}", file=sys.stderr)
     print(f"  模型: {os.environ.get('LLM_MODEL', 'deepseek-chat')}", file=sys.stderr)

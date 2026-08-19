@@ -2,7 +2,6 @@ import json
 import os
 import sys
 import time
-import uuid
 from pathlib import Path
 from contextlib import contextmanager
 from shared.types import MemoryEntry
@@ -97,7 +96,7 @@ def add_memory(challenge_dir: Path, kind: str, content: str,
         return dup
 
     entry = MemoryEntry(
-        id=f"mem_{uuid.uuid4().hex[:8]}",
+        id=f"mem_{os.urandom(4).hex()}",
         kind=kind,
         content=content,
         created_at=time.time(),
