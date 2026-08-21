@@ -5,15 +5,17 @@ import time
 import threading
 from pathlib import Path
 
-from shared.jsonl import serialize, deserialize
+from shared.jsonl import deserialize, write_line
 from shared.bridge_types import SolverInitPayload
+from solver.runtime.settings import (
+    apply_llm_gateway as _apply_llm_gateway,
+    load_settings as _load_settings_from_env,
+)
 from solver.tools import bridge_tools
 
 
 def _emit(event_type: str, data=None) -> None:
-    msg = {"type": event_type, "data": data}
-    sys.stdout.write(serialize(msg))
-    sys.stdout.flush()
+    write_line({"type": event_type, "data": data})
 
 
 def _read_stdin_loop(agent) -> None:
@@ -71,31 +73,42 @@ def _run_tsecbench_mode() -> None:
     _emit("mode", {"mode": "tsecbench"})
 
     # 从环境变量读取 LLM 配置（比赛环境下可能通过环境变量传入）
-    settings = _load_settings_from_env()
+    try:
+        settings = _load_settings_from_env()
+    except ValueError as exc:
+        _emit("error", {"msg": f"配置加载失败：{exc}"})
+        sys.exit(1)
 
     # 验证 LLM 配置
     llm_cfg = settings.get("llm", {})
     llm_url = llm_cfg.get("base_url") or os.environ.get("LLM_BASE_URL", "")
     llm_key = llm_cfg.get("api_key") or os.environ.get("LLM_API_KEY", "")
-    if not llm_url or not llm_key:
+
+    # 托管模式：未配置 LLM_BASE_URL 时默认走 DeepSeek 平台网关（白名单内）
+    if not llm_url:
+        llm_url = "http://api.deepseek.com.tsecbench.gw/v1"
+        llm_cfg["base_url"] = llm_url
+
+    if not llm_key:
         _emit("error", {"msg": (
-            "LLM 配置缺失。请设置环境变量 LLM_BASE_URL 和 LLM_API_KEY。"
-            " 比赛环境网关地址示例：LLM_BASE_URL=http://api.deepseek.com.tsecbench.gw"
+            "LLM_API_KEY 未配置。请在平台运行时环境变量中添加：\n"
+            "  LLM_API_KEY=<你的大模型 API Key>\n"
+            "可选：LLM_MODEL=deepseek-v4-flash（默认已是）、LLM_GATEWAY=1（自动改写网关）。"
         )})
         sys.exit(1)
-    _emit("llm_config", {"base_url": llm_url, "model": llm_cfg.get("default_model", "deepseek-chat")})
+    _emit("llm_config", {"base_url": llm_url, "model": llm_cfg.get("default_model", "deepseek-v4-flash")})
 
     # ━━ LLM 连通性测试 ━━
     _emit("llm_probe", {"status": "testing", "url": llm_url})
     try:
-        import httpx2 as httpx
+        import httpx
         from openai import OpenAI
         probe_client = OpenAI(
             base_url=llm_url,
             api_key=llm_key,
             timeout=httpx.Timeout(10.0, connect=8.0),
         )
-        probe_model = llm_cfg.get("default_model") or os.environ.get("LLM_MODEL", "deepseek-chat")
+        probe_model = llm_cfg.get("default_model") or os.environ.get("LLM_MODEL", "deepseek-v4-flash")
         probe_resp = probe_client.chat.completions.create(
             model=probe_model,
             messages=[{"role": "user", "content": "ping"}],
@@ -245,13 +258,30 @@ def _run_tsecbench_mode() -> None:
     # 最终报告
     try:
         final_challenges = client.list_challenges()
-        total_score = sum(c.total_score for c in final_challenges if c.is_completed)
+        total_score = 0
+        for c in final_challenges:
+            if not c.is_completed:
+                continue
+            score_file = Path(workspace_dir) / c.unique_code / ".cumulative_score"
+            try:
+                total_score += int(score_file.read_text(encoding="utf-8").strip())
+            except Exception:
+                total_score += c.total_score
         total_solved = sum(1 for c in final_challenges if c.is_completed)
         total_count = len(final_challenges)
     except Exception:
+        # 任务结束后 list 接口会 invalid_state，改为从工作区落盘的实际得分统计
         total_score = 0
         total_solved = 0
         total_count = 63
+        try:
+            base = Path(workspace_dir)
+            if base.is_dir():
+                for score_file in base.glob("*/.cumulative_score"):
+                    total_score += int(score_file.read_text(encoding="utf-8").strip())
+                    total_solved += 1
+        except Exception:
+            pass
     finally:
         client.close()
 
@@ -271,52 +301,6 @@ def _run_tsecbench_mode() -> None:
     print(f"{'='*60}\n")
 
     sys.exit(0 if total_solved == total_count else 1)
-
-
-def _load_settings_from_env() -> dict:
-    """
-    从环境变量加载 settings（比赛环境下不走 settings.json）。
-    支持的环境变量：
-      LLM_BASE_URL, LLM_API_KEY, LLM_MODEL    → settings.llm
-      SOLVER_MAX_ROUNDS, SOLVER_OBSERVER_EVERY → settings.solver
-    也尝试从 /workspace/settings.json 或当前目录 settings.json 读取。
-    """
-    settings: dict = {}
-
-    # 优先从文件加载（settings.local.json 优先，不进版本控制）
-    for candidate in ["/workspace/settings.local.json", "/workspace/settings.json",
-                      "settings.local.json", "settings.json"]:
-        try:
-            settings = json.loads(Path(candidate).read_text(encoding="utf-8"))
-            break
-        except Exception:
-            continue
-
-    # 环境变量覆盖
-    llm = settings.setdefault("llm", {})
-    if os.environ.get("LLM_BASE_URL"):
-        llm["base_url"] = os.environ["LLM_BASE_URL"]
-    if os.environ.get("LLM_API_KEY"):
-        llm["api_key"] = os.environ["LLM_API_KEY"]
-    if os.environ.get("LLM_MODEL"):
-        llm["default_model"] = os.environ["LLM_MODEL"]
-
-    # search_llm 配置
-    search_llm = settings.setdefault("search_llm", {})
-    if os.environ.get("SEARCH_LLM_BASE_URL"):
-        search_llm["base_url"] = os.environ["SEARCH_LLM_BASE_URL"]
-    if os.environ.get("SEARCH_LLM_API_KEY"):
-        search_llm["api_key"] = os.environ["SEARCH_LLM_API_KEY"]
-    if os.environ.get("SEARCH_LLM_MODEL"):
-        search_llm["model"] = os.environ["SEARCH_LLM_MODEL"]
-
-    solver = settings.setdefault("solver", {})
-    if os.environ.get("SOLVER_MAX_ROUNDS"):
-        solver["max_rounds"] = int(os.environ["SOLVER_MAX_ROUNDS"])
-    if os.environ.get("SOLVER_OBSERVER_EVERY"):
-        solver["observer_every_rounds"] = int(os.environ["SOLVER_OBSERVER_EVERY"])
-
-    return settings
 
 
 def _run_bridge_mode() -> None:
@@ -373,6 +357,15 @@ def _run_bridge_mode() -> None:
     os.environ["CTF_CHALLENGE_ID"] = challenge_id
     os.environ["CTF_WORKSPACE"] = workspace_dir
     os.environ["CTF_SKILLS_DIR"] = skills_dir
+
+    from solver.worker_context import RunContext, ctx
+    ctx.configure(
+        RunContext.create(
+            workspace_dir,
+            challenge_id,
+            target_url=os.environ.get("CTF_TARGET_URL", ""),
+        )
+    )
 
     _emit("init_success", {"solver_id": solver_id, "challenge_id": challenge_id})
 

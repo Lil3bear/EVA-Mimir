@@ -1,0 +1,64 @@
+{
+  "version": 1,
+  "note": "跨 run 攻击链种子库。由 harvest_attack_chains.py 从 run 日志沉淀；只存解法方法（flag/IP 已剥离），不存答案。",
+  "by_code": {
+    "g-05": {
+      "code": "g-05",
+      "prefix": "g-",
+      "summary": "writeup: RSA 脚本错误：n = math.prod([getPrime(1024) for _ in range(2**0)]) 中 2**0=1，所以 n 只等于一个素数 p，没有模量乘积。此时 phi(n) = p-1 = n-1，用 d = inverse(e, n-1) 直接解密 c 得到 flag。题目作者误以为 2**0=2 生成两个素数，实为\"任何数 0 次方为 1\"。",
+      "time": 1787148768.9661226
+    },
+    "g-07": {
+      "code": "g-07",
+      "prefix": "g-",
+      "summary": "writeup: 加密脚本使用身份映射 + 每位偏移 i（类 Trithemius cipher / progressive Caesar）。解密时对每个字母 ch，计算 chi=(ch-'A' - i) mod 26 还原原字母，非字母保持不变。对 output.txt 中密文逐字符逆推得到明文 DID_YOU_KNOW_ABOUT_THE_TRITHEMIUS_CIPHER...，按要求用 HTB{...} 包",
+      "time": 1787148774.4512658
+    },
+    "g-08": {
+      "code": "g-08",
+      "prefix": "g-",
+      "summary": "writeup: script.sh 中 SSH 公钥尾部注释含 SSH 用户名，去掉 user@ 前缀后反转得到前半段 <flag>。无缝拼接两个碎片得完整 flag。",
+      "time": 1787148743.6179118
+    },
+    "g-09": {
+      "code": "g-09",
+      "prefix": "g-",
+      "summary": "writeup: 解包邮件 .eml 中的 onlineform.html 附件，其内含 URL 编码（unescape）嵌套的 VBScript。解码后获得恶意载荷：VBScript 通过 WMI 创建进程，从 standalone.htb 下载 form1.exe，并硬编码了 flag 字符串 <flag>。",
+      "time": 1787148774.5959852
+    },
+    "g-32": {
+      "code": "g-32",
+      "prefix": "g-",
+      "summary": "writeup: 下载附件 zip，解压得到二进制 stash。用 strings 扫描查找 HTB 关键字，在明文数据中发现 flag：<flag>。",
+      "time": 1787148844.7266095
+    },
+    "g-35": {
+      "code": "g-35",
+      "prefix": "g-",
+      "summary": "g-35 \"Flag Command\" 题 flag：<flag>（已通过 POST /api/monitor 发送 secret 选项 \"Blip-blop, in a pickle with a hiccup! Shmigg",
+      "time": 1787148883.3150234
+    }
+  },
+  "chains": {
+    "g-": [
+      {
+        "code": "g-09",
+        "prefix": "g-",
+        "summary": "writeup: 解包邮件 .eml 中的 onlineform.html 附件，其内含 URL 编码（unescape）嵌套的 VBScript。解码后获得恶意载荷：VBScript 通过 WMI 创建进程，从 standalone.htb 下载 form1.exe，并硬编码了 flag 字符串 <flag>。",
+        "time": 1787148774.5959852
+      },
+      {
+        "code": "g-32",
+        "prefix": "g-",
+        "summary": "writeup: 下载附件 zip，解压得到二进制 stash。用 strings 扫描查找 HTB 关键字，在明文数据中发现 flag：<flag>。",
+        "time": 1787148844.7266095
+      },
+      {
+        "code": "g-35",
+        "prefix": "g-",
+        "summary": "g-35 \"Flag Command\" 题 flag：<flag>（已通过 POST /api/monitor 发送 secret 选项 \"Blip-blop, in a pickle with a hiccup! Shmigg",
+        "time": 1787148883.3150234
+      }
+    ]
+  }
+}

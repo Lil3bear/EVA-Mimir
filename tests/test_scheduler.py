@@ -1,7 +1,9 @@
+import json
 import os
 import tempfile
 import unittest
 import threading
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from solver.ctfplatform.tsecbench_client import (
@@ -59,9 +61,19 @@ class BuildTaskTests(unittest.TestCase):
     def test_includes_target_url_from_container_addr(self):
         c = _make_challenge("web-01", description="SQL injection")
         task = _build_task_from_challenge(c, ("10.0.0.2:8080",))
-        self.assertIn("http://10.0.0.2:8080", task)
+        self.assertIn("10.0.0.2:8080", task)
+        self.assertIn("不保证是 HTTP", task)
         self.assertIn("SQL injection", task)
         self.assertIn("web-01", task)
+
+    def test_includes_every_container_address_without_guessing_protocol(self):
+        c = _make_challenge("service-01")
+        task = _build_task_from_challenge(
+            c, ("10.0.0.2:10086", "10.0.0.2:22")
+        )
+        self.assertIn("10.0.0.2:10086", task)
+        self.assertIn("10.0.0.2:22", task)
+        self.assertNotIn("http://10.0.0.2", task)
 
     def test_multi_flag_hint(self):
         c = _make_challenge("web-02", flag_count=3, correct_flag_count=1)
@@ -88,19 +100,25 @@ class BuildTaskTests(unittest.TestCase):
         c = _make_challenge("a-05")
         task = _build_task_from_challenge(c, ("10.0.0.1:80",))
         self.assertIn("Web", task)
-        self.assertIn("/skills/web/SKILL.md", task)
+        self.assertIn('skill_load(name="web")', task)
 
         # b- 前缀 → 多阶段渗透
         c = _make_challenge("b-01", flag_count=4)
         task = _build_task_from_challenge(c, ("10.0.0.2:80",))
         self.assertIn("渗透", task)
-        self.assertIn("/skills/pentest/SKILL.md", task)
+        self.assertIn('skill_load(name="pentest")', task)
 
-        # e1- 前缀 → 二进制/逆向
+        # C 类多入口或 SSH/Telnet 服务不能按纯 Web 处理
+        c = _make_challenge("c-07")
+        task = _build_task_from_challenge(c, ("10.0.0.4:23",))
+        self.assertIn("多服务渗透", task)
+        self.assertIn('skill_load(name="pentest")', task)
+
+        # e1- 前缀 → 渗透测试
         c = _make_challenge("e1-03")
         task = _build_task_from_challenge(c, ("10.0.0.3:80",))
-        self.assertIn("逆向", task)
-        self.assertIn("/skills/reverse/SKILL.md", task)
+        self.assertIn("渗透", task)
+        self.assertIn('skill_load(name="pentest")', task)
 
 
 class SchedulerTests(unittest.TestCase):
@@ -173,6 +191,28 @@ class SchedulerTests(unittest.TestCase):
         call_kwargs = mock_factory.call_args
         self.assertIn("web-01", call_kwargs.kwargs["task"])
 
+    def test_non_http_endpoint_reaches_agent(self):
+        challenges = [_make_challenge("c-07")]
+        completed = [_make_challenge("c-07", is_completed=True, correct_flag_count=1)]
+        client = self._make_mock_client(challenges)
+        client.start_challenge.return_value = StartResult(
+            unique_code="c-07", container_addr=("10.0.0.2:23",)
+        )
+        client.list_challenges.side_effect = [challenges, completed, completed]
+        mock_agent = MagicMock(round=2)
+        mock_factory = MagicMock(return_value=mock_agent)
+
+        report = Scheduler(
+            client,
+            settings={"llm": {}, "solver": {}},
+            agent_factory=mock_factory,
+            workspace_dir=self._tmpdir,
+        ).run_all()
+
+        self.assertEqual(report.solved, 1)
+        mock_agent.run.assert_called_once()
+        self.assertIn("10.0.0.2:23", mock_factory.call_args.kwargs["task"])
+
     def test_handles_start_invalid_state(self):
         """启动题目返回 invalid_state 时，重试耗尽后跳过该题。"""
         challenges = [_make_challenge("web-01")]
@@ -191,9 +231,143 @@ class SchedulerTests(unittest.TestCase):
         self.assertIn("active limit", report.results[0].error)
         client.close_challenge.assert_not_called()
 
+    def test_unexpected_error_after_start_still_closes_challenge(self):
+        challenge = _make_challenge("hard-01", difficulty="hard")
+        client = self._make_mock_client([challenge])
+        scheduler = Scheduler(
+            client,
+            settings={"llm": {}, "solver": {}},
+            workspace_dir=self._tmpdir,
+            close_retry_interval=0,
+        )
+
+        with patch.object(
+            scheduler, "_attempt_multi_solver", side_effect=RuntimeError("boom")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                scheduler._attempt_challenge(challenge)
+
+        client.close_challenge.assert_called_once_with("hard-01")
+        self.assertNotIn("hard-01", scheduler._active_codes)
+
+    def test_multi_solver_elects_one_observer(self):
+        challenge = _make_challenge("hard-01", difficulty="hard")
+        client = self._make_mock_client([challenge])
+        created_settings = []
+
+        def factory(**kwargs):
+            created_settings.append(kwargs["settings"])
+            return MagicMock(solved=False, round=1)
+
+        scheduler = Scheduler(
+            client,
+            settings={"llm": {}, "solver": {}},
+            agent_factory=factory,
+            workspace_dir=self._tmpdir,
+        )
+        workspace = os.path.join(self._tmpdir, challenge.unique_code)
+
+        scheduler._attempt_multi_solver(
+            challenge,
+            ("10.0.0.2:8080",),
+            workspace,
+            challenge.unique_code,
+            "10.0.0.2:8080",
+        )
+
+        enabled = [s["solver"]["observer_enabled"] for s in created_settings]
+        self.assertCountEqual(enabled, [True, False])
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AttackChainTests(unittest.TestCase):
+    """攻击链持久化与注入：sanitize、by_code 存储、同题精确注入优先级。"""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp(prefix="test-chain-")
+        self._old_ws = os.environ.get("CTF_WORKSPACE")
+        os.environ["CTF_WORKSPACE"] = self._tmpdir
+
+    def tearDown(self):
+        if self._old_ws is None:
+            os.environ.pop("CTF_WORKSPACE", None)
+        else:
+            os.environ["CTF_WORKSPACE"] = self._old_ws
+
+    def _make_skills_dir(self, seed: dict) -> str:
+        skills = os.path.join(self._tmpdir, "skills")
+        ref = os.path.join(skills, "experiences", "references")
+        os.makedirs(ref, exist_ok=True)
+        with open(os.path.join(ref, "attack-chains.json"), "w", encoding="utf-8") as f:
+            json.dump(seed, f, ensure_ascii=False)
+        return skills
+
+    def test_sanitize_strips_flag_and_ip(self):
+        from solver.ctfplatform.scheduler import _sanitize_chain_text
+        text = "访问 10.0.162.64:80 后台 /admin，提交 flag{abc123} 得分"
+        out = _sanitize_chain_text(text)
+        self.assertNotIn("flag{abc123}", out)
+        self.assertNotIn("10.0.162.64", out)
+        self.assertIn("<flag>", out)
+        self.assertIn("<IP>", out)
+
+    def test_save_stores_by_code_and_sanitizes(self):
+        import json as _json
+        from solver.ctfplatform.scheduler import _save_attack_chain, _CHAIN_STORE_FILE
+        ws = Path(self._tmpdir) / "a-18"
+        (ws / "ideas").mkdir(parents=True)
+        (ws / "ideas" / "index.json").write_text(_json.dumps([
+            {"content": "后台弱口令 admin/admin123 登录 10.0.1.5 拿 flag{real_one} 后提权", "status": "verified"}
+        ]), encoding="utf-8")
+        _save_attack_chain(str(ws), "a-18", True)
+        store = _json.loads((Path(self._tmpdir) / _CHAIN_STORE_FILE).read_text(encoding="utf-8"))
+        entry = store["by_code"]["a-18"]
+        self.assertIn("admin/admin123", entry["summary"])
+        self.assertNotIn("flag{real_one}", entry["summary"])
+        self.assertNotIn("10.0.1.5", entry["summary"])
+
+    def test_exact_code_seed_takes_priority(self):
+        from solver.ctfplatform.scheduler import _load_recent_chain
+        skills = self._make_skills_dir({
+            "by_code": {"a-18": {"code": "a-18", "prefix": "a-", "summary": "历史解法XYZ", "time": 1}},
+            "chains": {"a-": [{"code": "a-01", "prefix": "a-", "summary": "同类解法", "time": 1}]},
+        })
+        text = _load_recent_chain("a-18", skills)
+        self.assertIn("本题历史解法", text)
+        self.assertIn("历史解法XYZ", text)
+
+    def test_prefix_fallback_from_seed(self):
+        from solver.ctfplatform.scheduler import _load_recent_chain
+        skills = self._make_skills_dir({
+            "by_code": {},
+            "chains": {"a-": [{"code": "a-01", "prefix": "a-", "summary": "同类解法ABC", "time": 1}]},
+        })
+        text = _load_recent_chain("a-18", skills)
+        self.assertIn("同类题经验", text)
+        self.assertIn("同类解法ABC", text)
+
+    def test_extract_successful_writeups_from_journal(self):
+        import json as _json
+        from solver.ctfplatform.scheduler import _extract_successful_writeups
+        ws = Path(self._tmpdir) / "f2-05"
+        ws.mkdir(parents=True)
+        events = [
+            {"type": "prepared", "run_id": "r1", "call_id": "c1", "tool": "challenge_submit_flag",
+             "args": {"flag": "flag{x}", "writeup": "登录接口 union 注入读 flags 表"}},
+            {"type": "completed", "run_id": "r1", "call_id": "c1", "tool": "challenge_submit_flag",
+             "result": "[✓] Flag 提交正确：flag{x}，本次得分 300"},
+            {"type": "prepared", "run_id": "r1", "call_id": "c2", "tool": "challenge_submit_flag",
+             "args": {"flag": "flag{y}", "writeup": "猜的"}},
+            {"type": "completed", "run_id": "r1", "call_id": "c2", "tool": "challenge_submit_flag",
+             "result": "[✗] Flag 提交错误"},
+        ]
+        (ws / ".execution-journal.jsonl").write_text(
+            "\n".join(_json.dumps(e, ensure_ascii=False) for e in events), encoding="utf-8")
+        writeups = _extract_successful_writeups(ws)
+        self.assertEqual(writeups, ["登录接口 union 注入读 flags 表"])
 
 
 class ParallelSchedulerTests(unittest.TestCase):
@@ -603,4 +777,3 @@ class ParallelSchedulerTests(unittest.TestCase):
         self.assertEqual(report.attempted, 2)
         started_codes = {c.args[0] for c in client.start_challenge.call_args_list}
         self.assertNotIn("web-02", started_codes)
-

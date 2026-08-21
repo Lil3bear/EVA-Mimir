@@ -2,14 +2,18 @@ import subprocess
 import os
 import re
 import hashlib
+import shlex
 from collections import Counter
+from urllib.parse import urlsplit
 
 from solver.worker_context import ctx as _ctx
+from solver.tools import knowledge_router
 
 # 常量
 _DEDUP_WINDOW = 10
 _DEDUP_WARN_THRESHOLD = 3
-_APPROACH_WARN_THRESHOLD = 5
+_APPROACH_WARN_THRESHOLD = 3
+_APPROACH_BLOCK_THRESHOLD = 3
 _HOST_FAIL_WARN_THRESHOLD = 3
 
 
@@ -100,6 +104,32 @@ def _extract_host(cmd: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _target_hostname(target_url: str | None = None) -> str:
+    """Return the configured target host without doing DNS resolution."""
+    value = (target_url if target_url is not None else _ctx.target_url).strip()
+    if not value:
+        return ""
+    try:
+        return urlsplit(value if "://" in value else f"//{value}").hostname or ""
+    except ValueError:
+        return ""
+
+
+def _inline_http_variant_count(cmd: str) -> int:
+    """Count values in a shell ``for ... in ...`` loop that drives HTTP calls."""
+    if "curl" not in cmd.lower() or not re.search(r'https?://', cmd, re.IGNORECASE):
+        return 1
+    match = re.search(
+        r'\bfor\s+[A-Za-z_]\w*\s+in\s+(.+?);\s*do\b', cmd, re.DOTALL
+    )
+    if not match:
+        return 1
+    try:
+        return max(1, len(shlex.split(match.group(1))))
+    except ValueError:
+        return 1
+
+
 def _is_connection_refused(output: str) -> bool:
     """判断 bash 输出是否表明目标不可达（Connection Refused / timeout）。"""
     patterns = [
@@ -124,6 +154,7 @@ TOOL_DEF = {
             "禁止 cd /root/workspace，所有文件操作都在当前目录进行。"
             "输出超长时会截断，截断提示里会给出完整结果的绝对路径，可用 grep/cat 查询。"
             "对于耗时较长的求解脚本（python3/sage），可设置 timeout 参数（最大 600 秒）。"
+            "同一 HTTP 请求结构最多执行 3 个变体；批量 shell 循环按循环值逐个计数，超限会被阻止。"
         ),
         "parameters": {
             "type": "object",
@@ -185,8 +216,19 @@ def execute(args: dict) -> str:
     approach_warn = ""
     url_pattern = _extract_url_pattern(cmd)
     if url_pattern:
-        _ctx.approach_counter[url_pattern] += 1
-        approach_count = _ctx.approach_counter[url_pattern]
+        variant_count = _inline_http_variant_count(cmd)
+        previous_count = _ctx.approach_counter[url_pattern]
+        approach_count = previous_count + variant_count
+        if approach_count > _APPROACH_BLOCK_THRESHOLD:
+            _ctx.approach_counter[url_pattern] = _APPROACH_BLOCK_THRESHOLD + 1
+            if previous_count <= _APPROACH_BLOCK_THRESHOLD and _ctx.observer_trigger_callback:
+                _ctx.observer_trigger_callback(reason=f"approach_blocked:{url_pattern[:60]}")
+            return (
+                f"[阻止] 同一 HTTP 请求结构本次包含 {variant_count} 个变体，"
+                f"累计将达到 {approach_count} 个，超过 {_APPROACH_BLOCK_THRESHOLD} 个的验证预算。"
+                "请记录失败边界并切换方向；不要把更多猜测藏进 shell 循环。"
+            )
+        _ctx.approach_counter[url_pattern] = approach_count
         if approach_count >= _APPROACH_WARN_THRESHOLD:
             approach_warn = (
                 f"\n⚠️ [方向循环警告] 同一请求结构已尝试 {approach_count} 次（{url_pattern[:80]}），"
@@ -197,7 +239,7 @@ def execute(args: dict) -> str:
                 _ctx.observer_trigger_callback(reason=f"approach_loop:{url_pattern[:60]}")
 
     # 每题独立的工作目录（并行安全）
-    cwd = _ctx.challenge_dir if (_ctx.challenge_dir and _ctx.challenge_dir != "/workspace") else "/root/workspace"
+    cwd = _ctx.attempt_dir if (_ctx.attempt_dir and _ctx.attempt_dir != "/workspace") else "/root/workspace"
     os.makedirs(cwd, exist_ok=True)
 
     try:
@@ -246,13 +288,13 @@ def execute(args: dict) -> str:
         # 连接成功，重置该 host 的失败计数
         _ctx.host_fail_counter[host] = 0
 
-    return repeat_warn + approach_warn + conn_warn + _auto_extract(output) + output
+    return repeat_warn + approach_warn + conn_warn + _auto_extract(output, cmd) + output
 
 
 def _save_full_output(cmd: str, output: str) -> str:
     import time, hashlib
     # 每题独立的 tool-results 目录（并行安全）
-    base_dir = _ctx.challenge_dir if (_ctx.challenge_dir and _ctx.challenge_dir != "/workspace") else "/root/workspace"
+    base_dir = _ctx.attempt_dir if (_ctx.attempt_dir and _ctx.attempt_dir != "/workspace") else "/root/workspace"
     results_dir = os.path.join(base_dir, ".tool-results")
     os.makedirs(results_dir, exist_ok=True)
     ts = int(time.time() * 1000)
@@ -274,7 +316,7 @@ _MIDDLEWARE_KEYWORDS = [
 ]
 
 
-def _auto_extract(output: str) -> str:
+def _auto_extract(output: str, command: str = "") -> str:
     """
     对 bash 输出做确定性后处理：用正则提取 flag、凭据、内网 IP、中间件名。
     结果作为醒目前缀追加到输出开头，确保模型不会遗漏关键信息。
@@ -309,20 +351,26 @@ def _auto_extract(output: str) -> str:
     )
     if internal_ips:
         # 去重 + 排除常见无关 IP
+        target_host = _target_hostname()
         unique_ips = [ip for ip in dict.fromkeys(internal_ips)
                       if not ip.startswith('10.0.100.')  # VPN 网关
-                      and ip != '172.17.0.1']  # Docker 网关
+                      and ip != '172.17.0.1'  # Docker 网关
+                      and ip != target_host]
         if unique_ips:
             findings.append(f"🌐 发现内网 IP：{unique_ips[:5]}，可能需要横向移动！")
 
-    # 4. 中间件/框架识别
-    output_lower = output.lower()
-    detected_mw = [mw for mw in _MIDDLEWARE_KEYWORDS if mw in output_lower]
-    if detected_mw:
-        findings.append(
-            f"🔍 识别到中间件：{detected_mw[:3]}"
-            f"，立即用 security_search 搜索对应 CVE！"
-        )
+    # 4. 中间件/框架识别 → 确定性 CVE 路由（本地表命中直接注入，不靠模型回忆）
+    cve_hint = knowledge_router.lookup(output, context=command)
+    if cve_hint:
+        findings.append(cve_hint)
+    else:
+        output_lower = output.lower()
+        detected_mw = [mw for mw in _MIDDLEWARE_KEYWORDS if mw in output_lower]
+        if detected_mw:
+            findings.append(
+                f"🔍 识别到中间件：{detected_mw[:3]}"
+                f"（本地 CVE 表未命中，可用 security_search 补充，结果必须 bash 验证）"
+            )
 
     if not findings:
         return ""

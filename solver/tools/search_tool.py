@@ -6,7 +6,7 @@
 
 1. Tavily — 真实搜索 API，CTF 友好，能提取代码块和 writeup
 2. Kimi（moonshot-v1-auto）— 原生联网搜索，能获取真实 writeup
-3. DeepSeek（deepseek-chat）— 用模型训练知识回答，无联网
+3. DeepSeek（deepseek-v4-flash）— 用模型训练知识回答，无联网
 
 配置方式：
   settings.json 中添加：
@@ -28,13 +28,12 @@ from typing import Optional
 
 from openai import OpenAI
 
+from solver.runtime.llm import create_with_retry, is_deepseek_v4
+
 def _msg_content(msg) -> str:
-    """从 LLM 消息中提取内容，兼容 thinking 模型。"""
+    """只返回最终答案；reasoning_content 不能冒充搜索结果。"""
     c = getattr(msg, "content", None)
-    if c:
-        return c
-    extra = getattr(msg, "model_extra", {}) or {}
-    return extra.get("reasoning_content", "") or ""
+    return c or ""
 
 
 TOOL_DEF = {
@@ -69,6 +68,13 @@ _SEARCH_SYSTEM = (
     "4. 常见绕过姿势或变体\n"
     "回答控制在 500 字以内，优先给出可操作的信息。"
     "如果能找到 CTF writeup，优先参考 writeup 中的解法。"
+)
+
+_MODEL_KNOWLEDGE_SYSTEM = (
+    _SEARCH_SYSTEM
+    + "\n你当前没有联网或检索能力，只能提供模型已有知识。"
+    "不得声称已经搜索互联网，不得根据题号、标题或零散词语猜测特定题目的解法。"
+    "如果没有高置信度的直接知识，只回答“无可靠本地知识”，不要给通用漏洞清单。"
 )
 
 # 搜索专用 LLM 客户端（与 Solver 主模型独立）
@@ -118,7 +124,7 @@ def init(settings: dict) -> None:
         _search_model = (
             llm_cfg.get("search_model")
             or llm_cfg.get("default_model")
-            or os.environ.get("LLM_MODEL", "deepseek-chat")
+            or os.environ.get("LLM_MODEL", "deepseek-v4-flash")
         )
         _search_client = OpenAI(base_url=base_url, api_key=api_key)
         _search_source = "deepseek" if "deepseek" in base_url else "fallback"
@@ -182,7 +188,8 @@ def _search_kimi(query: str) -> str:
         }]
     }
 
-    resp = _search_client.chat.completions.create(
+    resp = create_with_retry(
+        _search_client.chat.completions.create,
         model=_search_model,
         messages=messages,
         max_tokens=800,
@@ -200,7 +207,8 @@ def _search_kimi(query: str) -> str:
                 "name": tc.function.name,
                 "content": tc.function.arguments,
             })
-        resp2 = _search_client.chat.completions.create(
+        resp2 = create_with_retry(
+            _search_client.chat.completions.create,
             model=_search_model,
             messages=messages,
             max_tokens=800,
@@ -219,20 +227,35 @@ def _search_llm(query: str) -> str:
         return "[错误] search_tool 未初始化"
 
     messages = [
-        {"role": "system", "content": _SEARCH_SYSTEM},
+        {"role": "system", "content": _MODEL_KNOWLEDGE_SYSTEM},
         {"role": "user", "content": query},
     ]
 
-    resp = _search_client.chat.completions.create(
-        model=_search_model,
-        messages=messages,
-        max_tokens=800,
+    request = {
+        "model": _search_model,
+        "messages": messages,
+        "max_tokens": 1200,
+    }
+    if is_deepseek_v4(_search_model):
+        # 短知识查询不需要思考模式；避免预算全部消耗在 reasoning_content。
+        request["extra_body"] = {"thinking": {"type": "disabled"}}
+
+    resp = create_with_retry(
+        _search_client.chat.completions.create,
+        **request,
     )
 
-    content = _msg_content(resp.choices[0].message) or "（无结果）"
+    choice = resp.choices[0]
+    content = _msg_content(choice.message).strip()
+    if not content:
+        reason = getattr(choice, "finish_reason", "") or "unknown"
+        return (
+            f"[错误] 模型知识查询未生成最终答案（finish_reason={reason}）。"
+            "已丢弃 reasoning_content，禁止把模型推理草稿当作搜索结果。"
+        )
 
     if _search_source == "deepseek":
-        prefix = "[DeepSeek 知识查询结果（非实时搜索）]"
+        prefix = "[DeepSeek 模型知识（非联网、未验证，使用前必须用 bash 验证）]"
     else:
         prefix = f"[{_search_source} 搜索结果]"
 

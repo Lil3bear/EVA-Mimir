@@ -29,6 +29,9 @@ def _file_lock(lock_path: Path):
                 fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except (IOError, OSError):
+                if lock_file:
+                    lock_file.close()
+                    lock_file = None
                 if time.time() > deadline:
                     raise TimeoutError(f"无法获取锁：{lock_path}")
                 time.sleep(LOCK_RETRY_INTERVAL)
@@ -64,7 +67,8 @@ def _load_index(challenge_dir: Path) -> list[dict]:
         return []
 
 
-def add_idea(challenge_dir: Path, content: str, source: str = "solver") -> IdeaRecord:
+def add_idea(challenge_dir: Path, content: str, source: str = "solver",
+             owner_attempt_id: str = "primary") -> IdeaRecord:
     normalized = content.strip().lower()
     with _file_lock(_lock_path(challenge_dir)):
         ideas = _load_index(challenge_dir)
@@ -79,6 +83,7 @@ def add_idea(challenge_dir: Path, content: str, source: str = "solver") -> IdeaR
             created_at=now,
             updated_at=now,
             source=source,
+            owner_attempt_id=owner_attempt_id,
         )
         ideas.append(idea.__dict__)
         _atomic_write(_index_path(challenge_dir), ideas)

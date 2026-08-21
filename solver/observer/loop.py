@@ -1,14 +1,11 @@
 import hashlib
 import os
 import re
-import sys
 import threading
 from pathlib import Path
 
 from solver.worker_context import ctx as _ctx
-
-
-_emit_lock = threading.Lock()
+from shared.jsonl import write_line
 
 
 # 攻击向量关键词映射：命中任意关键词→向量名
@@ -81,6 +78,7 @@ class ObserverLoop:
     def __init__(self, settings: dict, on_correction: callable = None):
         self.settings = settings
         self.on_correction = on_correction
+        self.enabled = settings.get("solver", {}).get("observer_enabled", True)
         self._round_logs: list[dict] = []
         self._current_round: dict | None = None
         self._lock = threading.Lock()
@@ -94,38 +92,60 @@ class ObserverLoop:
         # 攻击向量级循环检测
         self._recent_vectors: list[str | None] = []  # 每轮的主要攻击向量
         self._vector_cycle_warned: set[str] = set()  # 已警告过的向量
-        self._VECTOR_CYCLE_THRESHOLD = 8  # 连续 N 轮同一向量则触发
+        self._VECTOR_CYCLE_THRESHOLD = 4  # 第 4 轮前强制切换已连续失败的方向
+        self._run_context = _ctx.snapshot()
+        self._client = _ctx.client
 
     def trigger_now(self, reason: str = "", extra_context: str = "") -> None:
         """立即触发一次 Observer 审查（不等周期）。"""
+        if not self.enabled:
+            return
         with self._lock:
             rounds_to_review = list(self._round_logs)
             self._round_logs = []
 
         challenge_dir = self._get_challenge_dir()
+        attempt_dir = self._get_attempt_dir()
 
         if self._review_thread and self._review_thread.is_alive():
             self._review_thread.join(timeout=10)
+            if self._review_thread.is_alive():
+                # Keep the evidence for the next review rather than starting two
+                # observers that concurrently mutate the same blackboard.
+                with self._lock:
+                    self._round_logs = rounds_to_review + self._round_logs
+                return
 
         self._review_thread = threading.Thread(
             target=self._run_review,
-            args=(rounds_to_review, challenge_dir),
+            args=(rounds_to_review, challenge_dir, attempt_dir),
             daemon=True,
         )
         self._review_thread.start()
 
     def on_round_start(self, round_num: int) -> None:
+        if not self.enabled:
+            return
         with self._lock:
             self._current_round = {"round": round_num, "tool_calls": []}
 
     def on_tool_call(self, tool: str, args: dict, result: str) -> None:
+        if not self.enabled:
+            return
         with self._lock:
             if self._current_round is not None:
-                # 取末尾 300 字节：失败原因/诊断信息通常在输出末尾
+                # Preserve both response identity and final diagnostics.
+                result_excerpt = result
+                if len(result_excerpt) > 1200:
+                    result_excerpt = (
+                        result_excerpt[:400]
+                        + "\n...[observer excerpt]...\n"
+                        + result_excerpt[-800:]
+                    )
                 self._current_round["tool_calls"].append({
                     "tool": tool,
                     "args": args,
-                    "result": result[-300:],
+                    "result": result_excerpt,
                 })
                 # 攻击向量分类（只对 bash 命令）
                 if tool == "bash":
@@ -134,6 +154,8 @@ class ObserverLoop:
                         self._current_round["_attack_vector"] = vector
 
     def on_round_end(self, round_num: int) -> None:
+        if not self.enabled:
+            return
         with self._lock:
             current = self._current_round
             if current:
@@ -194,12 +216,14 @@ class ObserverLoop:
 
         if self.on_correction:
             if self._should_send_correction(message, round_num):
-                self.on_correction(message)
+                self.on_correction(message, round_num)
 
         # 同时触发 Observer 审查，让它结合 Memory/Ideas 做更智能的纠偏
         self.trigger_now(reason=f"vector_cycle:{dominant}")
 
     def on_agent_end(self) -> None:
+        if not self.enabled:
+            return
         with self._lock:
             has_unreviewed = bool(self._round_logs)
 
@@ -221,10 +245,11 @@ class ObserverLoop:
             return
 
         challenge_dir = self._get_challenge_dir()
+        attempt_dir = self._get_attempt_dir()
 
         self._review_thread = threading.Thread(
             target=self._run_review,
-            args=(rounds_to_review, challenge_dir),
+            args=(rounds_to_review, challenge_dir, attempt_dir),
             daemon=True,
         )
         self._review_thread.start()
@@ -235,6 +260,12 @@ class ObserverLoop:
         if _ctx.challenge_dir and _ctx.challenge_dir != "/workspace":
             return Path(_ctx.challenge_dir)
         return Path(os.environ.get("CTF_WORKSPACE", "/workspace"))
+
+    @staticmethod
+    def _get_attempt_dir() -> Path:
+        if _ctx.attempt_dir and _ctx.attempt_dir != "/workspace":
+            return Path(_ctx.attempt_dir)
+        return ObserverLoop._get_challenge_dir()
 
     def _should_send_correction(self, content: str, current_round: int) -> bool:
         # 只做内容指纹去重，不限轮次 cooldown
@@ -310,37 +341,35 @@ class ObserverLoop:
         message = "\n".join(lines)
         if self._should_send_correction(message, current_round):
             if self.on_correction:
-                self.on_correction(message)
+                self.on_correction(message, current_round)
 
-    def _run_review(self, rounds: list[dict], challenge_dir: Path) -> None:
+    def _run_review(
+        self, rounds: list[dict], challenge_dir: Path, attempt_dir: Path
+    ) -> None:
         current_round = rounds[-1]["round"] if rounds else 0
 
         def guarded_correction(content: str) -> None:
             if self._should_send_correction(content, current_round):
                 if self.on_correction:
-                    self.on_correction(content)
+                    self.on_correction(content, current_round)
             else:
-                from shared.jsonl import serialize
-                with _emit_lock:
-                    sys.stdout.write(serialize({
-                        "type": "observer_correction_suppressed",
-                        "data": {"reason": "cooldown_or_duplicate", "round": current_round}
-                    }))
-                    sys.stdout.flush()
+                write_line({
+                    "type": "observer_correction_suppressed",
+                    "data": {"reason": "cooldown_or_duplicate", "round": current_round},
+                })
 
         try:
             from solver.observer.agent import ObserverAgent
-            observer = ObserverAgent(settings=self.settings)
-            observer.review(
-                recent_rounds=rounds,
-                challenge_dir=challenge_dir,
-                on_correction=guarded_correction,
-            )
+            with _ctx.bind(self._run_context, self._client):
+                observer = ObserverAgent(settings=self.settings)
+                observer.review(
+                    recent_rounds=rounds,
+                    challenge_dir=challenge_dir,
+                    attempt_dir=attempt_dir,
+                    on_correction=guarded_correction,
+                )
         except Exception as e:
-            from shared.jsonl import serialize
-            with _emit_lock:
-                sys.stdout.write(serialize({"type": "observer_error", "data": {"msg": str(e)}}))
-                sys.stdout.flush()
+            write_line({"type": "observer_error", "data": {"msg": str(e)}})
 
         # 审查结束后做无进展检测
         self._check_progress(challenge_dir, current_round)

@@ -71,10 +71,13 @@ def memory_add(args: dict) -> str:
     if not content:
         return "[错误] content 不能为空"
 
-    entry = mem_store.add_memory(
-        _challenge_dir(), kind=kind, content=content, refs=refs, source="solver"
+    entry, created = mem_store.add_memory_with_status(
+        _challenge_dir(), kind=kind, content=content, refs=refs, source="solver",
+        attempt_id=_ctx.attempt_id,
     )
-    return f"[Memory] 已记录 [{kind}] {entry.id}：{content}"
+    if not created:
+        return f"[Memory] 已存在，未新增 [{entry.kind}] {entry.id}：{entry.content}"
+    return f"[Memory] 已记录 [{entry.kind}] {entry.id}：{entry.content}"
 
 
 def memory_list(args: dict) -> str:
@@ -87,5 +90,5 @@ def memory_list(args: dict) -> str:
     lines = ["[Memory 看板]"]
     for e in entries:
         refs_str = f" (refs: {', '.join(e.refs)})" if e.refs else ""
-        lines.append(f"- [{e.kind}] {e.id}: {e.content}{refs_str}")
+        lines.append(f"- [{e.kind}] {e.id} ({e.attempt_id}): {e.content}{refs_str}")
     return "\n".join(lines)

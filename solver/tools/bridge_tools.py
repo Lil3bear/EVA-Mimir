@@ -1,14 +1,15 @@
-import sys
 import os
+import json
 import threading
 from typing import Any
 
-from shared.jsonl import serialize, deserialize
+from shared.jsonl import deserialize, write_line
 from solver.ctfplatform.tsecbench_client import (
     Challenge,
     DuplicateSubmit,
     TsecbenchClient,
 )
+from solver.runtime.submission_store import SubmissionOutcome, SubmissionStore
 from solver.worker_context import ctx as _ctx
 
 
@@ -54,8 +55,7 @@ def _request_bridge(action: str, params: dict, timeout: float = 30.0) -> dict:
         "action": action,
         "params": params,
     }
-    sys.stdout.write(serialize(msg))
-    sys.stdout.flush()
+    write_line(msg)
 
     done.wait(timeout=timeout)
 
@@ -205,12 +205,55 @@ def _request_backend(action: str, params: dict) -> dict:
     return _request_bridge(action, params)
 
 
+def _challenge_dir() -> str:
+    d = getattr(_ctx, "challenge_dir", "") or ""
+    if not d or d == "/workspace":
+        return ""
+    return d
+
+
+def _hint_marker_path() -> str:
+    d = _challenge_dir()
+    return os.path.join(d, ".hint_fetched") if d else ""
+
+
 def submit_flag(args: dict) -> str:
     flag = args.get("flag", "").strip()
     writeup = args.get("writeup", "")
-    try:
-        data = _request_backend("challenge_submit_flag", {"flag": flag, "writeup": writeup})
-    except DuplicateSubmit:
+
+    def submit_once() -> dict:
+        try:
+            return _request_backend(
+                "challenge_submit_flag", {"flag": flag, "writeup": writeup}
+            )
+        except DuplicateSubmit:
+            return {"correct": True, "duplicate": True}
+
+    challenge_dir = _challenge_dir()
+    if challenge_dir:
+        outcome = SubmissionStore(challenge_dir).submit(flag, submit_once)
+    else:
+        data = submit_once()
+        outcome = SubmissionOutcome(
+            status="correct" if data.get("correct") else "wrong",
+            response=data,
+            duplicate=False,
+            wrong_count=0 if data.get("correct") else 1,
+        )
+
+    if outcome.duplicate:
+        if outcome.status == "correct":
+            return f"[重复] Flag 已提交且正确：{flag}"
+        return f"[重复] 该 flag 之前已提交且判定错误：{flag}。禁止重复提交同一 flag，请换方向重新分析。"
+
+    if outcome.status == "limited":
+        return (
+            f"[拦截] 本题已累计提交 {outcome.wrong_count} 个错误 flag，"
+            "禁止继续猜。请回到题目逻辑重新分析，找到确定证据后再提交。"
+        )
+
+    data = outcome.response or {}
+    if data.get("duplicate"):
         return f"[重复] Flag 已经提交并计分：{flag}"
     if data.get("correct"):
         score = data.get("awarded")
@@ -224,7 +267,14 @@ def submit_flag(args: dict) -> str:
         else:
             return f"[✓] Flag 提交正确：{flag}{suffix}{progress} 还有剩余 Flag，请继续寻找！"
     else:
-        return f"[✗] Flag 提交错误：{flag}，请继续寻找"
+        wrong = outcome.wrong_count
+        warn = ""
+        if wrong >= 3:
+            warn = (
+                f"\n⚠️ 已累计提交 {wrong} 个错误 flag。"
+                "立即停止猜 flag，回到题目逻辑重新分析，找到确定证据后再提交。"
+            )
+        return f"[✗] Flag 提交错误：{flag}，请继续寻找{warn}"
 
 
 def get_state(args: dict) -> str:
@@ -248,11 +298,21 @@ def get_state(args: dict) -> str:
 
 
 def get_hint(args: dict) -> str:
+    # hint 扣分是“每题一次性 10%”，重复查看不叠加；因此允许跨重跑轮次重新查看，
+    # 只保留“每轮一次”的门控在 agent 层（_hint_fetch_count）。
     data = _request_backend("challenge_get_hint", args)
+    marker = _hint_marker_path()
+    if marker:
+        try:
+            os.makedirs(os.path.dirname(marker), exist_ok=True)
+            with open(marker, "w", encoding="utf-8") as f:
+                f.write("1")
+        except Exception:
+            pass
     hints = data.get("hints", [])
     if not hints:
         return "[提示] 暂无提示"
-    return "[提示]\n" + "\n".join(f"- {h}" for h in hints)
+    return "[提示]（本题已扣分，可反复查看，请充分利用）\n" + "\n".join(f"- {h}" for h in hints)
 
 
 def start_challenge(args: dict) -> str:

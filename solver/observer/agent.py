@@ -1,19 +1,15 @@
 import json
 import os
-import sys
-import threading
 from pathlib import Path
 
 from openai import OpenAI
 
 from solver.observer.tools import (
-    OBSERVER_TOOL_DEFS,
-    read_file,
-    memory_list, memory_add, memory_delete, memory_update,
-    idea_list, idea_add, idea_update,
+    build_tool_registry,
 )
+from solver.runtime.llm import assistant_message_dict, completion_kwargs, create_with_retry
 from shared.data import memory as mem_store, ideas as idea_store
-from shared.jsonl import serialize
+from shared.jsonl import write_line
 
 
 OBSERVER_SYSTEM_PROMPT = """你是 CTF 解题 Agent 的 Observer（旁路审查员）。
@@ -23,13 +19,15 @@ OBSERVER_SYSTEM_PROMPT = """你是 CTF 解题 Agent 的 Observer（旁路审查�
 你的唯一职责是：审查 Solver 最近的行为，维护 Memory/Ideas 看板，必要时发纠偏消息。
 
 ## Solver 可用工具清单（纠偏指令只能指示 Solver 使用以下工具，禁止编造不存在的工具名）
-- bash — 执行 shell 命令（curl、python3、gcc 等）
-- read_file — 读取文件内容（也用于加载 /skills/web/SKILL.md、/skills/pwn/SKILL.md、/skills/crypto/SKILL.md、/skills/reverse/SKILL.md、/skills/pentest/SKILL.md、/skills/cloud/SKILL.md、/skills/evasion/SKILL.md 等指南）
+- bash — 执行 shell 命令（curl、python3、gcc、nc 等）
+- read_file — 读取附件/源码/文件内容（**不要用它读 SKILL.md，会被截断**）
 - write_file — 写入文件
 - grep — 搜索文件内容
+- skill_list — 列出可用 Skill（名称、用途、references）
+- skill_load — 按需加载 Skill 入口或某个 reference（**知识检索走这里，不走 read_file**）
 - memory_add / memory_list — 记录/查看已知事实
 - idea_list — 查看当前攻击方向（只读，不能 idea_add）
-- security_search — 搜索安全知识
+- security_search — 搜索安全知识（DeepSeek 结果是模型知识、非联网，必须验证）
 - challenge_submit_flag — 提交 flag
 - challenge_get_state — 查看题目当前状态（URL、描述等）
 - challenge_get_hint — 获取题目提示
@@ -41,14 +39,14 @@ OBSERVER_SYSTEM_PROMPT = """你是 CTF 解题 Agent 的 Observer（旁路审查�
 **绝对禁止**在纠偏消息里提及不在 Solver 清单内的工具（如 challenge_restart、restart、challenge_update_url 等），这类工具不存在，Solver 无法调用。
 
 ## Core Loop（按顺序执行）
-1. 先查看当前 memory_list 和 idea_list
+1. user prompt 已包含 Memory/Ideas 快照，直接使用；除非快照明确截断且确有必要，不要重复调用 memory_list/idea_list
 2. **先做 Memory 精简（强制）**：
    - 若 memory 超过 10 条，必须先清理再做其他工作
    - 合并同类项：多条描述同一类失败的记录合并为一条（如「SQLi 对 id 无效」+「SQLi 对 name 无效」→ memory_update 为「SQLi 对 id、name 参数均无效」，然后 memory_delete 另一条）
    - 删除已过时的 note 类记录（如“等待目标启动”在目标已可达后无意义）
    - 删除已被更新的 fact 类旧版本（如旧的「PHP 8」已被纠正为「PHP 7.3」后，旧条目应已删除）
    - **禁止删除 evidence 类（凭据）**，除非它已被证实错误
-3. 若摘要不足以判断 Solver 的状态，用 read_file 查阅 Solver 原始对话历史（路径见下方 "history_path" 字段）。每行一条 JSON，含 role/content/tool_calls 字段
+3. 最近行为摘要通常已经足够。只有存在一个无法从摘要解决的具体矛盾时，才用 read_file 查阅原始历史；禁止为了“再确认一下”重复读取
 4. **矛盾检测**：对比新发现与现有 memory 条目，若有矛盾：
    - 用 memory_update 纠正旧条目（优先），或 memory_delete 删除错误条目
    - 禁止同时保留两条互相矛盾的事实
@@ -70,16 +68,16 @@ OBSERVER_SYSTEM_PROMPT = """你是 CTF 解题 Agent 的 Observer（旁路审查�
 - Solver 方向明显错误（如在 Crypto 题上跑 SQLi）
 - Solver 陷入无意义的循环超过 10 轮
 - Solver 遭遇目标不可达但仍在猜端口/扫节点
-- **存在未利用情报**（见下方「未利用情报检测」）
+- 存在与当前方向直接相关、且整个最近窗口都未出现的关键情报
 
 ## 未利用情报检测（极重要）
-审查时如果看到「⚠️ 未利用情报」章节，说明 Memory 中有 evidence/fact 包含的关键信息（IP、密码、路径等）
-在最近多轮的工具调用参数中从未出现过。这意味着 Solver 可能忘记了这些信息。
+审查时如果看到「可能未利用的情报」章节，只表示相关关键词在最近审查窗口内没有出现，不代表整个会话从未使用。
+先判断它是否与当前主线直接相关、是否已经过时、是否明确标记为旧地址或失败路线。
 
-**必须立即 send_correction**，格式：
+仅在确认 Solver 确实遗忘关键情报时 send_correction，格式：
 「Memory 中有未利用的情报：{具体内容}。当前方向已卡住 N 轮，建议立即利用该情报（如：用弱口令登录跳板机、访问已知的管理后台路径）。」
 
-这比普通纠偏优先级更高——已有情报未利用是最大的浪费。
+旧地址、已完成步骤、已判死路线以及与当前方向无关的信息不得触发纠偏。
 
 ## ⚠️ 纠偏只做方向性判断，禁止做技术性判断（极重要）
 
@@ -159,22 +157,24 @@ OBSERVER_SYSTEM_PROMPT = """你是 CTF 解题 Agent 的 Observer（旁路审查�
 2. Solver 是否在重复尝试同一个 patch 方案？如果 patch 后程序仍然失败，应该换 patch 位置或改变策略
 3. Solver 是否用了 ltrace/strace 进行动态分析？如果只做静态分析且卡住，建议动态分析
 
-## 计划对照审查（极重要）
-当 prompt 中包含「## 攻击计划」章节时，说明系统已为本题生成了专属攻击计划。
-你需要对照计划检查 Solver 的进度：
-
-1. **卡在某一步超过 10 轮**：如果 Solver 持续在计划第 N 步徘徊超过 10 轮，send_correction 指出「计划第 N 步已卡 10+ 轮，建议跳过该步先执行后续步骤，或换子方向」
-2. **跳过了关键步骤**：如果 Solver 跳过了计划中的关键步骤（如计划要求先做框架识别再做爆破，但 Solver 直接爆破），send_correction 提醒
-3. **某一步已被确认不可行**：如果计划中的某一步已被实证无效（如「框架识别」已确认是自研系统），用 memory_add 记录，不要再让 Solver 回到那一步
-4. **计划已完成但未找到 flag**：如果所有计划步骤都已尝试但未成功，send_correction 建议跳出计划框架，探索计划外的方向
-
 ## Output Contract
 无需改动时，直接回复 NO_CHANGE。
 有改动时，简短说明做了什么（1-3 句话）。
 """
 
 
-def _build_observer_prompt(recent_rounds: list[dict], challenge_dir: Path) -> str:
+def _excerpt(text: str, limit: int) -> str:
+    text = str(text or "")
+    if len(text) <= limit:
+        return text
+    head = limit * 2 // 3
+    tail = limit - head
+    return text[:head] + " ...[省略]... " + text[-tail:]
+
+
+def _build_observer_prompt(
+    recent_rounds: list[dict], challenge_dir: Path, attempt_dir: Path | None = None
+) -> str:
     memories = mem_store.list_memory(challenge_dir, limit=12)
     ideas = idea_store.list_ideas(challenge_dir, limit=8)
 
@@ -188,7 +188,7 @@ def _build_observer_prompt(recent_rounds: list[dict], challenge_dir: Path) -> st
             lines.append(f"\n⚠️ **Memory 超限**：非 evidence 条目已达 {len(non_evidence)} 条（上限 10）。"
                          f"请先合并同类项或删除过时条目，再做其他工作。\n")
         for m in memories:
-            lines.append(f"- [{m.kind}] {m.id}: {m.content}")
+            lines.append(f"- [{m.kind}] {m.id}: {_excerpt(m.content, 700)}")
     else:
         lines.append("### Memory（空）")
 
@@ -196,28 +196,13 @@ def _build_observer_prompt(recent_rounds: list[dict], challenge_dir: Path) -> st
         lines.append("### Ideas")
         for i in ideas:
             result_str = f" → {i.result}" if i.result else ""
-            lines.append(f"- [{i.status}] {i.id}: {i.content}{result_str}")
+            lines.append(f"- [{i.status}] {i.id}: {_excerpt(i.content + result_str, 450)}")
     else:
         lines.append("### Ideas（空）")
 
     # 告知 Observer 真实的 history 文件路径
-    history_path = str((challenge_dir / ".solver-history.jsonl").resolve())
+    history_path = str(((attempt_dir or challenge_dir) / ".solver-history.jsonl").resolve())
     lines.append(f"\n## history_path\n`{history_path}`")
-
-    # ━━ 读取攻击计划（如果存在）━━
-    plan_path = challenge_dir / ".attack-plan.json"
-    if plan_path.exists():
-        try:
-            import json
-            plan_data = json.loads(plan_path.read_text(encoding="utf-8"))
-            steps = plan_data.get("steps", [])
-            if steps:
-                lines.append("\n## 攻击计划（系统自动生成，请对照审查）")
-                for i, step in enumerate(steps, 1):
-                    lines.append(f"{i}. {step}")
-                lines.append("")
-        except Exception:
-            pass
 
     lines.append("\n## Solver 最近行为摘要")
     for r in recent_rounds[-6:]:
@@ -291,35 +276,30 @@ def _build_observer_prompt(recent_rounds: list[dict], challenge_dir: Path) -> st
             if not keywords:
                 continue
 
-            unused_keys = [k for k in keywords if k.lower() not in all_args_text]
-            if unused_keys:
+            keywords = list(dict.fromkeys(keywords))
+            used_keys = [k for k in keywords if k.lower() in all_args_text]
+            if keywords and not used_keys:
                 unused_intel.append({
                     "memory_id": m.id,
                     "content": content,
-                    "unused_keywords": unused_keys,
+                    "unused_keywords": keywords,
                 })
 
         if unused_intel:
-            lines.append("\n## ⚠️ 未利用情报（Solver 从未在工具调用中使用过以下信息）")
-            for item in unused_intel:
+            lines.append("\n## 可能未利用的情报（仅表示最近审查窗口未命中）")
+            for item in unused_intel[:3]:
                 keys_str = ", ".join(item["unused_keywords"][:5])
-                lines.append(f"- Memory `{item['memory_id']}`: {item['content']}")
-                lines.append(f"  未使用的关键信息: {keys_str}")
+                lines.append(f"- Memory `{item['memory_id']}`: {_excerpt(item['content'], 350)}")
+                lines.append(f"  最近窗口未出现: {keys_str}")
             lines.append("")
-            lines.append("**请立即 send_correction 提醒 Solver 利用以上情报。**")
+            lines.append("先排除旧地址、已完成步骤和无关信息；只有确认遗忘时才 send_correction。")
 
     lines.append("\n请审查以上信息，按 Core Loop 执行。")
     return "\n".join(lines)
 
 
-_emit_lock = threading.Lock()
-
-
 def _emit(event_type: str, data=None) -> None:
-    msg = {"type": event_type, "data": data}
-    with _emit_lock:
-        sys.stdout.write(serialize(msg))
-        sys.stdout.flush()
+    write_line({"type": event_type, "data": data})
 
 
 class ObserverAgent:
@@ -328,45 +308,50 @@ class ObserverAgent:
         self.client = OpenAI(
             base_url=llm_cfg.get("base_url") or os.environ.get("LLM_BASE_URL", ""),
             api_key=llm_cfg.get("api_key") or os.environ.get("LLM_API_KEY", ""),
-            timeout=__import__("httpx2").Timeout(60.0, connect=10.0),
+            timeout=__import__("httpx").Timeout(60.0, connect=10.0),
         )
-        self.model = llm_cfg.get("observer_model") or llm_cfg.get("default_model") or os.environ.get("LLM_MODEL", "deepseek-chat")
+        self.model = llm_cfg.get("observer_model") or llm_cfg.get("default_model") or os.environ.get("LLM_MODEL", "deepseek-v4-flash")
+        self._reasoning_effort = llm_cfg.get("observer_reasoning_effort", "high")
+        self._thinking_enabled = bool(llm_cfg.get("observer_thinking_enabled", False))
+        self._max_output_tokens = int(llm_cfg.get("observer_max_output_tokens", 8192))
+        self._max_react_rounds = int(llm_cfg.get("observer_max_react_rounds", 2))
 
     def review(self, recent_rounds: list[dict], challenge_dir: Path,
+               attempt_dir: Path | None = None,
                on_correction: callable = None) -> str:
-        user_prompt = _build_observer_prompt(recent_rounds, challenge_dir)
+        user_prompt = _build_observer_prompt(recent_rounds, challenge_dir, attempt_dir)
 
-        tool_executors = {
-            "read_file":       read_file,
-            "memory_list":    memory_list,
-            "memory_add":     memory_add,
-            "memory_delete":  memory_delete,
-            "memory_update":  memory_update,
-            "idea_list":      idea_list,
-            "idea_add":       idea_add,
-            "idea_update":    idea_update,
-            "send_correction": lambda args: _handle_correction(args, on_correction),
-        }
+        tool_registry = build_tool_registry(
+            lambda args: _handle_correction(args, on_correction)
+        )
 
         messages = [
             {"role": "system", "content": OBSERVER_SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ]
 
-        # Observer 自己也是一个小 ReAct 循环，但最多跑 5 轮（省 token）
-        for _ in range(5):
-            response = self.client.chat.completions.create(
+        # Observer 是控制面，不应消耗接近 Solver 的推理预算。
+        for _ in range(self._max_react_rounds):
+            kwargs = completion_kwargs(
                 model=self.model,
                 messages=messages,
-                tools=OBSERVER_TOOL_DEFS,
+                tools=tool_registry.definitions,
                 tool_choice="auto",
+                max_tokens=self._max_output_tokens,
+                reasoning_effort=self._reasoning_effort,
+                thinking_enabled=self._thinking_enabled,
+            )
+            response = create_with_retry(
+                self.client.chat.completions.create,
+                **kwargs,
+                max_attempts=3,
             )
 
             msg = response.choices[0].message
-            messages.append(msg.model_dump(exclude_none=True))
+            messages.append(assistant_message_dict(msg))
 
             if not msg.tool_calls:
-                summary = getattr(msg, "content", None) or getattr(msg, "model_extra", {}).get("reasoning_content", "") or "NO_CHANGE"
+                summary = getattr(msg, "content", None) or "NO_CHANGE"
                 _emit("observer_end", {"summary": summary})
                 return summary
 
@@ -377,7 +362,7 @@ class ObserverAgent:
                 except json.JSONDecodeError:
                     tool_args = {}
 
-                executor = tool_executors.get(tool_name)
+                executor = tool_registry.executors.get(tool_name)
                 if executor:
                     try:
                         result = executor(tool_args)

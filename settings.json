@@ -2,8 +2,15 @@
   "llm": {
     "base_url": "https://api.deepseek.com",
     "api_key": "",
-    "default_model": "deepseek-v4-pro",
-    "observer_model": "deepseek-v4-pro"
+    "default_model": "deepseek-v4-flash",
+    "observer_model": "deepseek-v4-flash",
+    "reasoning_effort": "high",
+    "max_output_tokens": 8192,
+    "summary_max_output_tokens": 8192,
+    "observer_thinking_enabled": false,
+    "observer_reasoning_effort": "high",
+    "observer_max_output_tokens": 8192,
+    "observer_max_react_rounds": 3
   },
   "docker": {
     "image_name": "eva-mimir-solver",
@@ -11,8 +18,9 @@
     "workspace_dir": "./workspace"
   },
   "solver": {
-    "max_rounds": 100,
+    "max_rounds": null,
     "observer_every_rounds": 6,
+    "observer_correction_max_lag": 3,
     "memory_limit": 10,
     "idea_limit": 8
   }

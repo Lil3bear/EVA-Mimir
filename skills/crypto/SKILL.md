@@ -3,6 +3,8 @@
 ## 适用场景
 CTF Crypto 类题目，包括古典密码、RSA、AES、哈希破解、编码转换、数论攻击等。
 
+**进阶题型（LCG/差分/背包/带噪/置换群/侧信道）→ `skill_load(name="crypto", resource="advanced-attacks.md")`**
+
 ---
 
 ## 阶段一：识别密码类型

@@ -1,9 +1,79 @@
 """Tests for new features: difficulty-based max_rounds, path traversal dedup, forced review."""
+import tempfile
+import threading
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
-from collections import Counter
 
-from solver.tools.bash_tool import _extract_url_pattern
+from solver.tools.bash_tool import _extract_url_pattern, _inline_http_variant_count
+
+
+class ObserverControlPlaneTests(unittest.TestCase):
+    def test_disabled_observer_is_noop(self):
+        from solver.observer.loop import ObserverLoop
+
+        observer = ObserverLoop(
+            settings={"solver": {"observer_enabled": False}},
+            on_correction=MagicMock(),
+        )
+        observer.on_round_start(1)
+        observer.on_tool_call("bash", {"cmd": "id"}, "uid=0")
+        observer.on_round_end(1)
+        observer.trigger_now()
+        observer.on_agent_end()
+
+        self.assertEqual(observer._round_logs, [])
+        self.assertIsNone(observer._review_thread)
+        self.assertEqual(observer._VECTOR_CYCLE_THRESHOLD, 4)
+
+    @patch("solver.observer.agent.OpenAI")
+    def test_observer_has_separate_bounded_budget(self, _mock_openai):
+        from solver.observer.agent import ObserverAgent
+
+        observer = ObserverAgent(settings={"llm": {}})
+
+        self.assertEqual(observer._reasoning_effort, "high")
+        self.assertFalse(observer._thinking_enabled)
+        self.assertEqual(observer._max_output_tokens, 8192)
+        self.assertEqual(observer._max_react_rounds, 2)
+
+
+class ObserverPromptTests(unittest.TestCase):
+    def test_used_memory_is_not_reported_as_wholly_unused(self):
+        from shared.data.memory import add_memory
+        from solver.observer.agent import _build_observer_prompt
+
+        challenge_dir = Path(tempfile.mkdtemp(prefix="observer-prompt-"))
+        entry = add_memory(
+            challenge_dir,
+            "fact",
+            "current host 10.0.0.1; old host 10.0.0.2 " + "detail " * 1000,
+        )
+        rounds = [{
+            "round": 8,
+            "tool_calls": [{
+                "tool": "bash",
+                "args": {"cmd": "check 10.0.0.1"},
+                "result": "ok",
+            }],
+        }]
+
+        prompt = _build_observer_prompt(rounds, challenge_dir)
+
+        self.assertEqual(prompt.count(entry.id), 1)
+        self.assertLess(len(prompt), 4000)
+
+    def test_observer_history_reader_has_character_cap(self):
+        from solver.observer.tools import read_file
+
+        path = Path(tempfile.mkdtemp(prefix="observer-history-")) / "history.jsonl"
+        path.write_text("x" * 20000 + "TAIL", encoding="utf-8")
+
+        result = read_file({"path": str(path), "limit": 50})
+
+        self.assertIn("仅保留末尾", result)
+        self.assertTrue(result.endswith("TAIL"))
+        self.assertLess(len(result), 12100)
 
 
 class DifficultyMaxRoundsTests(unittest.TestCase):
@@ -18,6 +88,12 @@ class DifficultyMaxRoundsTests(unittest.TestCase):
         settings = {"llm": {"base_url": "http://x", "api_key": "k"}}
         agent = SolverAgent(task=task, settings=settings, skills_dir="/skills")
         self.assertEqual(agent.max_rounds, 30)
+        self.assertEqual(agent._context_window_tokens, 1_000_000)
+        self.assertEqual(
+            agent._context_window_tokens - agent._reserve_tokens,
+            967_232,
+        )
+        self.assertEqual(agent._max_output_tokens, 8_192)
 
     @patch("solver.agent.ObserverLoop")
     @patch("solver.agent.OpenAI")
@@ -32,12 +108,12 @@ class DifficultyMaxRoundsTests(unittest.TestCase):
     @patch("solver.agent.ObserverLoop")
     @patch("solver.agent.OpenAI")
     @patch("solver.agent.search_tool")
-    def test_hard_gets_100_rounds(self, mock_search, mock_openai, mock_observer):
+    def test_hard_gets_120_rounds(self, mock_search, mock_openai, mock_observer):
         from solver.agent import SolverAgent
         task = "# CTF 题目：a-13\n- 难度：hard\n- 目标地址：http://10.0.1.1"
         settings = {"llm": {"base_url": "http://x", "api_key": "k"}}
         agent = SolverAgent(task=task, settings=settings, skills_dir="/skills")
-        self.assertEqual(agent.max_rounds, 100)
+        self.assertEqual(agent.max_rounds, 120)
 
     @patch("solver.agent.ObserverLoop")
     @patch("solver.agent.OpenAI")
@@ -88,6 +164,44 @@ class PathTraversalDedupTests(unittest.TestCase):
         """=/etc/passwd should be recognized as traversal-like"""
         p = _extract_url_pattern("curl 'http://host/download.php?id=/etc/passwd'")
         self.assertIsNotNone(p)
+
+
+class BashAttemptBudgetTests(unittest.TestCase):
+    def test_counts_values_hidden_in_http_loop(self):
+        cmd = "for value in one two three four; do curl -s http://example.invalid/$value; done"
+        self.assertEqual(_inline_http_variant_count(cmd), 4)
+
+    @patch("solver.tools.bash_tool.subprocess.run")
+    def test_blocks_oversized_http_variant_loop(self, run):
+        from solver.tools.bash_tool import execute
+        from solver.worker_context import RunContext, ctx
+
+        base = tempfile.mkdtemp(prefix="bash-budget-")
+        context = RunContext.create(base, "case")
+        cmd = "for value in one two three four; do curl -s http://example.invalid/$value; done"
+        with ctx.bind(context):
+            result = execute({"cmd": cmd})
+
+        self.assertIn("[阻止]", result)
+        run.assert_not_called()
+
+    @patch("solver.tools.bash_tool.subprocess.run")
+    def test_blocks_fourth_matching_request(self, run):
+        from solver.tools.bash_tool import execute
+        from solver.worker_context import RunContext, ctx
+
+        run.return_value = MagicMock(stdout="ok", stderr="", returncode=0)
+        base = tempfile.mkdtemp(prefix="bash-budget-")
+        context = RunContext.create(base, "case")
+        with ctx.bind(context):
+            for value in ("one", "two", "three"):
+                self.assertNotIn(
+                    "[阻止]", execute({"cmd": f"curl -s http://example.invalid/check?v={value}"})
+                )
+            result = execute({"cmd": "curl -s http://example.invalid/check?v=four"})
+
+        self.assertIn("[阻止]", result)
+        self.assertEqual(run.call_count, 3)
 
 
 class ExtractDifficultyTests(unittest.TestCase):
@@ -149,6 +263,35 @@ class AutoExtractTests(unittest.TestCase):
         result = _auto_extract("route via 10.0.100.1 dev tun0")
         # VPN 网关 10.0.100.x 应被过滤
         self.assertNotIn("内网", result)
+
+    def test_configured_target_is_not_reported_as_lateral_host(self):
+        from solver.tools.bash_tool import _auto_extract
+        from solver.worker_context import RunContext, ctx
+
+        base = tempfile.mkdtemp(prefix="auto-extract-")
+        context = RunContext.create(base, "case", target_url="http://10.0.1.1:80")
+        with ctx.bind(context):
+            result = _auto_extract("request to 10.0.1.1 completed")
+
+        self.assertNotIn("内网", result)
+
+    def test_target_ip_does_not_trigger_phase_transition(self):
+        from solver.agent import SolverAgent
+
+        agent = SolverAgent.__new__(SolverAgent)
+        agent._phase = "INITIAL_ACCESS"
+        agent._got_shell = True
+        agent._target_url = "http://10.0.1.1:80"
+        agent._found_internal_ips = set()
+        agent._pending_injections = []
+        agent._injection_lock = threading.Lock()
+
+        agent._detect_phase_transition(
+            "bash", {"cmd": "curl http://10.0.1.1"}, "connected to 10.0.1.1"
+        )
+
+        self.assertEqual(agent._phase, "INITIAL_ACCESS")
+        self.assertEqual(agent._found_internal_ips, set())
 
 
 if __name__ == "__main__":

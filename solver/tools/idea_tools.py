@@ -57,7 +57,10 @@ def idea_add(args: dict) -> str:
     if not content:
         return "[错误] content 不能为空"
 
-    idea = idea_store.add_idea(_challenge_dir(), content=content, source="solver")
+    idea = idea_store.add_idea(
+        _challenge_dir(), content=content, source="solver",
+        owner_attempt_id=_ctx.attempt_id,
+    )
     return f"[Ideas] 已添加 [{idea.status}] {idea.id}：{content}"
 
 
@@ -71,5 +74,5 @@ def idea_list(args: dict) -> str:
     lines = ["[Ideas 看板]"]
     for i in ideas:
         result_str = f" → {i.result}" if i.result else ""
-        lines.append(f"- [{i.status}] {i.id}: {i.content}{result_str}")
+        lines.append(f"- [{i.status}] {i.id} ({i.owner_attempt_id}): {i.content}{result_str}")
     return "\n".join(lines)

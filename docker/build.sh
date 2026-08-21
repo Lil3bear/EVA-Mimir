@@ -2,10 +2,11 @@
 # Docker 镜像构建 + 体积验证脚本
 # 在项目根目录执行：bash docker/build.sh
 
-set -e
+set -euo pipefail
 
 IMAGE_NAME="eva-mimir-solver"
 MAX_SIZE_MB=1024  # 1GB 限制
+TARGET_PLATFORM="${TARGET_PLATFORM:-linux/amd64}"
 
 echo "============================================"
 echo "  EVA-Mimir Docker 镜像构建"
@@ -17,7 +18,7 @@ mkdir -p docker/fastcoll-src
 # 构建
 echo ""
 echo "[1/4] 开始构建..."
-docker build -t ${IMAGE_NAME}:latest -f docker/Dockerfile . 2>&1 | tail -20
+docker build --platform "${TARGET_PLATFORM}" -t ${IMAGE_NAME}:latest -f docker/Dockerfile . 2>&1 | tail -20
 
 # 检查体积
 echo ""

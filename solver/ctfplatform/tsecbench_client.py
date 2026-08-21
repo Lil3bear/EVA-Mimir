@@ -1,4 +1,5 @@
 import os
+import threading
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -169,8 +170,23 @@ class TsecbenchClient:
         self.timeout = timeout
         self.start_timeout = 90.0  # start_challenge 启动容器
         self.vpn_check_url = vpn_check_url
-        self._session = session or requests.Session()
-        self._owns_session = session is None
+        # 并发安全：未显式传入 session 时，每线程独立 Session，
+        # 避免 start_challenge 的 90s 长请求阻塞其他并发的平台请求。
+        self._shared_session = session
+        self._local = threading.local()
+        self._sessions: list[requests.Session] = []
+        self._sessions_lock = threading.Lock()
+
+    def _get_session(self) -> requests.Session:
+        if self._shared_session is not None:
+            return self._shared_session
+        session = getattr(self._local, "session", None)
+        if session is None:
+            session = requests.Session()
+            self._local.session = session
+            with self._sessions_lock:
+                self._sessions.append(session)
+        return session
 
     @classmethod
     def from_env(
@@ -194,8 +210,10 @@ class TsecbenchClient:
         )
 
     def close(self) -> None:
-        if self._owns_session:
-            self._session.close()
+        with self._sessions_lock:
+            sessions, self._sessions = self._sessions, []
+        for session in sessions:
+            session.close()
 
     def __enter__(self) -> "TsecbenchClient":
         return self
@@ -205,7 +223,9 @@ class TsecbenchClient:
 
     def check_vpn(self) -> VpnCheckResult:
         try:
-            response = self._session.get(self.vpn_check_url, timeout=self.timeout)
+            response = self._get_session().get(
+                self.vpn_check_url, timeout=self.timeout
+            )
         except requests.RequestException as exc:
             raise VpnCheckError(
                 "vpn_check_failed",
@@ -306,7 +326,7 @@ class TsecbenchClient:
         headers["BENCHMARK_TOKEN"] = self.token
         req_timeout = kwargs.pop("timeout", self.timeout)
         try:
-            response = self._session.request(
+            response = self._get_session().request(
                 method,
                 url,
                 headers=headers,

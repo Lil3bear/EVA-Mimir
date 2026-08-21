@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 
 from shared.data import memory as mem_store, ideas as idea_store
+from solver.tools.registry import ToolRegistry, ToolSpec
 from solver.worker_context import ctx as _ctx
 
 
@@ -13,6 +14,15 @@ def _challenge_dir() -> Path:
 
 
 # Observer 拥有完整的 memory/ideas 管理权（增删改），Solver 只能追加
+
+
+def _excerpt(text: str, limit: int) -> str:
+    text = str(text or "")
+    if len(text) <= limit:
+        return text
+    head = limit * 2 // 3
+    tail = limit - head
+    return text[:head] + " ...[省略]... " + text[-tail:]
 
 READ_FILE_TOOL_DEF = {
     "type": "function",
@@ -170,6 +180,20 @@ OBSERVER_TOOL_DEFS = [
 ]
 
 
+def build_tool_registry(send_correction) -> ToolRegistry:
+    return ToolRegistry((
+        ToolSpec(READ_FILE_TOOL_DEF, read_file),
+        ToolSpec(MEMORY_LIST_TOOL_DEF, memory_list),
+        ToolSpec(MEMORY_ADD_TOOL_DEF, memory_add),
+        ToolSpec(MEMORY_DELETE_TOOL_DEF, memory_delete),
+        ToolSpec(MEMORY_UPDATE_TOOL_DEF, memory_update),
+        ToolSpec(IDEA_LIST_TOOL_DEF, idea_list),
+        ToolSpec(IDEA_ADD_TOOL_DEF, idea_add),
+        ToolSpec(IDEA_UPDATE_TOOL_DEF, idea_update),
+        ToolSpec(SEND_CORRECTION_TOOL_DEF, send_correction),
+    ))
+
+
 def read_file(args: dict) -> str:
     path = args.get("path", "").strip()
     limit = int(args.get("limit", 50))
@@ -183,7 +207,10 @@ def read_file(args: dict) -> str:
             prefix = f"[文件过长，只显示最后 {limit} 行]\n"
         else:
             prefix = ""
-        return prefix + "".join(lines)
+        content = prefix + "".join(lines)
+        if len(content) > 12000:
+            content = "[历史输出过长，仅保留末尾 12000 字符]\n" + content[-12000:]
+        return content
     except FileNotFoundError:
         return f"[错误] 文件不存在：{path}"
     except Exception as e:
@@ -196,7 +223,7 @@ def memory_list(args: dict) -> str:
         return "[Memory] 暂无记录"
     lines = ["[Memory 看板]"]
     for e in entries:
-        lines.append(f"- [{e.kind}] {e.id}: {e.content}")
+        lines.append(f"- [{e.kind}] {e.id} ({e.attempt_id}): {_excerpt(e.content, 700)}")
     return "\n".join(lines)
 
 
@@ -205,8 +232,13 @@ def memory_add(args: dict) -> str:
     content = args.get("content", "").strip()
     if not content:
         return "[错误] content 不能为空"
-    entry = mem_store.add_memory(_challenge_dir(), kind=kind, content=content, source="observer")
-    return f"[Memory] 已添加 [{kind}] {entry.id}: {content}"
+    entry, created = mem_store.add_memory_with_status(
+        _challenge_dir(), kind=kind, content=content, source="observer",
+        attempt_id=_ctx.attempt_id,
+    )
+    if not created:
+        return f"[Memory] 已存在，未新增 [{entry.kind}] {entry.id}: {entry.content}"
+    return f"[Memory] 已添加 [{entry.kind}] {entry.id}: {entry.content}"
 
 
 def memory_delete(args: dict) -> str:
@@ -231,7 +263,10 @@ def idea_list(args: dict) -> str:
     lines = ["[Ideas 看板]"]
     for i in ideas:
         result_str = f" → {i.result}" if i.result else ""
-        lines.append(f"- [{i.status}] {i.id}: {i.content}{result_str}")
+        lines.append(
+            f"- [{i.status}] {i.id} ({i.owner_attempt_id}): "
+            f"{_excerpt(i.content + result_str, 450)}"
+        )
     return "\n".join(lines)
 
 
@@ -239,7 +274,10 @@ def idea_add(args: dict) -> str:
     content = args.get("content", "").strip()
     if not content:
         return "[错误] content 不能为空"
-    idea = idea_store.add_idea(_challenge_dir(), content=content, source="observer")
+    idea = idea_store.add_idea(
+        _challenge_dir(), content=content, source="observer",
+        owner_attempt_id=_ctx.attempt_id,
+    )
     return f"[Ideas] 已添加 [{idea.status}] {idea.id}: {content}"
 
 

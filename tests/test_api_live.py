@@ -26,7 +26,7 @@ from solver.ctfplatform.tsecbench_client import (
 
 
 BASE_URL = "https://tsecbench.zc.tencent.com"
-TOKEN = "5008ff7a-9f0f-4751-9d5a-584771edaa2a"
+TOKEN = os.environ.get("BENCHMARK_TOKEN", "").strip()
 
 
 def main():
@@ -34,7 +34,15 @@ def main():
     print("  Tsecbench API 连通性测试")
     print("=" * 60)
 
-    client = TsecbenchClient(base_url=BASE_URL, token=TOKEN, timeout=30.0)
+    if not TOKEN:
+        print("  请先设置 BENCHMARK_TOKEN，本测试不再从代码读取密钥。")
+        return
+
+    client = TsecbenchClient(
+        base_url=os.environ.get("BENCHMARK_BASE_URL", BASE_URL),
+        token=TOKEN,
+        timeout=30.0,
+    )
 
     # ─── Step 0: VPN 检测 ───
     print("\n[Step 0] VPN 检测...")
@@ -100,6 +108,12 @@ def main():
         client.close()
         return
 
+    if os.environ.get("TSECBENCH_LIFECYCLE_TEST") != "1":
+        print("\n  只读连通性测试通过。")
+        print("  如需测试 start/close，设置 TSECBENCH_LIFECYCLE_TEST=1。")
+        client.close()
+        return
+
     # 选一道未完成的 easy 题做后续测试
     test_challenge = None
     for c in challenges:
@@ -142,7 +156,7 @@ def main():
         import traceback; traceback.print_exc()
 
     # ─── Step 3: 获取提示（可选，会扣分，这里只在已启动时测试） ───
-    if started:
+    if started and os.environ.get("TSECBENCH_HINT_TEST") == "1":
         print(f"\n[Step 3] 获取提示: {code}...")
         print(f"  ⚠️ 注意: 获取提示会导致后续提交扣分，这里仅做接口测试")
         try:

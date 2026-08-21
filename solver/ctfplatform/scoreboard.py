@@ -116,9 +116,16 @@ class Scoreboard:
         running = sum(1 for r in self._rows.values() if r.status.startswith("🔄"))
         queued = sum(1 for r in self._rows.values() if r.status.startswith("⏳"))
 
-        earned = sum(
-            r.total_score for r in self._rows.values() if r.status.startswith("✅")
-        )
+        earned = 0
+        for r in self._rows.values():
+            if not r.status.startswith("✅"):
+                continue
+            # 优先用 submit 回传的实际累计分（含 hint 扣分），否则回退到满分
+            score_file = self._path.parent / r.unique_code / ".cumulative_score"
+            try:
+                earned += int(score_file.read_text(encoding="utf-8").strip())
+            except Exception:
+                earned += r.total_score
 
         # 正在运行的题目列表
         running_codes = [c for c in self._order if self._rows[c].status.startswith("🔄")]

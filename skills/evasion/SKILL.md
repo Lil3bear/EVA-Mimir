@@ -1,4 +1,18 @@
+---
+name: evasion
+description: 处理 CTF 中的过滤规则、WAF、上传限制与二进制检测规避；确认检测证据后按类别加载 reference。
+---
+
 # 对抗规避 Skill — CTF WAF Bypass / 安全设备绕过 / Binary Evasion 指引
+
+## Reference 路由
+
+| 证据 | 加载 reference |
+|---|---|
+| WAF 或 SQL 过滤 | `waf-sqli.md` |
+| XSS 或命令参数过滤 | `xss-command.md` |
+| 上传、PHP 或文件类型检测 | `upload-and-php.md` |
+| ELF/PE 校验、沙箱或二进制检测 | `binary-evasion.md` |
 
 ## 适用场景
 CTF 对抗规避类题目，包括 WAF 绕过、IDS/IPS 规避、沙箱逃逸、AV 免杀、编码绕过、流量伪装、Binary Patching 绕过检测等。

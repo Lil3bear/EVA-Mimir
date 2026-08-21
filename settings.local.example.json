@@ -1,0 +1,19 @@
+{
+  "llm": {
+    "base_url": "https://api.deepseek.com/v1",
+    "api_key": "replace-me",
+    "default_model": "deepseek-v4-flash",
+    "observer_model": "deepseek-v4-flash",
+    "reasoning_effort": "high",
+    "max_output_tokens": 8192,
+    "summary_max_output_tokens": 8192,
+    "observer_reasoning_effort": "high",
+    "observer_max_output_tokens": 8192,
+    "observer_max_react_rounds": 3,
+    "observer_thinking_enabled": false
+  },
+  "solver": {
+    "max_parallel": 1,
+    "observer_every_rounds": 8
+  }
+}
