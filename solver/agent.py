@@ -200,6 +200,8 @@ class SolverAgent:
             "difficult": 12,
         }.get(difficulty, 10)
         self._auto_submit_count = 0  # 每题自动提交 flag 的累计次数（限流防误报）
+        self._wrong_submit_streak = 0  # 连续错误提交计数（触发强制干预）
+        self._wrong_submit_warned = False
         self._auto_submit_limit = 3
         self._target_url = ""
         # 从 task 中提取 URL 与多 Flag 总数（用于放宽自动提交限流）。
@@ -549,14 +551,25 @@ class SolverAgent:
                         solved = True
                         break
                     # 多 flag 题：提交成功一个但未完成，强制注入继续寻找提示
-                    # result 里已含进度和"还有剩余 Flag"提示
-                    # 额外注入一条强制指令，确保 Solver 不会停下
                     self._queue_injection(
                         f"[多 Flag 提醒] {result}"
                         "\n先调用 challenge_get_state 确认剩余数量；然后只从当前已验证的权限、"
                         "文件、配置或网络证据选择一个新的路线。已完成的扫描和失败方向不要重复，"
                         "若连续多个方向都没有新证据，按控制策略切换或结束本题。"
                     )
+                elif tool_name == "challenge_submit_flag" and ("提交错误" in result or "[✗]" in result):
+                    # 连续错误提交：停止盲目猜，强制回到证据分析。避免 f2-05 类
+                    # 题连续猜 key 烧完提交额度。
+                    self._wrong_submit_streak += 1
+                    if self._wrong_submit_streak >= 3 and not self._wrong_submit_warned:
+                        self._wrong_submit_warned = True
+                        self._queue_injection(
+                            "[错误提交干预] 已连续 3 次提交错误 flag/key。立即停止猜测，"
+                            "回到题目逻辑：附件题用 strings/objdump 定位校验逻辑再用 z3 求解；"
+                            "Web 题读源码/配置找真实 flag 或漏洞点。没有新证据前不再提交。"
+                        )
+                elif tool_name == "challenge_submit_flag":
+                    self._wrong_submit_streak = 0
 
             _emit("round_end", {"round": self.round})
             self.observer.on_round_end(self.round)

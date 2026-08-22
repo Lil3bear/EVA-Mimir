@@ -2,6 +2,11 @@
 
 > 适用：授权引擎、许可证校验、序列号校验器、设备授权校验器等"输入 key/序列号 → 校验 → 放行"类二进制题。
 
+## ⚠️ 硬约束（违反即为无效消耗）
+- **禁止暴力猜 key/序列号**：连续 2 次提交错误，立即停止猜，回到逆向分析。
+- 提交前必须能解释：这个 key 是从哪个校验逻辑（常量/算法）推导出来的。
+- 没有拿到校验逻辑（strings/objdump 里的常量或算法）之前，不提交任何候选。
+
 ## 识别题型
 - 题目描述含「授权」「许可证」「序列号」「license」「serial」「authorization engine」。
 - 程序行为：要求输入 key/序列号，校验通过才输出 flag 或解锁功能。
@@ -49,6 +54,43 @@ open('patched','wb').write(data)
 2. 找校验函数（常见 `strlen` + 逐字符运算 + 常量比较）。
 3. 用 z3 逐位求解满足约束的序列号。
 4. 提交合法序列号拿 flag。
+
+## z3 序列号求解完整模板（可直接复制）
+
+```python
+#!/usr/bin/env python3
+# 适用：序列号 = 若干字节，校验逻辑是逐字符运算 + 常量比较
+from z3 import *
+
+# 1. 从逆向分析确定序列号长度和每字节约束
+LEN = 16  # 根据 strlen/循环次数确定
+key = [BitVec(f'k{i}', 8) for i in range(LEN)]
+
+s = Solver()
+
+# 2. 字符集约束（可打印 ASCII，避免不可输入字节）
+for k in key:
+    s.add(k >= 0x20, k <= 0x7e)
+
+# 3. 逐字节校验约束（从 objdump 还原的算法逐条翻译）
+# 示例：k[0] ^ 0x2a == 0x55, (k[1] + k[2]) & 0xff == 0x9c ...
+# s.add(key[0] ^ 0x2a == 0x55)
+# s.add((key[1] + key[2]) & 0xff == 0x9c)
+# ...
+
+# 4. 求解并输出第一个解
+if s.check() == sat:
+    m = s.model()
+    serial = bytes(m[k].as_long() for k in key)
+    print('serial:', serial)
+else:
+    print('无解，检查约束还原是否正确')
+```
+
+**约束还原要点**：
+- `add/sub/xor/rol/ror` 逐个翻译成 z3 表达式；比较立即数 `cmp al, 0x41` 直接作为约束。
+- 有分支时把"放行分支"的条件作为约束（而不是失败分支）。
+- 解不出来时打印中间变量，确认哪个字节的约束冲突。
 
 ## 工具链
 - 静态：`file` / `strings` / `readelf` / `objdump` / `rizin`（若可用）
