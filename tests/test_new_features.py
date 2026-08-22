@@ -139,6 +139,9 @@ class ControlPolicyTests(unittest.TestCase):
         self.assertEqual(hard_pentest.max_rounds, 200)
         self.assertEqual(easy.observer_every_rounds, 15)
         self.assertEqual(hard_pentest.observer_every_rounds, 8)
+        # hard 多阶段题的 stop_after 必须足够宽，避免侦察阶段就 force_stop
+        self.assertEqual(hard_pentest.stop_after, 72)
+        self.assertEqual(ControlPolicy.from_settings({"solver": {}}, "hard").stop_after, 48)
 
     def test_explicit_policy_overrides_are_positive_only(self):
         policy = ControlPolicy.from_settings(

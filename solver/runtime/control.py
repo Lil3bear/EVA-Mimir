@@ -17,7 +17,11 @@ _PENTEST_EXTRA = {"easy": 40, "medium": 120, "hard": 80, "difficult": 80}
 _CTYPE_EXTRA = {"easy": 30, "medium": 60, "hard": 40, "difficult": 40}
 _OBSERVER_INTERVALS = {"easy": 15, "medium": 12, "hard": 8, "difficult": 8}
 _DEFAULT_SWITCH_AFTER = {"easy": 10, "medium": 12, "hard": 12, "difficult": 12}
-_DEFAULT_STOP_AFTER = {"easy": 20, "medium": 24, "hard": 24, "difficult": 24}
+# stop_after 必须与 max_rounds 成比例。hard 多阶段题前几十轮还在侦察，
+# 过紧的 stop_after 会在拿到 flag 前就 force_stop（run-12020 b-02 回退根因）。
+_DEFAULT_STOP_AFTER = {"easy": 20, "medium": 30, "hard": 48, "difficult": 48}
+_STOP_PENTEST_EXTRA = 24
+_STOP_CTYPE_EXTRA = 12
 
 
 @dataclass(frozen=True)
@@ -52,6 +56,12 @@ class ControlPolicy:
                 value = 0
             return value if value > 0 else default
 
+        stop_after = _DEFAULT_STOP_AFTER.get(difficulty, 24)
+        if pentest:
+            stop_after += _STOP_PENTEST_EXTRA
+        if ctype:
+            stop_after += _STOP_CTYPE_EXTRA
+
         return cls(
             max_rounds=positive_setting("max_rounds", base),
             switch_after=positive_setting(
@@ -60,7 +70,7 @@ class ControlPolicy:
             ),
             stop_after=positive_setting(
                 "no_progress_rounds",
-                _DEFAULT_STOP_AFTER.get(difficulty, 24),
+                stop_after,
             ),
             observer_every_rounds=positive_setting(
                 "observer_every_rounds",
