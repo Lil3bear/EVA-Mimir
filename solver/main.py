@@ -124,14 +124,13 @@ def _run_tsecbench_mode() -> None:
     llm_url = llm_cfg.get("base_url") or os.environ.get("LLM_BASE_URL", "")
     llm_key = llm_cfg.get("api_key") or os.environ.get("LLM_API_KEY", "")
 
-    # 托管模式只能访问平台网关。即使旧的 settings.local.json 中残留
-    # 公网 URL，也要在进入 Solver 前强制改写，避免托管沙箱访问公网。
+    # 托管模式默认只能访问平台网关；但显式 LLM_GATEWAY=0 时保持直连
+    # （例如 tokenhub.tencentmaas.com 等可直连端点）。
     if not llm_url:
         llm_url = "http://api.deepseek.com.tsecbench.gw/v1"
     else:
-        # Always normalize hosted URLs, including a manually suffixed
-        # https://...tsecbench.gw value.
-        llm_url = _apply_llm_gateway(llm_url, {"LLM_GATEWAY": "1"})
+        # LLM_GATEWAY=1 → 强制改写为 *.tsecbench.gw；否则保持直连。
+        llm_url = _apply_llm_gateway(llm_url)
     llm_cfg["base_url"] = llm_url
 
     if not llm_key:
