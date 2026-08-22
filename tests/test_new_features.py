@@ -191,6 +191,19 @@ class DifficultyMaxRoundsTests(unittest.TestCase):
     @patch("solver.agent.ObserverLoop")
     @patch("solver.agent.OpenAI")
     @patch("solver.agent.search_tool")
+    def test_multi_flag_task_widens_auto_submit_limit(self, mock_search, mock_openai, mock_observer):
+        from solver.agent import SolverAgent
+        task = (
+            "# CTF 题目：b-02\n- 难度：hard\n- 目标地址：http://10.0.1.1\n"
+            "- ⚠️ 本题包含 6 个 Flag（多阶段渗透题）"
+        )
+        settings = {"llm": {"base_url": "http://x", "api_key": "k"}}
+        agent = SolverAgent(task=task, settings=settings, skills_dir="/skills")
+        self.assertEqual(agent._auto_submit_limit, 6)
+
+    @patch("solver.agent.ObserverLoop")
+    @patch("solver.agent.OpenAI")
+    @patch("solver.agent.search_tool")
     def test_hint_min_round_scales_with_difficulty(self, mock_search, mock_openai, mock_observer):
         from solver.agent import SolverAgent
 

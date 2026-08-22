@@ -200,14 +200,21 @@ class SolverAgent:
             "difficult": 12,
         }.get(difficulty, 10)
         self._auto_submit_count = 0  # 每题自动提交 flag 的累计次数（限流防误报）
+        self._auto_submit_limit = 3
         self._target_url = ""
-        # 从 task 中提取 URL
+        # 从 task 中提取 URL 与多 Flag 总数（用于放宽自动提交限流）。
+        # 两个独立循环：URL 命中后 break 不能提前跳过后面的 Flag 总数行。
         for line in task.splitlines():
             if "目标地址：" in line or "目标：" in line:
                 parts = line.split("：", 1)
                 if len(parts) > 1:
                     self._target_url = parts[1].strip()
                     break
+        for line in task.splitlines():
+            match = __import__("re").search(r"包含\s+(\d+)\s+个\s*Flag", line)
+            if match:
+                self._auto_submit_limit = max(3, min(8, int(match.group(1))))
+                break
 
         # 渗透阶段状态机
         self._phase = "RECON"
@@ -1072,10 +1079,11 @@ class SolverAgent:
         """
         从工具输出中自动提取并提交【高置信度】 flag。
         只认已知 flag 前缀（flag/HTB/gctf/SEKAI/CTF/NSSCTF/WLLMCTF），且内容无空白；
-        每题累计自动提交 ≤ 3 次，避免逆向/杂项题输出里大量非 flag 字符串被误提交。
+        每题累计自动提交默认 ≤ 3 次，多 Flag 题按题目 flag 总数放宽（上限 8），
+        避免逆向/杂项题输出里大量非 flag 字符串被误提交。
         """
         import re
-        if self._auto_submit_count >= 3:
+        if self._auto_submit_count >= getattr(self, "_auto_submit_limit", 3):
             return ""
         pattern = re.compile(
             r'(?:flag|FLAG|htb|HTB|gctf|GCTF|sekai|SEKAI|ctf|CTF|nssctf|NSSCTF|wllmctf|WLLMCTF)'
@@ -1133,7 +1141,7 @@ class SolverAgent:
             return ""
         notes = []
         for flag in flags:
-            if self._auto_submit_count >= 3:
+            if self._auto_submit_count >= getattr(self, "_auto_submit_limit", 3):
                 break
             try:
                 sub = bridge_tools.submit_flag({"flag": flag, "writeup": "auto-submit from tool output"})

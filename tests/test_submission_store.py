@@ -165,6 +165,31 @@ class SubmissionStoreTests(unittest.TestCase):
         self.assertIn("disk full", outcome.persistence_error)
         self.assertEqual((root / ".cumulative_score").read_text(), "40")
 
+    def test_get_state_reports_flag_progress(self):
+        root = Path(tempfile.mkdtemp(prefix="get-state-progress-"))
+        run = RunContext.create(str(root), "case")
+
+        class StateClient:
+            def list_challenges(self):
+                return [Challenge(
+                    unique_code="case",
+                    description="multi stage",
+                    difficulty="hard",
+                    level=1,
+                    total_score=100,
+                    flag_count=6,
+                    correct_flag_count=1,
+                    is_completed=False,
+                    container_status="running",
+                    container_addr=(),
+                )]
+
+        with ctx.bind(run, StateClient()):
+            result = bridge_tools.get_state({})
+
+        self.assertIn("已找到 1/6", result)
+        self.assertIn("还有 5 个 Flag 待找", result)
+
     def test_hint_is_fetched_once_and_replayed_from_challenge_cache(self):
         root = Path(tempfile.mkdtemp(prefix="hint-cache-"))
         run = RunContext.create(str(root), "case")

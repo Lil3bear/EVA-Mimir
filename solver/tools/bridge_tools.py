@@ -186,6 +186,7 @@ def _request_tsecbench(action: str, params: dict) -> dict:
 
 
 def _challenge_to_state(challenge: Challenge) -> dict:
+    remaining = max(0, challenge.flag_count - challenge.correct_flag_count)
     return {
         "name": challenge.unique_code,
         "category": "unknown",
@@ -197,6 +198,7 @@ def _challenge_to_state(challenge: Challenge) -> dict:
         "unique_code": challenge.unique_code,
         "flag_count": challenge.flag_count,
         "correct_flag_count": challenge.correct_flag_count,
+        "remaining_flag_count": remaining,
         "container_status": challenge.container_status,
         "container_addr": list(challenge.container_addr),
     }
@@ -335,12 +337,19 @@ def get_state(args: dict) -> str:
             f"状态={item.get('container_status')}，完成={item.get('is_completed')}"
             for item in data["challenges"]
         )
+    correct = int(data.get("correct_flag_count", 0))
+    total = int(data.get("flag_count", 0))
+    remaining = max(0, total - correct)
     lines = [
         f"题目：{data.get('name')} ({data.get('category')} / {data.get('difficulty')})",
         f"URL：{data.get('url')}",
         f"描述：{data.get('description')}",
-        f"已完成：{'是' if data.get('is_completed') else '否'}",
+        f"Flag 进度：已找到 {correct}/{total} 个",
     ]
+    if data.get("is_completed"):
+        lines.append("状态：✅ 已完成（全部 Flag 已提交）")
+    else:
+        lines.append(f"状态：未完成，还有 {remaining} 个 Flag 待找，必须继续提交")
     correct_flags = data.get("correct_flags", [])
     if correct_flags:
         lines.append(f"已找到的 Flag：{', '.join(correct_flags)}")
