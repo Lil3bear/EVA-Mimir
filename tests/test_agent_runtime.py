@@ -391,7 +391,8 @@ class PersistentProgressTests(unittest.TestCase):
         agent._material_progress_count = 1
         self.assertFalse(agent._hint_focus_exhausted())
 
-    def test_same_http_evidence_is_not_fresh_in_next_agent(self):
+    def test_same_http_evidence_still_counts_as_progress_in_next_agent(self):
+        """宽松判定：不跨 agent 去重，重复 HTTP 证据也刷新停机计数。"""
         root = Path(tempfile.mkdtemp(prefix="persistent-progress-"))
 
         first = SolverAgent.__new__(SolverAgent)
@@ -403,7 +404,7 @@ class PersistentProgressTests(unittest.TestCase):
 
         output = "HTTP/1.1 200 OK\nServer: demo"
         self.assertTrue(first._bash_has_new_progress(output))
-        self.assertFalse(second._bash_has_new_progress(output))
+        self.assertTrue(second._bash_has_new_progress(output))
 
 
 class FlagEvidenceGateTests(unittest.TestCase):

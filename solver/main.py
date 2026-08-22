@@ -199,17 +199,12 @@ def _run_tsecbench_mode() -> None:
     os.environ.setdefault("CTF_RUN_ID", uuid.uuid4().hex)
     deadline = start_time + max(0, total_timeout_min) * 60
 
-    # 题目级无增量收敛：同一证据由 ChallengeLedger 跨重跑去重，
-    # 因此只有新增 flag 或新实质证据才重置 streak。困难题多给一次机会。
+    # 旧版（run-11649 基线）语义：连续 MAX_FAIL_STREAK 轮 0 correct 才放弃，
+    # 部分解出（correct>0）重置计数。不用 made_progress / 无增量收敛，
+    # 避免 hard 多阶段题在拿不到新增 flag 时被提前暂停。
     fail_streak: dict[str, int] = {}
-    fail_limit: dict[str, int] = {}
     abandoned_codes: set[str] = set()
-    no_delta_limits = {
-        "easy": 2,
-        "medium": 2,
-        "hard": 3,
-        "difficult": 3,
-    }
+    MAX_FAIL_STREAK = 4
     cumulative_report: dict = {}
     # Only report a total count that came from a successful platform snapshot;
     # never hard-code a presumed benchmark size after a terminal error.
@@ -303,15 +298,11 @@ def _run_tsecbench_mode() -> None:
             if r.success:
                 this_round_solved += 1
                 fail_streak.pop(r.unique_code, None)
-                fail_limit.pop(r.unique_code, None)
-            elif r.made_progress:
-                fail_streak.pop(r.unique_code, None)
-                fail_limit.pop(r.unique_code, None)
-            else:
+            elif r.correct_flag_count == 0:
                 this_round_failed.add(r.unique_code)
-                fail_limit[r.unique_code] = no_delta_limits.get(
-                    (r.difficulty or "").lower(), 2
-                )
+            else:
+                # 部分解出（correct>0）重置失败计数（旧版语义）
+                fail_streak.pop(r.unique_code, None)
 
         _emit("retry_round_end", {
             "round": round_idx,
@@ -324,10 +315,10 @@ def _run_tsecbench_mode() -> None:
         for code in this_round_failed:
             fail_streak[code] = fail_streak.get(code, 0) + 1
 
-        # 连续多次无新增 flag/证据 → 暂停该题，避免跨重跑从头循环。
+        # 连续 MAX_FAIL_STREAK 轮失败（0 correct）→ 放弃
         newly_abandoned = {
             code for code, streak in fail_streak.items()
-            if streak >= fail_limit.get(code, 2)
+            if streak >= MAX_FAIL_STREAK
         }
         abandoned_codes |= newly_abandoned
         for code in newly_abandoned:
@@ -335,14 +326,9 @@ def _run_tsecbench_mode() -> None:
         if newly_abandoned:
             _emit("retry_abandoned", {
                 "codes": sorted(newly_abandoned),
-                "reason": "repeated_no_flag_or_material_evidence_delta",
-                "no_delta_limits": {
-                    code: fail_limit.get(code, 2) for code in sorted(newly_abandoned)
-                },
+                "reason": "consecutive_zero_correct_rounds",
                 "total_abandoned": len(abandoned_codes),
             })
-            for code in newly_abandoned:
-                fail_limit.pop(code, None)
 
         # 检查是否还有未完成的题
         try:

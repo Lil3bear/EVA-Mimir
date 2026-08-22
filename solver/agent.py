@@ -463,14 +463,11 @@ class SolverAgent:
                         "error": execution.journal_error,
                     })
 
-                # ━━ 记录“新进展”轮次（只认新增，不认重复操作）━━
+                # ━━ 记录“新进展”轮次（宽松判定：不指纹去重，避免 hard 题侦察阶段被停）━━
                 if tool_name == "memory_add" and (
                     "已记录" in result or "已添加" in result
-                ) and "已存在" not in result and tool_args.get("kind") in {
-                    "evidence", "fact"
-                }:
-                    # note/failure 是过程管理，不足以延长整题预算；只有
-                    # 新事实或证据才算实质进展。
+                ) and "已存在" not in result:
+                    # 任何 memory_add 都算进展（旧版宽松语义，保留探索机会）
                     self._last_progress_round = self.round
                     self._last_discovery_round = self.round
                     self._material_progress_count += 1
@@ -480,9 +477,9 @@ class SolverAgent:
                     self._last_progress_round = self.round
                     self._last_discovery_round = self.round
                     self._material_progress_count += 1
-                elif tool_name in ("bash", "read_file", "grep") and self._bash_has_new_progress(result):
-                    # Fingerprints are challenge-scoped, so another strategy or
-                    # retry cannot recycle the same response as fresh evidence.
+                elif tool_name in ("bash", "read_file", "grep") and self._bash_is_progress(result):
+                    # 无指纹去重：每次出现新结构化证据都刷新停机计数，
+                    # 重复 HTTP 200/IP 不再被去重误判为“死循环”。
                     self._last_progress_round = self.round
                     self._last_discovery_round = self.round
                     self._material_progress_count += 1
@@ -1019,52 +1016,12 @@ class SolverAgent:
         return list(dict.fromkeys(keywords))
 
     def _bash_has_new_progress(self, result: str) -> bool:
-        """只把首次出现的结构化证据计为进展。
+        """宽松进展判定：不指纹去重，直接判断是否含结构化证据。
 
-        单纯出现 HTTP 200、同一个目标 IP 或重复的 password 字样不能
-        无限刷新停机计数；每个结构化信号只在本题首次出现时计一次。
+        旧版（run-11649 基线）语义：每次出现 HTTP 200/IP/凭据都刷新停机
+        计数，避免 hard 题在重复探测阶段被“无进展”误判而提前停止。
         """
-        if not self._bash_is_progress(result):
-            return False
-        import hashlib
-        import re
-        signals: list[str] = []
-        patterns = (
-            ("flag", r"[A-Za-z0-9_]+\{[^}\s]{4,80}\}"),
-            ("ip", r"\b\d{1,3}(?:\.\d{1,3}){3}\b"),
-            ("uid", r"uid=\d+(?:\([^)]*\))?"),
-            ("credential", r"(?:password|passwd|secret|token|api[_-]?key)\s*[=:]\s*[^\s,;]+"),
-            ("http", r"HTTP/\d\.\d\s+\d{3}"),
-        )
-        for kind, pattern in patterns:
-            for value in re.findall(pattern, result, re.IGNORECASE):
-                normalized = f"{kind}:{str(value).lower()}"
-                signals.append(normalized)
-        if not signals:
-            # 一次性的明确成功/发现文本仍算进展，但重复正文不算。
-            normalized = re.sub(r"\s+", " ", result).strip().lower()[:300]
-            signals.append(f"text:{normalized}")
-        fingerprints = [
-            hashlib.sha1(signal.encode()).hexdigest()[:16]
-            for signal in dict.fromkeys(signals)
-        ]
-        ledger = getattr(self, "_ledger", None)
-        if ledger is not None:
-            try:
-                fresh_count = ledger.register_fingerprints(fingerprints)
-                self._progress_fingerprints.update(fingerprints)
-                return fresh_count > 0
-            except Exception:
-                # A control ledger failure must not stop solving; retain the
-                # original in-memory deduplication for this Agent.
-                pass
-
-        fresh = False
-        for fingerprint in fingerprints:
-            if fingerprint not in self._progress_fingerprints:
-                self._progress_fingerprints.add(fingerprint)
-                fresh = True
-        return fresh
+        return self._bash_is_progress(result)
 
     @staticmethod
     def _bash_is_progress(result: str) -> bool:
