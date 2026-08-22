@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from solver.ctfplatform.tsecbench_client import Challenge, DuplicateSubmit
+from solver.ctfplatform.tsecbench_client import Challenge, DuplicateSubmit, HintResult
 from solver.runtime.context import RunContext, ctx
 from solver.runtime.submission_store import (
     SubmissionStore,
@@ -81,6 +81,7 @@ class SubmissionStoreTests(unittest.TestCase):
         (root / "attempts" / "primary").mkdir(parents=True)
         (root / "attempts" / "primary" / ".solver-history.jsonl").write_text("old")
         (root / ".execution-journal.jsonl").write_text("old")
+        (root / ".challenge-ledger.json").write_text("{}")
 
         with patch.dict(
             "os.environ",
@@ -92,6 +93,7 @@ class SubmissionStoreTests(unittest.TestCase):
             self.assertFalse((root / "ideas" / "index.json").exists())
             self.assertFalse((root / "attempts").exists())
             self.assertFalse((root / ".execution-journal.jsonl").exists())
+            self.assertFalse((root / ".challenge-ledger.json").exists())
             self.assertTrue(score_belongs_to_current_task(root))
             self.assertFalse(prepare_challenge_state(root))
 
@@ -162,6 +164,27 @@ class SubmissionStoreTests(unittest.TestCase):
         self.assertEqual(outcome.status, "correct")
         self.assertIn("disk full", outcome.persistence_error)
         self.assertEqual((root / ".cumulative_score").read_text(), "40")
+
+    def test_hint_is_fetched_once_and_replayed_from_challenge_cache(self):
+        root = Path(tempfile.mkdtemp(prefix="hint-cache-"))
+        run = RunContext.create(str(root), "case")
+
+        class HintClient:
+            calls = 0
+
+            def get_hint(self, unique_code):
+                self.calls += 1
+                return HintResult(unique_code, "try another protocol")
+
+        client = HintClient()
+        with ctx.bind(run, client):
+            first = bridge_tools.get_hint({})
+            second = bridge_tools.get_hint({})
+
+        self.assertEqual(client.calls, 1)
+        self.assertIn("首次获取并已缓存", first)
+        self.assertIn("本地缓存", second)
+        self.assertIn("try another protocol", second)
 
     def test_remote_duplicate_reconciles_completion_state(self):
         root = Path(tempfile.mkdtemp(prefix="submission-duplicate-state-"))

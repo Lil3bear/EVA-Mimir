@@ -10,6 +10,7 @@ import httpx
 from openai import APITimeoutError
 
 from solver.agent import SolverAgent, _parse_tool_args
+from solver.runtime.challenge_ledger import ChallengeLedger
 from solver.runtime.context import RunContext, ctx
 from solver.runtime.llm import (
     assistant_message_dict,
@@ -375,6 +376,34 @@ class CompactionTests(unittest.TestCase):
         agent._journal.complete.assert_called_once()
         self.assertIn("reboot", message)
         self.assertIn("禁止自动重放", message)
+
+
+class PersistentProgressTests(unittest.TestCase):
+    def test_hint_focus_stops_only_without_material_progress(self):
+        agent = SolverAgent.__new__(SolverAgent)
+        agent._hint_focus_start_round = 2
+        agent._hint_focus_limit = 8
+        agent._hint_focus_progress_baseline = 0
+        agent._material_progress_count = 0
+        agent.round = 11
+        self.assertTrue(agent._hint_focus_exhausted())
+
+        agent._material_progress_count = 1
+        self.assertFalse(agent._hint_focus_exhausted())
+
+    def test_same_http_evidence_is_not_fresh_in_next_agent(self):
+        root = Path(tempfile.mkdtemp(prefix="persistent-progress-"))
+
+        first = SolverAgent.__new__(SolverAgent)
+        first._ledger = ChallengeLedger(root)
+        first._progress_fingerprints = set()
+        second = SolverAgent.__new__(SolverAgent)
+        second._ledger = ChallengeLedger(root)
+        second._progress_fingerprints = set()
+
+        output = "HTTP/1.1 200 OK\nServer: demo"
+        self.assertTrue(first._bash_has_new_progress(output))
+        self.assertFalse(second._bash_has_new_progress(output))
 
 
 class FlagEvidenceGateTests(unittest.TestCase):

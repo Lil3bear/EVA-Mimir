@@ -20,6 +20,7 @@ from solver.ctfplatform.tsecbench_client import (
 from solver.ctfplatform.scheduler import (
     Scheduler,
     SchedulerReport,
+    SchedulerResult,
     _build_task_from_challenge,
     _retry_delay,
     _sort_challenges,
@@ -46,6 +47,33 @@ def _make_challenge(
         container_status="stopped",
         container_addr=(),
     )
+
+
+class AttemptProgressTests(unittest.TestCase):
+    def test_partial_without_new_flag_is_not_progress(self):
+        result = SchedulerResult(
+            "multi-flag",
+            success=False,
+            initial_correct_flag_count=1,
+            correct_flag_count=1,
+            material_progress_count=0,
+        )
+        self.assertFalse(result.made_progress)
+
+    def test_new_flag_or_material_evidence_is_progress(self):
+        new_flag = SchedulerResult(
+            "multi-flag",
+            success=False,
+            initial_correct_flag_count=1,
+            correct_flag_count=2,
+        )
+        evidence = SchedulerResult(
+            "unsolved",
+            success=False,
+            material_progress_count=1,
+        )
+        self.assertTrue(new_flag.made_progress)
+        self.assertTrue(evidence.made_progress)
 
 
 class RetryPolicyTests(unittest.TestCase):

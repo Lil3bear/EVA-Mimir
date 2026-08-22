@@ -174,6 +174,9 @@ class DifficultyMaxRoundsTests(unittest.TestCase):
             967_232,
         )
         self.assertEqual(agent._max_output_tokens, 8_192)
+        agent.round = 20
+        agent._last_discovery_round = 0
+        self.assertIn("easy 题默认不查看提示", agent._tool_gate("challenge_get_hint", {}))
 
     @patch("solver.agent.ObserverLoop")
     @patch("solver.agent.OpenAI")

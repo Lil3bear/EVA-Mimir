@@ -11,6 +11,7 @@ from solver.ctfplatform.tsecbench_client import (
     TaskNotFound,
     TsecbenchClient,
 )
+from solver.runtime.challenge_ledger import ChallengeLedger
 from solver.runtime.submission_store import SubmissionOutcome, SubmissionStore
 from solver.worker_context import ctx as _ctx
 
@@ -347,13 +348,26 @@ def get_state(args: dict) -> str:
 
 
 def get_hint(args: dict) -> str:
-    # hint 扣分是“每题一次性 10%”，重复查看不叠加；因此允许跨重跑轮次重新查看，
-    # 只保留“每轮一次”的门控在 agent 层（_hint_fetch_count）。
-    data = _request_backend("challenge_get_hint", args)
-    hints = data.get("hints", [])
+    # 提示扣分按题目一次性计算；跨 Agent/重跑时允许重看，但直接返回
+    # 题目级缓存，避免 Multi-Solver 重复请求平台和重复消耗时间。
+    challenge_dir = _challenge_dir()
+
+    def fetch() -> list[str]:
+        data = _request_backend("challenge_get_hint", args)
+        return [str(value) for value in data.get("hints", []) if value]
+
+    if challenge_dir:
+        hints, cached = ChallengeLedger(challenge_dir).get_or_fetch_hints(fetch)
+    else:
+        hints, cached = fetch(), False
     if not hints:
-        return "[提示] 暂无提示"
-    return "[提示]（本题已扣分，可反复查看，请充分利用）\n" + "\n".join(f"- {h}" for h in hints)
+        suffix = "（本地缓存）" if cached else ""
+        return f"[提示]{suffix} 暂无提示"
+    source = "本地缓存，未重复请求平台" if cached else "首次获取并已缓存"
+    return (
+        f"[提示]（{source}；本题提示扣分不重复叠加）\n"
+        + "\n".join(f"- {hint}" for hint in hints)
+    )
 
 
 def start_challenge(args: dict) -> str:

@@ -13,6 +13,7 @@
     "observer_thinking_enabled": false
   },
   "solver": {
-    "max_parallel": 1
+    "max_parallel": 1,
+    "allow_easy_hint": false
   }
 }

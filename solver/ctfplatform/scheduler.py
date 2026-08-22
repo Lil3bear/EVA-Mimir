@@ -39,6 +39,7 @@ from solver.ctfplatform.tsecbench_client import (
     VpnCheckError,
 )
 from solver.tools import bridge_tools
+from solver.runtime.challenge_ledger import ChallengeLedger
 from solver.runtime.submission_store import (
     prepare_challenge_state,
     score_belongs_to_current_task,
@@ -59,13 +60,24 @@ _CLOSE_RETRY_INTERVAL = 5  # 秒
 
 @dataclass
 class SchedulerResult:
-    """单题解题结果"""
+    """单题解题结果及本次 attempt 的实际增量。"""
     unique_code: str
     success: bool
     correct_flag_count: int = 0
     total_flag_count: int = 0
     error: str = ""
     rounds: int = 0
+    initial_correct_flag_count: int = 0
+    material_progress_count: int = 0
+    difficulty: str = ""
+
+    @property
+    def new_flag_count(self) -> int:
+        return max(0, self.correct_flag_count - self.initial_correct_flag_count)
+
+    @property
+    def made_progress(self) -> bool:
+        return bool(self.success or self.new_flag_count > 0 or self.material_progress_count > 0)
 
 
 @dataclass
@@ -263,7 +275,7 @@ class Scheduler:
             todo = [c for c in todo if c.unique_code.lower().startswith(self.prefix_filter.lower())]
             _emit("prefix_filter", {"prefix": self.prefix_filter, "matched": len(todo)})
 
-        # 跳过被放弃的题目（多轮重跑时连续两轮失败的题）
+        # 跳过被暂停的题目（跨重跑连续无新增 flag/实质证据）
         if self.skip_codes:
             todo = [c for c in todo if c.unique_code not in self.skip_codes]
 
@@ -338,6 +350,8 @@ class Scheduler:
                 "success": result.success,
                 "correct": result.correct_flag_count,
                 "total": result.total_flag_count,
+                "new_flags": result.new_flag_count,
+                "material_progress": result.material_progress_count,
                 "rounds": result.rounds,
                 "error": result.error,
             })
@@ -375,7 +389,10 @@ class Scheduler:
                         unique_code=challenge.unique_code,
                         success=False,
                         error=f"Worker exception: {e}",
+                        correct_flag_count=challenge.correct_flag_count,
                         total_flag_count=challenge.flag_count,
+                        initial_correct_flag_count=challenge.correct_flag_count,
+                        difficulty=challenge.difficulty,
                     )
                 results.append(result)
                 _emit("challenge_result", {
@@ -383,6 +400,8 @@ class Scheduler:
                     "success": result.success,
                     "correct": result.correct_flag_count,
                     "total": result.total_flag_count,
+                    "new_flags": result.new_flag_count,
+                    "material_progress": result.material_progress_count,
                     "rounds": result.rounds,
                     "error": result.error,
                 })
@@ -431,6 +450,8 @@ class Scheduler:
             success=False,
             total_flag_count=challenge.flag_count,
             correct_flag_count=challenge.correct_flag_count,
+            initial_correct_flag_count=challenge.correct_flag_count,
+            difficulty=challenge.difficulty,
         )
 
         base_context = RunContext(
@@ -506,12 +527,16 @@ class Scheduler:
 
             agent.run()
 
-            # 记录结果
+            # 记录结果。rounds 使用两个策略的总消耗，使题目级预算看到
+            # Multi-Solver 的真实成本，而不是只记录获胜策略。
             with result_lock:
+                best_result.rounds += agent.round
+                best_result.material_progress_count += int(
+                    getattr(agent, "_material_progress_count", 0) or 0
+                )
                 if agent.solved:
                     stop_event.set()  # 通知另一个停止
                     best_result.success = True
-                    best_result.rounds = agent.round
                     best_result.correct_flag_count = challenge.flag_count
 
         # 两个 Solver 只用 prompt 区分策略，共用同一套预算与一个 Observer。
@@ -588,6 +613,8 @@ class Scheduler:
             success=False,
             total_flag_count=challenge.flag_count,
             correct_flag_count=challenge.correct_flag_count,
+            initial_correct_flag_count=challenge.correct_flag_count,
+            difficulty=challenge.difficulty,
         )
 
         # A terminal platform error in another worker aborts queued work too;
@@ -739,6 +766,7 @@ class Scheduler:
                 raise
             except Exception:
                 pass
+            self._record_attempt_outcome(challenge_workspace, result)
             # close; retain the active marker on failure so the outer
             # finally/close_all_active path can retry rather than leaking a
             # container slot silently.
@@ -795,6 +823,9 @@ class Scheduler:
             })
             agent.run()
             result.rounds = agent.round
+            result.material_progress_count = int(
+                getattr(agent, "_material_progress_count", 0) or 0
+            )
             _emit("timing_agent_done", {
                 "unique_code": code,
                 "rounds": agent.round,
@@ -825,6 +856,8 @@ class Scheduler:
             raise
         except Exception:
             pass
+
+        self._record_attempt_outcome(challenge_workspace, result)
 
         # close_challenge 带重试：确保平台侧容器被释放，防止槽位泄漏
         close_ok = False
@@ -892,6 +925,28 @@ class Scheduler:
         """Serialize state snapshots so parallel attempts see a coherent platform view."""
         with self._platform_state_lock:
             return self.client.list_challenges()
+
+    @staticmethod
+    def _record_attempt_outcome(
+        challenge_workspace: str,
+        result: SchedulerResult,
+    ) -> None:
+        try:
+            ChallengeLedger(challenge_workspace).record_attempt({
+                "initial_correct_flags": result.initial_correct_flag_count,
+                "final_correct_flags": result.correct_flag_count,
+                "new_flags": result.new_flag_count,
+                "material_progress": result.material_progress_count,
+                "rounds": result.rounds,
+                "success": result.success,
+                "error": result.error[:300],
+            })
+        except Exception as exc:
+            _emit("challenge_ledger_error", {
+                "unique_code": result.unique_code,
+                "phase": "record_attempt",
+                "error": str(exc),
+            })
 
     @staticmethod
     def _collect_failure_note(challenge_workspace: str) -> str:

@@ -18,6 +18,7 @@ from solver.runtime.llm import (
     create_with_retry,
     is_deepseek_v4,
 )
+from solver.runtime.challenge_ledger import ChallengeLedger
 from solver.runtime.context_window import ContextWindow, serialize_messages
 from solver.runtime.control import ControlPolicy
 from solver.runtime.journal import ExecutionJournal
@@ -164,12 +165,34 @@ class SolverAgent:
         # hint 严格门：太低轮次 / 还在有新发现 / 本轮已看过则禁止看提示
         # 不用固定 20 轮硬卡——用“最近是否还有新发现”判断是否真卡住，避免早期白卡。
         self._hint_min_round = int(settings.get("solver", {}).get("hint_min_round", 8))
+        self._allow_easy_hint = bool(
+            settings.get("solver", {}).get("allow_easy_hint", False)
+        )
         # 每轮最多看一次提示；跨重跑轮次允许重看（提示扣分每题一次性，不叠加）。
         self._hint_fetch_count = 0
         self._last_progress_round = 0  # 最近一次有新进展的轮次（用于及时刹停）
         self._stuck_switched = False  # 是否已注入过“方向切换”指令
         self._last_discovery_round = 0  # 最近一次新发现（memory_add / 正确 flag）的轮次
         self._progress_fingerprints: set[str] = set()
+        challenge_dir = getattr(_ctx, "challenge_dir", "")
+        self._ledger = (
+            ChallengeLedger(challenge_dir)
+            if challenge_dir and challenge_dir != "/workspace"
+            else None
+        )
+        self._material_progress_count = 0
+        try:
+            cached_hints = self._ledger.cached_hints() if self._ledger else []
+        except Exception:
+            cached_hints = []
+        self._hint_focus_start_round: int | None = 0 if cached_hints else None
+        self._hint_focus_progress_baseline = 0
+        self._hint_focus_limit = {
+            "easy": 8,
+            "medium": 10,
+            "hard": 12,
+            "difficult": 12,
+        }.get(difficulty, 10)
         self._auto_submit_count = 0  # 每题自动提交 flag 的累计次数（限流防误报）
         self._target_url = ""
         # 从 task 中提取 URL
@@ -262,6 +285,9 @@ class SolverAgent:
         recovery_message = self._recover_execution()
         if recovery_message:
             self.messages.append({"role": "user", "content": recovery_message})
+        initial_snapshot = self._build_state_snapshot()
+        if initial_snapshot:
+            self.messages.append({"role": "user", "content": initial_snapshot})
 
         _emit("agent_start", {"task": self.task[:200]})
 
@@ -286,6 +312,15 @@ class SolverAgent:
                 self.observer.stop()
                 self._finish_execution("force_stop_no_progress")
                 _emit("agent_end", {"rounds": self.round, "reason": "force_stop_no_progress"})
+                return
+            if self._hint_focus_exhausted():
+                self.observer.stop()
+                self._finish_execution("hint_exhausted_no_progress")
+                _emit("agent_end", {
+                    "rounds": self.round,
+                    "reason": "hint_exhausted_no_progress",
+                    "hint_focus_rounds": self.round - self._hint_focus_start_round,
+                })
                 return
 
             # ━━ 及时刹停（分级）：先换方向，换方向后仍无进展才停 ━━
@@ -403,6 +438,9 @@ class SolverAgent:
                     and "[拒绝]" not in result
                 ):
                     self._hint_fetch_count += 1
+                    if self._hint_focus_start_round is None:
+                        self._hint_focus_start_round = self.round
+                        self._hint_focus_progress_baseline = self._material_progress_count
                 if execution.journal_error:
                     _emit("execution_journal_error", {
                         "call_id": tool_call.id,
@@ -413,23 +451,26 @@ class SolverAgent:
                 # ━━ 记录“新进展”轮次（只认新增，不认重复操作）━━
                 if tool_name == "memory_add" and (
                     "已记录" in result or "已添加" in result
-                ) and "已存在" not in result:
+                ) and "已存在" not in result and tool_args.get("kind") in {
+                    "evidence", "fact"
+                }:
+                    # note/failure 是过程管理，不足以延长整题预算；只有
+                    # 新事实或证据才算实质进展。
                     self._last_progress_round = self.round
                     self._last_discovery_round = self.round
+                    self._material_progress_count += 1
                 elif tool_name == "challenge_submit_flag" and (
                     "[✓]" in result and "[重复]" not in result
                 ):
                     self._last_progress_round = self.round
                     self._last_discovery_round = self.round
+                    self._material_progress_count += 1
                 elif tool_name in ("bash", "read_file", "grep") and self._bash_has_new_progress(result):
-                    # Source/attachment reads can be real progress on
-                    # reverse/crypto tasks too; the same first-seen evidence
-                    # fingerprint prevents repeated reads from resetting idle.
+                    # Fingerprints are challenge-scoped, so another strategy or
+                    # retry cannot recycle the same response as fresh evidence.
                     self._last_progress_round = self.round
                     self._last_discovery_round = self.round
-                elif tool_name == "write_file" and self._write_file_is_new(result):
-                    self._last_progress_round = self.round
-                    self._last_discovery_round = self.round
+                    self._material_progress_count += 1
 
                 # ━━ 自动提交工具输出中发现的 flag（不依赖 LLM 主动提交）━━
                 if tool_name in ("bash", "read_file", "grep"):
@@ -439,6 +480,7 @@ class SolverAgent:
                         if "[✓]" in auto_note and "[重复]" not in auto_note:
                             self._last_progress_round = self.round
                             self._last_discovery_round = self.round
+                            self._material_progress_count += 1
 
                 _emit("tool_result", {
                     "tool": tool_name,
@@ -643,6 +685,11 @@ class SolverAgent:
         if self._deadline_exceeded():
             return "[停止] 已达到本次运行截止时间，不再执行新的工具调用。"
         if tool_name == "challenge_get_hint":
+            if self._difficulty == "easy" and not self._allow_easy_hint:
+                return (
+                    "[拒绝] easy 题默认不查看提示，避免为本应快速解决的题扣分。"
+                    "请切换攻击面；若确需启用，显式设置 solver.allow_easy_hint=true。"
+                )
             since_discovery = self.round - self._last_discovery_round
             stuck_limit = {
                 "easy": 12,
@@ -824,6 +871,17 @@ class SolverAgent:
 
         lines = ["[状态快照] 当前看板（自动注入，请对照行动）："]
 
+        ledger = getattr(self, "_ledger", None)
+        if ledger is not None:
+            try:
+                cached_hints = ledger.cached_hints()
+            except Exception:
+                cached_hints = []
+            if cached_hints:
+                lines.append("💡 已缓存题目提示（不要重复请求平台，按提示验证新方向）：")
+                for hint in cached_hints:
+                    lines.append(f"  - {hint}")
+
         memory_limit = max(1, int(getattr(self, "_memory_limit", 10)))
 
         # ━━ 第一层：evidence（凭据）— 注入最近条目，完整记录仍可用 memory_list 查询
@@ -960,27 +1018,27 @@ class SolverAgent:
             # 一次性的明确成功/发现文本仍算进展，但重复正文不算。
             normalized = re.sub(r"\s+", " ", result).strip().lower()[:300]
             signals.append(f"text:{normalized}")
+        fingerprints = [
+            hashlib.sha1(signal.encode()).hexdigest()[:16]
+            for signal in dict.fromkeys(signals)
+        ]
+        ledger = getattr(self, "_ledger", None)
+        if ledger is not None:
+            try:
+                fresh_count = ledger.register_fingerprints(fingerprints)
+                self._progress_fingerprints.update(fingerprints)
+                return fresh_count > 0
+            except Exception:
+                # A control ledger failure must not stop solving; retain the
+                # original in-memory deduplication for this Agent.
+                pass
+
         fresh = False
-        for signal in signals:
-            fingerprint = hashlib.sha1(signal.encode()).hexdigest()[:16]
+        for fingerprint in fingerprints:
             if fingerprint not in self._progress_fingerprints:
                 self._progress_fingerprints.add(fingerprint)
                 fresh = True
         return fresh
-
-    def _write_file_is_new(self, result: str) -> bool:
-        """Count a newly-created artifact once, not repeated overwrites."""
-        import hashlib
-        import re
-        match = re.search(r"已写入\s+(.+?)（\d+\s*字节）", result or "")
-        if not match:
-            return False
-        signal = "file:" + match.group(1).strip()
-        fingerprint = hashlib.sha1(signal.encode()).hexdigest()[:16]
-        if fingerprint in self._progress_fingerprints:
-            return False
-        self._progress_fingerprints.add(fingerprint)
-        return True
 
     @staticmethod
     def _bash_is_progress(result: str) -> bool:
@@ -1218,6 +1276,15 @@ class SolverAgent:
     def _deadline_exceeded(self) -> bool:
         deadline = float(getattr(_ctx, "deadline", 0.0) or 0.0)
         return bool(deadline and __import__("time").time() >= deadline)
+
+    def _hint_focus_exhausted(self) -> bool:
+        start = getattr(self, "_hint_focus_start_round", None)
+        if start is None:
+            return False
+        return bool(
+            self._material_progress_count <= self._hint_focus_progress_baseline
+            and self.round - start > self._hint_focus_limit
+        )
 
     def _should_force_stop(self) -> bool:
         """统一控制面上的无进展停止判断。
