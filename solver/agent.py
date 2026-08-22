@@ -161,10 +161,16 @@ class SolverAgent:
         self.max_rounds = self._control_policy.max_rounds
         self._switch_after_rounds = self._control_policy.switch_after
         self._stop_after_rounds = self._control_policy.stop_after
-        # hint 严格门：低于该轮次禁止看提示（提示会扣 10%，先自己跑 loop）
-        # hint 严格门：太低轮次 / 还在有新发现 / 本轮已看过则禁止看提示
-        # 不用固定 20 轮硬卡——用“最近是否还有新发现”判断是否真卡住，避免早期白卡。
-        self._hint_min_round = int(settings.get("solver", {}).get("hint_min_round", 8))
+        # hint 严格门：低于该轮次禁止看提示（提示会扣分，先自己跑 loop）。
+        # 难题更早允许看 hint：hard/difficult 解不出风险高，hint 价值/成本比更高；
+        # 显式配置 hint_min_round 时以配置为准。
+        configured_hint_min = int(settings.get("solver", {}).get("hint_min_round", 0))
+        self._hint_min_round = configured_hint_min or {
+            "easy": 12,
+            "medium": 8,
+            "hard": 6,
+            "difficult": 6,
+        }.get(difficulty, 8)
         self._allow_easy_hint = bool(
             settings.get("solver", {}).get("allow_easy_hint", False)
         )

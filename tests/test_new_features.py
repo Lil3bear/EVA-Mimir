@@ -191,6 +191,35 @@ class DifficultyMaxRoundsTests(unittest.TestCase):
     @patch("solver.agent.ObserverLoop")
     @patch("solver.agent.OpenAI")
     @patch("solver.agent.search_tool")
+    def test_hint_min_round_scales_with_difficulty(self, mock_search, mock_openai, mock_observer):
+        from solver.agent import SolverAgent
+
+        def make(difficulty):
+            task = f"# CTF 题目：a-01\n- 难度：{difficulty}\n- 目标地址：http://10.0.1.1"
+            settings = {"llm": {"base_url": "http://x", "api_key": "k"}}
+            return SolverAgent(task=task, settings=settings, skills_dir="/skills")
+
+        self.assertEqual(make("easy")._hint_min_round, 12)
+        self.assertEqual(make("medium")._hint_min_round, 8)
+        self.assertEqual(make("hard")._hint_min_round, 6)
+        self.assertEqual(make("difficult")._hint_min_round, 6)
+
+    @patch("solver.agent.ObserverLoop")
+    @patch("solver.agent.OpenAI")
+    @patch("solver.agent.search_tool")
+    def test_explicit_hint_min_round_overrides_difficulty(self, mock_search, mock_openai, mock_observer):
+        from solver.agent import SolverAgent
+        task = "# CTF 题目：a-13\n- 难度：hard\n- 目标地址：http://10.0.1.1"
+        settings = {
+            "llm": {"base_url": "http://x", "api_key": "k"},
+            "solver": {"hint_min_round": 15},
+        }
+        agent = SolverAgent(task=task, settings=settings, skills_dir="/skills")
+        self.assertEqual(agent._hint_min_round, 15)
+
+    @patch("solver.agent.ObserverLoop")
+    @patch("solver.agent.OpenAI")
+    @patch("solver.agent.search_tool")
     def test_hard_gets_120_rounds(self, mock_search, mock_openai, mock_observer):
         from solver.agent import SolverAgent
         task = "# CTF 题目：a-13\n- 难度：hard\n- 目标地址：http://10.0.1.1"
