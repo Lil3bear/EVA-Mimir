@@ -10,7 +10,7 @@
     "observer_thinking_enabled": false,
     "observer_reasoning_effort": "high",
     "observer_max_output_tokens": 8192,
-    "observer_max_react_rounds": 3
+    "observer_max_react_rounds": 2
   },
   "docker": {
     "image_name": "eva-mimir-solver",
