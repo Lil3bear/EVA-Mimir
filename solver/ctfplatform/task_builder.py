@@ -27,6 +27,11 @@ def build_task_from_challenge(
     ]
     if challenge.description:
         lines.append(f"- 描述：{challenge.description}")
+    if profile.product_hint:
+        lines.append(
+            f"- 🔎 端口产品候选：{profile.product_hint}。"
+            "先用一次 curl 验证指纹，命中后再加载对应 skill 攻击链；不要跳过验证直接猜。"
+        )
     if challenge.flag_count > 1:
         remaining = challenge.flag_count - challenge.correct_flag_count
         lines.extend([

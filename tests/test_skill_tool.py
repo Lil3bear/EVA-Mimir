@@ -106,7 +106,24 @@ class KnowledgeRouterTests(unittest.TestCase):
         # context path without making a false positive for an unrelated page.
         self.assertEqual(out, "")
 
-    def test_port_alone_is_not_a_product_fingerprint(self):
+    def test_port_alone_is_a_weak_hint_not_a_cve(self):
+        path = Path(self._tmp).joinpath("cve-cheatsheet.json")
+        path.write_text(
+            '{"middleware": {"Apache OFBiz": {"cves": ["CVE-X"], '
+            '"match": {"ports": ["8443"]}}}}',
+            encoding="utf-8",
+        )
+        knowledge_router._CACHE = None
+        result = knowledge_router.lookup(
+            "HTTP/1.1 200 OK\n<html><body>x</body></html>",
+            "curl http://target:8443/",
+        )
+        # 端口弱信号只引导验证，不直接给 CVE。
+        self.assertIn("端口弱信号", result)
+        self.assertIn("Apache OFBiz", result)
+        self.assertNotIn("CVE-X", result)
+
+    def test_port_without_web_response_is_silent(self):
         path = Path(self._tmp).joinpath("cve-cheatsheet.json")
         path.write_text(
             '{"middleware": {"Apache OFBiz": {"cves": ["CVE-X"], '
@@ -115,7 +132,7 @@ class KnowledgeRouterTests(unittest.TestCase):
         )
         knowledge_router._CACHE = None
         self.assertEqual(
-            knowledge_router.lookup("HTTP/1.1 200 OK", "curl http://target:8443/"),
+            knowledge_router.lookup("Connection refused", "curl http://target:8443/"),
             "",
         )
 

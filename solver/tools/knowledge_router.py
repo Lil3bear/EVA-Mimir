@@ -67,8 +67,23 @@ def _fingerprint_products(output: str, context: str) -> set[str]:
     return products
 
 
+def _looks_like_web(output_lower: str) -> bool:
+    """Whether a curl output resembles a web/api response (not a refued/error)."""
+    markers = (
+        "<html", "<!doctype", "<body", "<head", "<div", "<script", "<title",
+        "http/1.", "http/2", "content-type", "{", "www",
+    )
+    return bool(output_lower) and any(m in output_lower for m in markers)
+
+
 def lookup(output: str, context: str = "") -> str:
-    """根据响应与请求上下文匹配中间件，返回确定性条目。"""
+    """根据响应与请求上下文匹配中间件，返回确定性条目。
+
+    Strong matches (product word / body / path fingerprint) return a CVE
+    entry.  A port-only match is treated as a weak hint: it only tells the
+    Solver which product to verify next, without handing it a CVE, so common
+    ports (8443/3000/8080) no longer misclassify arbitrary services.
+    """
     sheet = _load_cheatsheet()
     middleware = sheet.get("middleware", {}) if isinstance(sheet, dict) else {}
     if not middleware:
@@ -78,16 +93,14 @@ def lookup(output: str, context: str = "") -> str:
     combined_lower = f"{out_lower} {(context or '').lower()}"
     detected = _fingerprint_products(output, context)
     hits: list[tuple[str, dict]] = []
+    weak_hits: list[tuple[str, dict]] = []
     for product, entry in middleware.items():
         if not isinstance(entry, dict):
             continue
         match = entry.get("match") or {}
         body_any = [str(v).lower() for v in match.get("body_any", [])]
         path_any = [str(v).lower() for v in match.get("path_any", [])]
-        # Ports are only weak hints.  Never route a CVE/playbook from
-        # ``:8443``/``:10086`` alone; a response or endpoint fingerprint must
-        # corroborate it, otherwise arbitrary services on common ports are
-        # misclassified as OFBiz/1Panel.
+        ports = [str(v) for v in match.get("ports", [])]
         matched = (
             product in detected
             or product.lower() in out_lower
@@ -96,28 +109,46 @@ def lookup(output: str, context: str = "") -> str:
         )
         if matched:
             hits.append((product, entry))
+        elif (
+            ports
+            and any(f":{port}" in combined_lower for port in ports)
+            and _looks_like_web(out_lower)
+        ):
+            weak_hits.append((product, entry))
 
-    if not hits:
+    if not hits and not weak_hits:
         return ""
 
-    lines = ["📌 [本地确定性 CVE 条目]（无需联网搜索，先用 quick_check 验证）"]
-    for product, e in hits[:3]:
-        lines.append(f"### {product}")
-        cves = e.get("cves") or []
-        if cves:
-            lines.append(f"- CVE: {', '.join(str(c) for c in cves)}")
-        quick = e.get("quick_check")
-        if quick:
-            lines.append(f"- 验证命令: {quick}")
-        verify = e.get("verify") or []
-        if verify:
-            lines.append(f"- 判定: {', '.join(str(v) for v in verify)}")
-        query = e.get("search_query")
-        if query:
-            lines.append(f"- 补充搜索: security_search(\"{query}\")")
-        route = _PRODUCT_ROUTES.get(product)
-        if route:
-            lines.append(
-                f'- 下一步必须加载: skill_load(name="{route[0]}", resource="{route[1]}")'
-            )
+    lines: list[str] = []
+    if hits:
+        lines.append("📌 [本地确定性 CVE 条目]（无需联网搜索，先用 quick_check 验证）")
+        for product, e in hits[:3]:
+            lines.append(f"### {product}")
+            cves = e.get("cves") or []
+            if cves:
+                lines.append(f"- CVE: {', '.join(str(c) for c in cves)}")
+            quick = e.get("quick_check")
+            if quick:
+                lines.append(f"- 验证命令: {quick}")
+            verify = e.get("verify") or []
+            if verify:
+                lines.append(f"- 判定: {', '.join(str(v) for v in verify)}")
+            query = e.get("search_query")
+            if query:
+                lines.append(f"- 补充搜索: security_search(\"{query}\")")
+            route = _PRODUCT_ROUTES.get(product)
+            if route:
+                lines.append(
+                    f'- 下一步必须加载: skill_load(name="{route[0]}", resource="{route[1]}")'
+                )
+    if weak_hits:
+        lines.append("🔎 [端口弱信号] 仅凭端口不足以判定，请先验证产品指纹再查 CVE：")
+        for product, e in weak_hits[:3]:
+            quick = (e.get("quick_check") or "curl 目标首页/常见路径")
+            lines.append(f"- {product}：{quick}")
+            route = _PRODUCT_ROUTES.get(product)
+            if route:
+                lines.append(
+                    f'  指纹命中后加载: skill_load(name="{route[0]}", resource="{route[1]}")'
+                )
     return "\n".join(lines) + "\n"

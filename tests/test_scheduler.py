@@ -161,6 +161,27 @@ class BuildTaskTests(unittest.TestCase):
         self.assertIn("渗透", task)
         self.assertIn('skill_load(name="pentest")', task)
 
+    def test_port_product_hint_guides_c_challenge_recognition(self):
+        # 平台不返回题目标题，端口是唯一的强线索；c 类题必须给出产品候选。
+        cases = {
+            "3000": "Dify",
+            "8188": "ComfyUI",
+            "8080": "HugeGraph",
+            "7860": "Gradio",
+            "8443": "OFBiz",
+        }
+        for port, product in cases.items():
+            with self.subTest(port=port):
+                c = _make_challenge(f"c-{port}")
+                task = _build_task_from_challenge(c, (f"10.0.0.9:{port}",))
+                self.assertIn("端口产品候选", task)
+                self.assertIn(product, task)
+
+    def test_plain_http_port_has_no_product_hint(self):
+        c = _make_challenge("a-01")
+        task = _build_task_from_challenge(c, ("10.0.0.9:80",))
+        self.assertNotIn("端口产品候选", task)
+
 
 class SchedulerTests(unittest.TestCase):
     def setUp(self):
