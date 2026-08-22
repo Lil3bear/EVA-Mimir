@@ -244,7 +244,26 @@ def submit_flag(args: dict) -> str:
                 "challenge_submit_flag", {"flag": flag, "writeup": writeup}
             )
         except DuplicateSubmit:
-            return {"correct": True, "duplicate": True}
+            # A duplicate means this flag index was previously accepted.  The
+            # duplicate response has no score/progress metadata, so reconcile
+            # current completion state before updating the local store.
+            duplicate = {"correct": True, "duplicate": True}
+            try:
+                state = _request_backend(
+                    "challenge_get_state", {"unique_code": _current_unique_code()}
+                )
+                duplicate.update({
+                    "correct_flag_count": state.get("correct_flag_count", 0),
+                    "total_flag_count": state.get("flag_count", 0),
+                    "is_completed": state.get("is_completed", False),
+                })
+            except (TaskNotFound, InvalidState):
+                raise
+            except Exception:
+                # The duplicate itself is still authoritative; a transient
+                # snapshot failure must not turn it into a wrong submission.
+                pass
+            return duplicate
 
     challenge_dir = _challenge_dir()
     if challenge_dir:
@@ -258,10 +277,15 @@ def submit_flag(args: dict) -> str:
             wrong_count=0 if data.get("correct") else 1,
         )
 
+    persistence_warning = (
+        f"\n[警告] 平台响应已生效，但本地提交状态未完整持久化：{outcome.persistence_error}"
+        if outcome.persistence_error else ""
+    )
+
     if outcome.duplicate:
         if outcome.status == "correct":
-            return f"[重复] Flag 已提交且正确：{flag}"
-        return f"[重复] 该 flag 之前已提交且判定错误：{flag}。禁止重复提交同一 flag，请换方向重新分析。"
+            return f"[重复] Flag 已提交且正确：{flag}{persistence_warning}"
+        return f"[重复] 该 flag 之前已提交且判定错误：{flag}。禁止重复提交同一 flag，请换方向重新分析。{persistence_warning}"
 
     if outcome.status == "limited":
         return (
@@ -271,7 +295,15 @@ def submit_flag(args: dict) -> str:
 
     data = outcome.response or {}
     if data.get("duplicate"):
-        return f"[重复] Flag 已经提交并计分：{flag}"
+        correct = data.get("correct_flag_count", "?")
+        total = data.get("total_flag_count", "?")
+        progress = f"（进度 {correct}/{total}）"
+        if data.get("is_completed"):
+            return (
+                f"[重复] Flag 已经正确提交并计分：{flag}{progress} "
+                f"🎉 全部 Flag 已找到，题目完成！{persistence_warning}"
+            )
+        return f"[重复] Flag 已经正确提交并计分：{flag}{progress}{persistence_warning}"
     if data.get("correct"):
         score = data.get("awarded")
         correct = data.get("correct_flag_count", "?")
@@ -280,9 +312,9 @@ def submit_flag(args: dict) -> str:
         suffix = f"，本次得分 {score}" if score is not None else ""
         progress = f"（进度 {correct}/{total}）"
         if completed:
-            return f"[✓] Flag 提交正确：{flag}{suffix}{progress} 🎉 全部 Flag 已找到，题目完成！"
+            return f"[✓] Flag 提交正确：{flag}{suffix}{progress} 🎉 全部 Flag 已找到，题目完成！{persistence_warning}"
         else:
-            return f"[✓] Flag 提交正确：{flag}{suffix}{progress} 还有剩余 Flag，请继续寻找！"
+            return f"[✓] Flag 提交正确：{flag}{suffix}{progress} 还有剩余 Flag，请继续寻找！{persistence_warning}"
     else:
         wrong = outcome.wrong_count
         warn = ""
@@ -291,7 +323,7 @@ def submit_flag(args: dict) -> str:
                 f"\n⚠️ 已累计提交 {wrong} 个错误 flag。"
                 "立即停止猜 flag，回到题目逻辑重新分析，找到确定证据后再提交。"
             )
-        return f"[✗] Flag 提交错误：{flag}，请继续寻找{warn}"
+        return f"[✗] Flag 提交错误：{flag}，请继续寻找{warn}{persistence_warning}"
 
 
 def get_state(args: dict) -> str:

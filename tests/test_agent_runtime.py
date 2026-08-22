@@ -1,5 +1,6 @@
 import threading
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -47,6 +48,44 @@ class LlmRetryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             create_with_retry(create, sleep=lambda _: None)
         self.assertEqual(calls, 1)
+
+    def test_expired_deadline_prevents_request(self):
+        create = MagicMock(return_value="should not run")
+
+        with self.assertRaises(TimeoutError):
+            create_with_retry(create, deadline=time.time() - 1, model="test")
+
+        create.assert_not_called()
+
+    def test_waiting_for_concurrency_slot_respects_deadline(self):
+        gate = threading.BoundedSemaphore(1)
+        gate.acquire()
+        create = MagicMock(return_value="should not run")
+        try:
+            with patch("solver.runtime.llm._LLM_SEMAPHORE", gate):
+                started = time.time()
+                with self.assertRaises(TimeoutError):
+                    create_with_retry(
+                        create,
+                        deadline=time.time() + 0.03,
+                        model="test",
+                    )
+                self.assertLess(time.time() - started, 0.5)
+        finally:
+            gate.release()
+
+        create.assert_not_called()
+
+    def test_cancelled_request_never_enters_provider(self):
+        cancelled = threading.Event()
+        cancelled.set()
+        create = MagicMock(return_value="should not run")
+
+        with self.assertRaises(Exception) as caught:
+            create_with_retry(create, cancel_event=cancelled, model="test")
+
+        self.assertIn("cancel", str(caught.exception).lower())
+        create.assert_not_called()
 
     def test_retry_reuses_request_snapshot(self):
         messages = [{"role": "user", "content": "original"}]

@@ -6,11 +6,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from solver.ctfplatform.tsecbench_client import Challenge, DuplicateSubmit
+from solver.runtime.context import RunContext, ctx
 from solver.runtime.submission_store import (
     SubmissionStore,
     prepare_challenge_state,
     score_belongs_to_current_task,
 )
+from solver.tools import bridge_tools
 
 
 class SubmissionStoreTests(unittest.TestCase):
@@ -91,6 +94,105 @@ class SubmissionStoreTests(unittest.TestCase):
             self.assertFalse((root / ".execution-journal.jsonl").exists())
             self.assertTrue(score_belongs_to_current_task(root))
             self.assertFalse(prepare_challenge_state(root))
+
+    def test_failed_task_cleanup_does_not_commit_new_task_marker(self):
+        root = Path(tempfile.mkdtemp(prefix="submission-reset-failure-"))
+        (root / "attempts" / "old").mkdir(parents=True)
+
+        with patch.dict(
+            "os.environ",
+            {"BENCHMARK_BASE_URL": "https://bench", "BENCHMARK_TOKEN": "new-task"},
+            clear=False,
+        ), patch(
+            "solver.runtime.submission_store.shutil.rmtree",
+            side_effect=OSError("busy"),
+        ):
+            with self.assertRaisesRegex(OSError, "busy"):
+                prepare_challenge_state(root)
+
+        self.assertFalse((root / ".benchmark-task-id").exists())
+
+    def test_corrupt_submission_index_is_quarantined_and_recovered(self):
+        root = Path(tempfile.mkdtemp(prefix="submission-corrupt-index-"))
+        (root / ".submitted_flags.json").write_text("{broken", encoding="utf-8")
+
+        outcome = SubmissionStore(root).submit(
+            "flag{recovered}",
+            lambda: {"correct": True, "cumulative_score": 12},
+        )
+
+        self.assertEqual(outcome.status, "correct")
+        self.assertTrue(list(root.glob(".submitted_flags.json.corrupt.*")))
+        self.assertEqual(
+            json.loads((root / ".submitted_flags.json").read_text(encoding="utf-8")),
+            {"flag{recovered}": "correct"},
+        )
+
+    def test_corrupt_score_does_not_hide_remote_success(self):
+        root = Path(tempfile.mkdtemp(prefix="submission-corrupt-score-"))
+        (root / ".cumulative_score").write_text("not-an-int", encoding="utf-8")
+
+        outcome = SubmissionStore(root).submit(
+            "flag{score}",
+            lambda: {
+                "correct": True,
+                "cumulative_score": 25,
+                "is_completed": True,
+            },
+        )
+
+        self.assertEqual(outcome.status, "correct")
+        self.assertEqual((root / ".cumulative_score").read_text(), "25")
+        self.assertTrue((root / ".completed").exists())
+        self.assertTrue(list(root.glob(".cumulative_score.corrupt.*")))
+
+    def test_local_persistence_failure_keeps_authoritative_remote_result(self):
+        root = Path(tempfile.mkdtemp(prefix="submission-write-failure-"))
+        store = SubmissionStore(root)
+        # Avoid patching the run-initialization write; fail only the final
+        # submissions index after the remote response has been accepted.
+        store._write_text(store.run_marker_path, store.run_id)
+
+        with patch.object(store, "_write_json", side_effect=OSError("disk full")):
+            outcome = store.submit(
+                "flag{accepted}",
+                lambda: {"correct": True, "cumulative_score": 40},
+            )
+
+        self.assertEqual(outcome.status, "correct")
+        self.assertIn("disk full", outcome.persistence_error)
+        self.assertEqual((root / ".cumulative_score").read_text(), "40")
+
+    def test_remote_duplicate_reconciles_completion_state(self):
+        root = Path(tempfile.mkdtemp(prefix="submission-duplicate-state-"))
+        run = RunContext.create(str(root), "case")
+
+        class DuplicateClient:
+            def submit_flag(self, unique_code, flag):
+                raise DuplicateSubmit("duplicate", "already submitted")
+
+            def list_challenges(self):
+                return [Challenge(
+                    unique_code="case",
+                    description="",
+                    difficulty="easy",
+                    level=1,
+                    total_score=100,
+                    flag_count=1,
+                    correct_flag_count=1,
+                    is_completed=True,
+                    container_status="running",
+                    container_addr=(),
+                )]
+
+        with ctx.bind(run, DuplicateClient()):
+            result = bridge_tools.submit_flag({
+                "flag": "flag{duplicate}",
+                "writeup": "reconcile",
+            })
+
+        self.assertIn("全部 Flag 已找到", result)
+        self.assertTrue((Path(run.challenge_dir) / ".completed").exists())
 
     def test_concurrent_scores_keep_maximum(self):
         root = Path(tempfile.mkdtemp(prefix="submission-score-"))

@@ -86,9 +86,17 @@ def prepare_challenge_state(challenge_dir: str | Path) -> bool:
                 item.unlink(missing_ok=True)
         (challenge_path / "ideas" / "index.json").unlink(missing_ok=True)
         # Attempt journals and tool-result files are not useful across task
-        # identities and can otherwise feed stale recovery summaries.
-        shutil.rmtree(challenge_path / "attempts", ignore_errors=True)
-        shutil.rmtree(challenge_path / ".tool-results", ignore_errors=True)
+        # identities and can otherwise feed stale recovery summaries.  Never
+        # commit the new task marker after a silent cleanup failure: doing so
+        # would permanently bless stale state as belonging to the new task.
+        for stale_dir in (
+            challenge_path / "attempts",
+            challenge_path / ".tool-results",
+        ):
+            if stale_dir.exists():
+                shutil.rmtree(stale_dir)
+            if stale_dir.exists():
+                raise OSError(f"无法清理旧任务状态：{stale_dir}")
 
         store._write_text(store.task_marker_path, current)
         return True
@@ -100,6 +108,7 @@ class SubmissionOutcome:
     response: dict | None
     duplicate: bool
     wrong_count: int
+    persistence_error: str = ""
 
 
 class SubmissionStore:
@@ -146,16 +155,32 @@ class SubmissionStore:
             response = submitter()
             status = "correct" if response.get("correct") else "wrong"
             submissions[flag] = status
-            self._write_json(self.submissions_path, submissions)
+
+            # The remote response is authoritative.  Local persistence errors
+            # must not turn an accepted flag into an apparent wrong submit.
+            # Persist score/completion first: if the process dies before the
+            # final submissions index, a platform duplicate can still recover
+            # the flag while retaining already-acknowledged score metadata.
+            persistence_errors: list[str] = []
+
+            def persist(label: str, operation) -> None:
+                try:
+                    operation()
+                except Exception as exc:
+                    persistence_errors.append(f"{label}: {exc}")
+
             if status == "correct" and response.get("cumulative_score") is not None:
-                self._record_score(response.get("cumulative_score"))
+                persist("score", lambda: self._record_score(response.get("cumulative_score")))
             if status == "correct" and response.get("is_completed"):
-                self._write_text(self.completed_path, "1")
+                persist("completed", lambda: self._write_text(self.completed_path, "1"))
+            persist("submissions", lambda: self._write_json(self.submissions_path, submissions))
+
             return SubmissionOutcome(
                 status=status,
                 response=response,
                 duplicate=False,
                 wrong_count=self._wrong_count(submissions),
+                persistence_error="; ".join(persistence_errors),
             )
 
     @contextmanager
@@ -213,9 +238,13 @@ class SubmissionStore:
     def _read_submissions(self) -> dict[str, str]:
         if not self.submissions_path.exists():
             return {}
-        data = json.loads(self.submissions_path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            raise ValueError(f"invalid submission state: {self.submissions_path}")
+        try:
+            data = json.loads(self.submissions_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("submission state root is not an object")
+        except (json.JSONDecodeError, UnicodeError, ValueError):
+            self._quarantine_corrupt(self.submissions_path)
+            return {}
         return {
             str(flag): str(status)
             for flag, status in data.items()
@@ -228,7 +257,23 @@ class SubmissionStore:
             old_score = int(self.score_path.read_text(encoding="utf-8").strip() or "0")
         except FileNotFoundError:
             old_score = 0
+        except ValueError:
+            self._quarantine_corrupt(self.score_path)
+            old_score = 0
         self._write_text(self.score_path, str(max(old_score, new_score)))
+
+    @staticmethod
+    def _quarantine_corrupt(path: Path) -> None:
+        """Move malformed state aside so one bad file cannot block a run."""
+        if not path.exists():
+            return
+        quarantine = path.with_name(f"{path.name}.corrupt.{time.time_ns()}")
+        try:
+            os.replace(path, quarantine)
+        except OSError:
+            # Persistence may be read-only; the current operation can still
+            # use an empty in-memory state and report a later write warning.
+            pass
 
     @staticmethod
     def _wrong_count(submissions: dict[str, str]) -> int:

@@ -226,20 +226,28 @@ class ObserverAgent:
                 reasoning_effort=self._reasoning_effort,
                 thinking_enabled=self._thinking_enabled,
             )
-            client = self.client
             deadline = float(getattr(_ctx, "deadline", 0.0) or 0.0)
-            if deadline:
-                remaining = deadline - __import__("time").time()
-                if remaining <= 0:
-                    return "NO_CHANGE"
-                with_options = getattr(client, "with_options", None)
-                if callable(with_options):
-                    client = with_options(timeout=max(0.1, min(60.0, remaining)))
-            response = create_with_retry(
-                client.chat.completions.create,
-                **kwargs,
-                max_attempts=3,
-            )
+
+            def create_observer_completion(**request_kwargs):
+                client = self.client
+                if deadline:
+                    remaining = deadline - __import__("time").time()
+                    if remaining <= 0:
+                        raise TimeoutError("observer deadline exceeded")
+                    with_options = getattr(client, "with_options", None)
+                    if callable(with_options):
+                        client = with_options(timeout=max(0.1, min(60.0, remaining)))
+                return client.chat.completions.create(**request_kwargs)
+
+            try:
+                response = create_with_retry(
+                    create_observer_completion,
+                    **kwargs,
+                    max_attempts=3,
+                    deadline=deadline,
+                )
+            except TimeoutError:
+                return "NO_CHANGE"
 
             msg = response.choices[0].message
             messages.append(assistant_message_dict(msg))

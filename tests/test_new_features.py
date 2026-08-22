@@ -39,6 +39,28 @@ class ObserverControlPlaneTests(unittest.TestCase):
         self.assertFalse(observer.enabled)
         self.assertEqual(observer._round_logs, [])
 
+    def test_late_observer_review_cannot_emit_after_stop(self):
+        from solver.observer.loop import ObserverLoop
+
+        correction = MagicMock()
+        observer = ObserverLoop(
+            settings={"solver": {"observer_enabled": True}},
+            on_correction=correction,
+        )
+        observer.stop()
+        review = MagicMock(
+            side_effect=lambda **kwargs: kwargs["on_correction"]("late advice")
+        )
+        with patch("solver.observer.agent.ObserverAgent") as observer_cls, patch.object(
+            observer, "_check_progress"
+        ) as check_progress:
+            observer_cls.return_value.review = review
+            path = Path(tempfile.mkdtemp(prefix="observer-late-"))
+            observer._run_review([{"round": 3}], path, path)
+
+        correction.assert_not_called()
+        check_progress.assert_not_called()
+
     @patch("solver.observer.agent.OpenAI")
     def test_observer_has_separate_bounded_budget(self, _mock_openai):
         from solver.observer.agent import ObserverAgent

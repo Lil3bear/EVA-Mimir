@@ -1,6 +1,7 @@
 import json
 import os
 import threading
+from concurrent.futures import CancelledError
 from pathlib import Path
 from typing import Any
 
@@ -270,6 +271,7 @@ class SolverAgent:
 
             # ━━ Multi-Solver：另一个 Solver 已解出，本实例停止 ━━
             if self._stop_event is not None and self._stop_event.is_set():
+                self.observer.stop()
                 self._finish_execution("multi_solver_other_won")
                 _emit("agent_end", {"rounds": self.round, "reason": "multi_solver_other_won"})
                 return
@@ -324,7 +326,22 @@ class SolverAgent:
 
             # DeepSeek V4 thinking 不发送 tool_choice；其他模型沿用原策略。
             is_thinking = "v4" in self.model or "think" in self.model.lower()
-            response = self._create_turn_response(is_thinking)
+            try:
+                response = self._create_turn_response(is_thinking)
+            except (TimeoutError, CancelledError) as exc:
+                reason = (
+                    "deadline_exceeded"
+                    if isinstance(exc, TimeoutError)
+                    else "multi_solver_cancelled"
+                )
+                self.observer.stop()
+                self._finish_execution(reason)
+                _emit("agent_end", {
+                    "rounds": self.round,
+                    "reason": reason,
+                    "error": str(exc),
+                })
+                return
 
             msg = response.choices[0].message
             self.messages.append(assistant_message_dict(msg))
@@ -565,6 +582,14 @@ class SolverAgent:
                 client = with_options(timeout=max(0.1, min(120.0, remaining)))
         return client.chat.completions.create
 
+    def _completion_call(self, **kwargs):
+        """Create one completion after concurrency admission.
+
+        The timeout is derived here—not before entering the global LLM
+        semaphore—so waiting for a slot cannot stale the run deadline.
+        """
+        return self._completion_create()(**kwargs)
+
     def _create_turn_response(self, is_thinking: bool):
         kwargs = completion_kwargs(
             model=self.model,
@@ -576,10 +601,12 @@ class SolverAgent:
         )
         try:
             return create_with_retry(
-                self._completion_create(),
+                self._completion_call,
                 **kwargs,
                 max_attempts=self._llm_max_attempts,
                 on_retry=self._on_llm_retry,
+                deadline=float(getattr(_ctx, "deadline", 0.0) or 0.0),
+                cancel_event=getattr(self, "_stop_event", None),
             )
         except BadRequestError as exc:
             detail = str(exc).lower()
@@ -599,10 +626,12 @@ class SolverAgent:
             else:
                 raise
             return create_with_retry(
-                self._completion_create(),
+                self._completion_call,
                 **kwargs,
                 max_attempts=self._llm_max_attempts,
                 on_retry=self._on_llm_retry,
+                deadline=float(getattr(_ctx, "deadline", 0.0) or 0.0),
+                cancel_event=getattr(self, "_stop_event", None),
             )
 
     def _estimated_context_tokens(self) -> int:
@@ -738,10 +767,12 @@ class SolverAgent:
                 reasoning_effort=self._reasoning_effort,
             )
             resp = create_with_retry(
-                self._completion_create(),
+                self._completion_call,
                 **kwargs,
                 max_attempts=self._llm_max_attempts,
                 on_retry=self._on_llm_retry,
+                deadline=float(getattr(_ctx, "deadline", 0.0) or 0.0),
+                cancel_event=getattr(self, "_stop_event", None),
             )
             return _extract_content(resp.choices[0].message) or "（摘要生成失败）"
         except Exception as e:

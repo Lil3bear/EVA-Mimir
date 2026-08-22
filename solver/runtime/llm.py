@@ -7,6 +7,7 @@ import os
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import CancelledError
 from typing import Any
 
 from openai import (
@@ -90,6 +91,41 @@ def assistant_message_dict(message: Any) -> dict[str, Any]:
     return data
 
 
+def _ensure_request_active(
+    deadline: float,
+    cancel_event: threading.Event | None,
+) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise CancelledError("LLM request cancelled")
+    if deadline and time.time() >= deadline:
+        raise TimeoutError("LLM request exceeded benchmark deadline")
+
+
+def _acquire_llm_slot(
+    deadline: float,
+    cancel_event: threading.Event | None,
+) -> None:
+    """Acquire the global slot without waiting past cancellation/deadline."""
+    while True:
+        _ensure_request_active(deadline, cancel_event)
+        if deadline:
+            remaining = max(0.0, deadline - time.time())
+            wait = min(remaining, 0.2) if cancel_event is not None else remaining
+            acquired = _LLM_SEMAPHORE.acquire(timeout=wait)
+        elif cancel_event is not None:
+            acquired = _LLM_SEMAPHORE.acquire(timeout=0.2)
+        else:
+            _LLM_SEMAPHORE.acquire()
+            acquired = True
+        if acquired:
+            try:
+                _ensure_request_active(deadline, cancel_event)
+            except Exception:
+                _LLM_SEMAPHORE.release()
+                raise
+            return
+
+
 def create_with_retry(
     create: Callable[..., Any],
     *,
@@ -97,24 +133,44 @@ def create_with_retry(
     base_delay: float = 1.0,
     on_retry: Callable[[int, Exception, float], None] | None = None,
     sleep: Callable[[float], None] = time.sleep,
+    deadline: float = 0.0,
+    cancel_event: threading.Event | None = None,
     **kwargs: Any,
 ) -> Any:
-    """Call a completion endpoint, retrying only transient provider failures."""
+    """Call a completion endpoint with bounded concurrency and retries.
+
+    ``create`` is invoked once per attempt, after acquiring the process-wide
+    slot.  Callers that need a transport timeout derived from the remaining
+    budget should pass a small wrapper which computes that timeout when it is
+    invoked rather than binding the client before entering this function.
+    """
     attempts = max(1, max_attempts)
     request_snapshot = copy.deepcopy(kwargs)
+    deadline = float(deadline or 0.0)
     for attempt in range(1, attempts + 1):
+        _acquire_llm_slot(deadline, cancel_event)
         try:
-            with _LLM_SEMAPHORE:
-                return create(**copy.deepcopy(request_snapshot))
+            return create(**copy.deepcopy(request_snapshot))
         except Exception as exc:
             retryable = isinstance(exc, _RETRYABLE_ERRORS) or (
                 isinstance(exc, APIStatusError) and exc.status_code >= 500
             )
             if not retryable or attempt == attempts:
                 raise
-            delay = min(base_delay * (2 ** (attempt - 1)), 8.0)
+            delay = max(0.0, min(base_delay * (2 ** (attempt - 1)), 8.0))
+            if deadline:
+                delay = min(delay, max(0.0, deadline - time.time()))
             if on_retry:
                 on_retry(attempt, exc, delay)
+        finally:
+            _LLM_SEMAPHORE.release()
+
+        _ensure_request_active(deadline, cancel_event)
+        if cancel_event is not None:
+            if cancel_event.wait(delay):
+                raise CancelledError("LLM request cancelled during retry backoff")
+        else:
             sleep(delay)
+        _ensure_request_active(deadline, cancel_event)
 
     raise RuntimeError("unreachable")

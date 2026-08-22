@@ -29,6 +29,24 @@ from typing import Optional
 from openai import OpenAI
 
 from solver.runtime.llm import create_with_retry, is_deepseek_v4
+from solver.worker_context import ctx as _ctx
+
+
+def _search_completion(**request_kwargs):
+    """Create one search completion using the current remaining deadline."""
+    if _search_client is None:
+        raise RuntimeError("search_tool 未初始化")
+    client = _search_client
+    deadline = float(getattr(_ctx, "deadline", 0.0) or 0.0)
+    if deadline:
+        remaining = deadline - __import__("time").time()
+        if remaining <= 0:
+            raise TimeoutError("search deadline exceeded")
+        with_options = getattr(client, "with_options", None)
+        if callable(with_options):
+            client = with_options(timeout=max(0.1, min(60.0, remaining)))
+    return client.chat.completions.create(**request_kwargs)
+
 
 def _msg_content(msg) -> str:
     """只返回最终答案；reasoning_content 不能冒充搜索结果。"""
@@ -188,11 +206,13 @@ def _search_kimi(query: str) -> str:
         }]
     }
 
+    deadline = float(getattr(_ctx, "deadline", 0.0) or 0.0)
     resp = create_with_retry(
-        _search_client.chat.completions.create,
+        _search_completion,
         model=_search_model,
         messages=messages,
         max_tokens=800,
+        deadline=deadline,
         **extra_kwargs,
     )
 
@@ -208,10 +228,11 @@ def _search_kimi(query: str) -> str:
                 "content": tc.function.arguments,
             })
         resp2 = create_with_retry(
-            _search_client.chat.completions.create,
+            _search_completion,
             model=_search_model,
             messages=messages,
             max_tokens=800,
+            deadline=deadline,
             **extra_kwargs,
         )
         content = _msg_content(resp2.choices[0].message) or "（无结果）"
@@ -241,8 +262,9 @@ def _search_llm(query: str) -> str:
         request["extra_body"] = {"thinking": {"type": "disabled"}}
 
     resp = create_with_retry(
-        _search_client.chat.completions.create,
+        _search_completion,
         **request,
+        deadline=float(getattr(_ctx, "deadline", 0.0) or 0.0),
     )
 
     choice = resp.choices[0]

@@ -14,6 +14,7 @@
 
 import json
 import os
+import random
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -49,7 +50,7 @@ DEFAULT_MAX_PARALLEL = 3
 
 # start_challenge 失败后的重试参数
 _START_RETRY_MAX = 5
-_START_RETRY_INTERVAL = 30  # 秒
+_START_RETRY_INTERVAL = 5  # 秒；指数退避后封顶 60 秒
 
 # close_challenge 失败后的重试参数
 _CLOSE_RETRY_MAX = 3
@@ -98,6 +99,15 @@ def _sleep_retry(seconds: float, deadline: float = 0.0) -> None:
         seconds = min(seconds, max(0.0, deadline - time.time()))
     if seconds:
         time.sleep(seconds)
+
+
+def _retry_delay(base: float, attempt: int, *, cap: float = 60.0) -> float:
+    """Exponential retry delay with jitter to avoid synchronized workers."""
+    base = max(0.0, float(base or 0.0))
+    if not base:
+        return 0.0
+    delay = min(float(cap), base * (2 ** max(0, attempt - 1)))
+    return delay * random.uniform(0.85, 1.15)
 
 
 def _is_capacity_invalid_state(error: InvalidState) -> bool:
@@ -163,7 +173,6 @@ class Scheduler:
         *,
         skills_dir: str = "/skills",
         workspace_dir: str = "/workspace",
-        max_retries_per_challenge: int = 1,
         skip_completed: bool = True,
         skip_codes: set[str] | None = None,
         prefix_filter: str | None = None,
@@ -179,7 +188,6 @@ class Scheduler:
         self.settings = settings
         self.skills_dir = skills_dir
         self.workspace_dir = workspace_dir
-        self.max_retries = max_retries_per_challenge
         self.skip_completed = skip_completed
         self.skip_codes = skip_codes or set()
         self.prefix_filter = prefix_filter.strip() if prefix_filter else None
@@ -621,30 +629,32 @@ class Scheduler:
                         "error": str(e),
                     })
                     raise
+                wait = _retry_delay(self.start_retry_interval, attempt)
                 _emit("challenge_start_retry", {
                     "unique_code": code,
                     "attempt": attempt,
                     "reason": str(e),
-                    "wait": self.start_retry_interval,
+                    "wait": round(wait, 2),
                     "elapsed_so_far_s": round(_time.time() - _t_start_begin, 2),
                 })
                 if attempt < self.start_retry_max:
-                    _sleep_retry(self.start_retry_interval, self.deadline)
+                    _sleep_retry(wait, self.deadline)
                 else:
                     _emit("challenge_skip", {"unique_code": code, "reason": str(e)})
                     result.error = str(e)
                     self._scoreboard.mark_skipped(code, str(e))
                     return result
             except ResourceUnavailable as e:
+                wait = _retry_delay(self.start_retry_interval, attempt)
                 _emit("challenge_start_retry", {
                     "unique_code": code,
                     "attempt": attempt,
                     "reason": str(e),
-                    "wait": self.start_retry_interval,
+                    "wait": round(wait, 2),
                     "elapsed_so_far_s": round(_time.time() - _t_start_begin, 2),
                 })
                 if attempt < self.start_retry_max:
-                    _sleep_retry(self.start_retry_interval, self.deadline)
+                    _sleep_retry(wait, self.deadline)
                 else:
                     _emit("challenge_skip", {"unique_code": code, "reason": str(e)})
                     result.error = str(e)
@@ -653,11 +663,12 @@ class Scheduler:
             except TsecbenchConnectionError as e:
                 # 连接超时：服务端可能已启动容器但客户端没收到响应
                 # 尝试 close 释放可能占用的槽位，然后重试
+                wait = _retry_delay(self.start_retry_interval, attempt)
                 _emit("challenge_start_retry", {
                     "unique_code": code,
                     "attempt": attempt,
                     "reason": f"connection_error: {e}",
-                    "wait": self.start_retry_interval,
+                    "wait": round(wait, 2),
                     "elapsed_so_far_s": round(_time.time() - _t_start_begin, 2),
                 })
                 # 尝试 close（可能服务端已启动）
@@ -666,7 +677,7 @@ class Scheduler:
                 except Exception:
                     pass
                 if attempt < self.start_retry_max:
-                    _sleep_retry(self.start_retry_interval, self.deadline)
+                    _sleep_retry(wait, self.deadline)
                 else:
                     _emit("challenge_skip", {"unique_code": code, "reason": str(e)})
                     result.error = str(e)

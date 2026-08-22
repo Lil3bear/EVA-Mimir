@@ -375,6 +375,8 @@ class ObserverLoop:
         current_round = rounds[-1]["round"] if rounds else 0
 
         def guarded_correction(content: str) -> None:
+            if not self.enabled:
+                return
             if self._should_send_correction(content, current_round):
                 if self.on_correction:
                     self.on_correction(content, current_round)
@@ -397,5 +399,6 @@ class ObserverLoop:
         except Exception as e:
             write_line({"type": "observer_error", "data": {"msg": str(e)}})
 
-        # 审查结束后做无进展检测
-        self._check_progress(challenge_dir, current_round)
+        # 审查结束后做无进展检测；Agent 已结束时丢弃迟到结果。
+        if self.enabled:
+            self._check_progress(challenge_dir, current_round)

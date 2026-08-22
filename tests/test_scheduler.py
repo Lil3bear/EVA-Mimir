@@ -21,6 +21,7 @@ from solver.ctfplatform.scheduler import (
     Scheduler,
     SchedulerReport,
     _build_task_from_challenge,
+    _retry_delay,
     _sort_challenges,
 )
 
@@ -45,6 +46,15 @@ def _make_challenge(
         container_status="stopped",
         container_addr=(),
     )
+
+
+class RetryPolicyTests(unittest.TestCase):
+    @patch("solver.ctfplatform.scheduler.random.uniform", return_value=1.0)
+    def test_retry_delay_is_exponential_and_capped(self, _uniform):
+        self.assertEqual(_retry_delay(2, 1), 2)
+        self.assertEqual(_retry_delay(2, 3), 8)
+        self.assertEqual(_retry_delay(30, 4, cap=60), 60)
+        self.assertEqual(_retry_delay(0, 5), 0)
 
 
 class SortChallengesTests(unittest.TestCase):
