@@ -234,11 +234,6 @@ def _challenge_dir() -> str:
     return d
 
 
-def _hint_marker_path() -> str:
-    d = _challenge_dir()
-    return os.path.join(d, ".hint_fetched") if d else ""
-
-
 def submit_flag(args: dict) -> str:
     flag = args.get("flag", "").strip()
     writeup = args.get("writeup", "")
@@ -323,14 +318,6 @@ def get_hint(args: dict) -> str:
     # hint 扣分是“每题一次性 10%”，重复查看不叠加；因此允许跨重跑轮次重新查看，
     # 只保留“每轮一次”的门控在 agent 层（_hint_fetch_count）。
     data = _request_backend("challenge_get_hint", args)
-    marker = _hint_marker_path()
-    if marker:
-        try:
-            os.makedirs(os.path.dirname(marker), exist_ok=True)
-            with open(marker, "w", encoding="utf-8") as f:
-                f.write("1")
-        except Exception:
-            pass
     hints = data.get("hints", [])
     if not hints:
         return "[提示] 暂无提示"

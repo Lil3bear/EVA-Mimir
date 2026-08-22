@@ -163,7 +163,8 @@ class SolverAgent:
         # hint 严格门：太低轮次 / 还在有新发现 / 本轮已看过则禁止看提示
         # 不用固定 20 轮硬卡——用“最近是否还有新发现”判断是否真卡住，避免早期白卡。
         self._hint_min_round = int(settings.get("solver", {}).get("hint_min_round", 8))
-        self._hint_fetch_count = 0  # 本轮已取提示次数（跨重跑轮次由 .hint_fetched 文件去重）
+        # 每轮最多看一次提示；跨重跑轮次允许重看（提示扣分每题一次性，不叠加）。
+        self._hint_fetch_count = 0
         self._last_progress_round = 0  # 最近一次有新进展的轮次（用于及时刹停）
         self._stuck_switched = False  # 是否已注入过“方向切换”指令
         self._last_discovery_round = 0  # 最近一次新发现（memory_add / 正确 flag）的轮次
