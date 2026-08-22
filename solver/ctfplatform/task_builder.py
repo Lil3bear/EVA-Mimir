@@ -10,6 +10,29 @@ from solver.ctfplatform.tsecbench_client import Challenge
 from solver.runtime.context import RunContext
 
 
+# 描述关键词 → 必加载 reference（确定性预加载，避免 Agent 识别出漏洞类型
+# 却直接 security_search 而跳过本地 skill）。关键词是通用漏洞/产品名，非题号。
+_DESCRIPTION_REFERENCE_HINTS = (
+    (("jwt", "token", "签名", "oauth"), "JWT/签名 → 必须 skill_load(name=\"web\", resource=\"jwt-attacks.md\")"),
+    (("授权", "license", "serial", "序列号", "校验器"), "授权/序列号 → 必须 skill_load(name=\"reverse\", resource=\"embedded-license.md\")"),
+    (("云函数", "serverless", "cloudfunc", "lambda"), "Serverless → 必须 skill_load(name=\"cloud\", resource=\"serverless.md\")"),
+    (("ssrf", "内网探测", "资产探测", "请求伪造"), "SSRF → 必须 skill_load(name=\"web\", resource=\"ssrf.md\")"),
+    (("xxe", "xml", "实体注入"), "XXE → 必须 skill_load(name=\"payloads\", resource=\"xxe-injection.md\")"),
+    (("上传", "upload"), "文件上传 → 必须 skill_load(name=\"payloads\", resource=\"upload-insecure-files.md\")"),
+    (("图数据库", "hugegraph", "neo4j", "关联检索", "gremlin"), "图数据库 → 必须 skill_load(name=\"web\", resource=\"graph-db.md\")"),
+)
+
+
+def _reference_hints(description: str) -> list[str]:
+    """Return mandatory skill_load hints matched by the challenge description."""
+    lowered = (description or "").lower()
+    hints = []
+    for keywords, hint in _DESCRIPTION_REFERENCE_HINTS:
+        if any(keyword in lowered for keyword in keywords):
+            hints.append(hint)
+    return hints
+
+
 def build_task_from_challenge(
     challenge: Challenge, container_addr: tuple[str, ...]
 ) -> str:
@@ -31,6 +54,8 @@ def build_task_from_challenge(
             "- 🎯 描述中点名的目标（产品/服务/凭证/路径）是最高优先级线索：拿到初始权限后优先验证它，"
             "不要先泛扫网段或目录。"
         )
+        for hint in _reference_hints(challenge.description):
+            lines.append(f"- 📚 {hint}")
     if profile.product_hint:
         lines.append(
             f"- 🔎 端口产品候选：{profile.product_hint}。"

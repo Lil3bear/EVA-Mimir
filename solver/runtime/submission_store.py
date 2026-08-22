@@ -252,6 +252,14 @@ class SubmissionStore:
             if status in {"correct", "wrong"}
         }
 
+    def current_wrong_count(self) -> int:
+        """Return the challenge-scoped wrong-submit count without side effects."""
+        try:
+            submissions = self._read_submissions()
+            return self._wrong_count(submissions)
+        except Exception:
+            return 0
+
     def _record_score(self, score) -> None:
         new_score = int(score or 0)
         try:

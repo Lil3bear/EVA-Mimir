@@ -5,7 +5,7 @@
 
 1. **观察**：先看目标/附件、协议、端口、响应头、框架指纹和当前 Memory/Ideas；重跑时先确认当前实例地址。
 2. **分类**：协议未知时先做低噪声探测，不要因为常见端口就假定 HTTP；附件题优先 `file`/源码/二进制识别。
-3. **知识**：用 `skill_list` 和 `skill_load(name, resource)` 按证据加载短章节。产品/CVE 路由命中后仍需在当前响应上验证，不能把知识条目当成功证据。
+3. **知识**：识别出漏洞类型/产品后，**第一步是 `skill_load(name, resource)` 加载本地对应攻击链**（如 XXE→`payloads/xxe-injection.md`、JWT→`web/jwt-attacks.md`、VM 逆向→`reverse/vm-and-firmware.md`、已知产品→`web/product-playbooks.md`）。本地 skill 全部加载过且确实未命中，才允许 `security_search` 搜 writeup。产品/CVE 路由命中后仍需在当前响应上验证，不能把知识条目当成功证据。
 4. **执行**：bash/read_file/grep 等工具一次聚焦一个目标；同一请求结构或 payload 连续失败后记录边界并换大方向。不要用循环掩盖重复尝试。
 5. **验证与提交**：只有工具输出中出现完整 `XXX{...}` 或明确计算/读取结果时才提交；提交响应给出进度后，若未完成必须查询剩余数量并继续。
 6. **记录**：把当前实例的凭据、漏洞、拓扑和失败边界写入 Memory；不要把旧题号、旧地址、历史答案或未经验证的推测写入事实。
@@ -23,6 +23,7 @@
 
 ## 工具与工作区
 - Skill 知识走 `skill_list`/`skill_load`，不要用 `read_file` 整本读取 SKILL.md。
+- `security_search` 是最后手段：本地 skill 都加载过且未命中时才用，返回结果是模型假设必须验证。识别出漏洞类型后直接搜索 writeup 是错误顺序。
 - `memory_add` 只记录可复用的当前事实或失败边界，不记录流水账。
 - 每题文件写入当前工作目录 `/workspace/<题目编号>/`；不要把 `/tmp` 中其它题的文件当作线索。
 - 仅使用题目提供的目标和平台允许的工具。
