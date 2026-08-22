@@ -59,13 +59,21 @@ http://127.1/
 
 ## 1. FINDING SSRF SURFACE
 
+**❗ 第一步永远是读前端源码确定确切参数名和格式，不要盲目试。**
+
+服务端报 `URL is required` / `缺少参数` / `400` 时，说明参数名或格式不对。立即停止重试，改做：
+1. 读前端 JS 与 HTML，找请求参数：`grep -nE 'fetch|axios|XMLHttpRequest|/api/' index.html *.js 2>/dev/null`
+2. 看表单 input 的 `id`/`name`（例如 `<input id="partnerUrl">` → 参数名是 `partnerUrl` 而不是 `url`）
+3. 确认 Content-Type：JSON body（`{"partnerUrl": "..."}`）、form-data、还是 query string
+4. 用确认的参数名和格式重试一次；仍失败再换，不要在同一错误结构上反复试
+
 Look for **any parameter containing DNS names, IP addresses, or URLs**:
 
 ```
 loc=           url=        path=         endpoint=
-imageUrl=      dest=       redirect=     uri=
-callback=      load=       file=         resource=
-link=          src=        data=         ref=
+partnerUrl=    imageUrl=   dest=         redirect=     uri=
+callback=      load=       file=         resource=     source=
+link=          src=        data=         ref=          target=
 ```
 
 **Less obvious SSRF vectors**:

