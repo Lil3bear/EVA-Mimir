@@ -725,10 +725,19 @@ class SolverAgent:
                     f"[拒绝] 第 {self.round} 轮太早看提示。"
                     f"请先自己探索（至少 {self._hint_min_round} 轮）。"
                 )
-            if since_discovery < stuck_limit:
+            # 卡死判定：满足任一信号即可看 hint。
+            # 1) 连续多轮无新发现；2) 累计错误提交 >= 3（在瞎猜）；
+            # 3) 轮次已过 60% 预算且还没有正确提交（时间快用完）。
+            stuck_no_discovery = since_discovery >= stuck_limit
+            wrong_submits = self._submission_wrong_count() >= 3
+            late_no_flag = (
+                self.round > int(self.max_rounds * 0.6)
+                and self._submitted_flag_count == 0
+            )
+            if not (stuck_no_discovery or wrong_submits or late_no_flag):
                 return (
-                    f"[拒绝] 最近 {since_discovery} 轮内还有新发现，说明仍在推进，"
-                    "不要过早依赖提示。请继续当前方向或换一个攻击面。"
+                    "[拒绝] 仍在推进（最近有发现、无错误提交、时间充足），"
+                    "不用看提示，继续当前方向即可。"
                 )
             if self._hint_fetch_count >= 1:
                 return (
@@ -1260,6 +1269,17 @@ class SolverAgent:
     def _deadline_exceeded(self) -> bool:
         deadline = float(getattr(_ctx, "deadline", 0.0) or 0.0)
         return bool(deadline and __import__("time").time() >= deadline)
+
+    def _submission_wrong_count(self) -> int:
+        """题目级累计错误提交数（跨 attempt 持久），用于 hint 卡死判定。"""
+        try:
+            challenge_dir = getattr(_ctx, "challenge_dir", "") or ""
+            if not challenge_dir or challenge_dir == "/workspace":
+                return 0
+            from solver.runtime.submission_store import SubmissionStore
+            return SubmissionStore(challenge_dir).current_wrong_count()
+        except Exception:
+            return 0
 
     def _hint_focus_exhausted(self) -> bool:
         start = getattr(self, "_hint_focus_start_round", None)
