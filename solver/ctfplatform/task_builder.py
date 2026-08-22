@@ -27,6 +27,10 @@ def build_task_from_challenge(
     ]
     if challenge.description:
         lines.append(f"- 描述：{challenge.description}")
+        lines.append(
+            "- 🎯 描述中点名的目标（产品/服务/凭证/路径）是最高优先级线索：拿到初始权限后优先验证它，"
+            "不要先泛扫网段或目录。"
+        )
     if profile.product_hint:
         lines.append(
             f"- 🔎 端口产品候选：{profile.product_hint}。"

