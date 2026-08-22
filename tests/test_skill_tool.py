@@ -180,6 +180,50 @@ class RepositorySkillIntegrityTests(unittest.TestCase):
             with self.subTest(skill=item["name"]):
                 self.assertTrue(mentioned.issubset(set(item["references"])))
 
+    def test_product_routes_align_with_reference_content(self):
+        """knowledge_router/policy 的产品→reference 映射必须指向含该产品内容的文件。"""
+        from solver.tools import knowledge_router
+
+        product_keyword = {
+            "Gradio": "gradio",
+            "Dify": "dify",
+            "HugeGraph": "hugegraph",
+            "ComfyUI-Manager": "comfyui",
+            "Apache OFBiz": "ofbiz",
+            "1Panel": "1panel",
+            "GeoServer": "geoserver",
+        }
+        for product, (skill, resource) in knowledge_router._PRODUCT_ROUTES.items():
+            path = self.root / skill / "references" / resource
+            with self.subTest(product=product, resource=resource):
+                self.assertTrue(path.exists(), f"缺少 {path}")
+                content = path.read_text(encoding="utf-8", errors="replace").lower()
+                keyword = product_keyword[product]
+                self.assertIn(keyword, content, f"{path} 不含 {product} 内容")
+
+    def test_port_hints_align_with_product_content(self):
+        from solver.ctfplatform.policy import _PORT_PRODUCT_HINTS
+
+        keyword_by_product = {
+            "ComfyUI": "comfyui",
+            "Dify": "dify",
+            "Gradio": "gradio",
+            "OFBiz": "ofbiz",
+            "HugeGraph": "hugegraph",
+            "1Panel": "1panel",
+        }
+        for port, hint in _PORT_PRODUCT_HINTS.items():
+            for product, keyword in keyword_by_product.items():
+                if product.lower() in hint.lower():
+                    # 解析 hint 里的 reference 路径
+                    match = re.search(r"(web|cloud|pentest|reverse)/([a-z0-9-]+\.md)", hint)
+                    self.assertIsNotNone(match, f"端口 {port} 的 hint 缺少 reference 路径")
+                    path = self.root / match.group(1) / "references" / match.group(2)
+                    self.assertTrue(path.exists(), f"缺少 {path}")
+                    content = path.read_text(encoding="utf-8", errors="replace").lower()
+                    self.assertIn(keyword, content, f"端口 {port} → {path} 不含 {product} 内容")
+                    break
+
 
 if __name__ == "__main__":
     unittest.main()

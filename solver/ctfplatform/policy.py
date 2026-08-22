@@ -23,7 +23,7 @@ _PORT_PRODUCT_HINTS = {
     "8188": "ComfyUI / ComfyUI-Manager（先 curl 首页或 /api/manager 验证，命中加载 web/product-playbooks.md）",
     "3000": "Dify / Next.js（先 curl 首页看 data-public-api-prefix/Next.js 特征，命中加载 web/product-playbooks.md）",
     "7860": "Gradio（先 curl 首页看 gr-/gradio/queue 特征，命中加载 web/product-playbooks.md）",
-    "8443": "Apache OFBiz（先 curl /webtools/ 或首页验证，命中加载 web/known-product-exploit.md）",
+    "8443": "Apache OFBiz（先 curl /webtools/ 或首页验证，命中加载 web/java-exploitation.md）",
     "8080": "HugeGraph / 通用 Web（先 curl /gremlin 或 /graphs 验证，命中加载 web/graph-db.md）",
     "10086": "1Panel（先 curl /api/v1/auth/login 验证，命中加载 web/product-playbooks.md）",
 }

@@ -18,10 +18,10 @@ _CACHE_ROOT = ""
 _PRODUCT_ROUTES = {
     "Gradio": ("web", "product-playbooks.md"),
     "Dify": ("web", "product-playbooks.md"),
-    "HugeGraph": ("web", "product-playbooks.md"),
+    "HugeGraph": ("web", "graph-db.md"),
     "ComfyUI-Manager": ("web", "product-playbooks.md"),
     "Apache OFBiz": ("web", "java-exploitation.md"),
-    "1Panel": ("web", "known-product-exploit.md"),
+    "1Panel": ("web", "product-playbooks.md"),
     "GeoServer": ("web", "known-product-exploit.md"),
 }
 

