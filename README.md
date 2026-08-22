@@ -19,8 +19,8 @@ Scheduler ── policy / portfolio / task builder
 
 **核心特性**：
 - **Solver + Observer 双角色设计**：Solver 专注推进解题，Observer 旁路审查防止死循环
-- **Memory + Ideas 看板**：持久化状态管理，跨轮次复用攻击经验
-- **攻击链跨 run 沉淀**：成功解法（剥离 flag/IP 后）按题号持久化到 `skills/experiences/references/attack-chains.json`，下次 run 同题号精确注入「本题历史解法」，把"曾经解出"变成"稳定重放"
+- **Memory + Ideas 看板**：持久化当前题目/重试轮次状态，复用已验证事实而不注入历史题目解法
+- **合规经验库**：只保留不含题号、答案、地址、凭据和历史攻击链的通用验证原则；运行时不会注入历史题目解法。
 - **submit 证据门**：flag 必须曾在工具输出中出现才允许提交，拦截纯猜测（防 f2-05 式连错）
 - **语义上下文压缩**：解决长题目上下文丢失问题
 - **approach-level 循环检测**：自动检测重复攻击模式并告警
@@ -67,8 +67,8 @@ TOOLS = [ToolSpec(MY_TOOL_DEF, execute)]
 
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
-| `SOLVER_MAX_ROUNDS` | 每题最大推理轮次 | `100` |
-| `SOLVER_OBSERVER_EVERY` | Observer 审查间隔（轮） | `6` |
+| `SOLVER_MAX_ROUNDS` | 每题最大推理轮次（未设置时按难度/题型动态分配） | `动态 30–240` |
+| `SOLVER_OBSERVER_EVERY` | Observer 审查间隔（轮，未设置时按难度动态分配） | `动态 8–15` |
 
 ## 快速开始
 
@@ -116,19 +116,9 @@ gzip agent.tar
 # 上传 agent.tar.gz（需 < 1GB）
 ```
 
-### 5. 赛后沉淀攻击链（推荐）
+### 5. 赛后复盘（合规模式）
 
-每次 run 结束后，把获胜解法沉淀进种子库，下次打包即生效：
-
-```bash
-# 从 run 日志收割（agent stdout 中的 attack_chain 事件）
-python3 harvest_attack_chains.py run_log_xxx.log
-
-# 或从本地工作区收割（扫描各题目录的执行日志/历史）
-python3 harvest_attack_chains.py --workspace workspace/
-```
-
-种子库只保存解法方法（flag 与 IP 已自动剥离），不保存答案——合规且对靶场实例轮换鲁棒。
+只将抽象的、与题号无关的工具改进和验证原则写入 Skills。不要把题号、flag、地址、凭据或具体历史攻击链复制回镜像；评测运行时不会读取历史题目解法。
 
 ## 平台网关适配（托管运行模式）
 
@@ -193,17 +183,18 @@ EVA-Mimir/
 ├── shared/              # 共享数据模型
 ├── prompts/             # Solver/Observer 提示词
 ├── skills/              # 题目类型指南
-│   └── experiences/references/attack-chains.json  # 跨 run 攻击链种子库（随镜像打包）
+│   └── experiences/references/case-notes.md       # 不含题号/答案的通用复盘原则
 ├── docker/              # Docker 构建文件
 ├── tests/               # 单元测试
 ├── challenges/          # 题目配置文件
-└── harvest_attack_chains.py  # 赛后从日志/工作区收割攻击链进种子库
+└── harvest_attack_chains.py  # 仅供人工复盘；不得将题目专属解法重新打包
 ```
 
 ## 测试
 
 ```bash
-python -m unittest discover tests/ -v
+PYTHONPATH=. pytest -q
+# 或：python -m unittest discover tests/ -v
 ```
 
 ## 支持的 LLM

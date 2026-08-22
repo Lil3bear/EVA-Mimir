@@ -24,6 +24,13 @@ class RunContext:
     target_url: str = ""
     attempt_id: str = "primary"
     attempt_dir: str = ""
+    # Monotonic wall-clock deadline for the current benchmark run.  A zero
+    # value means that the caller did not provide a deadline (local bridge
+    # mode remains backwards compatible).
+    deadline: float = 0.0
+    # Stable identifier shared by retries in one process.  It is deliberately
+    # not the benchmark token, so it is safe to persist in local state files.
+    run_id: str = ""
 
     def __post_init__(self) -> None:
         challenge_dir = str(Path(self.challenge_dir))
@@ -40,6 +47,8 @@ class RunContext:
         target_url: str = "",
         attempt_id: str = "primary",
         isolate_attempt: bool = False,
+        deadline: float = 0.0,
+        run_id: str = "",
     ) -> "RunContext":
         challenge_dir = Path(workspace_dir) / unique_code
         attempt_dir = (
@@ -54,6 +63,8 @@ class RunContext:
             target_url=target_url,
             attempt_id=attempt_id,
             attempt_dir=str(attempt_dir),
+            deadline=deadline,
+            run_id=run_id,
         )
 
     @classmethod
@@ -70,6 +81,8 @@ class RunContext:
             challenge_id=challenge_id,
             challenge_dir=str(challenge_dir),
             target_url=os.environ.get("CTF_TARGET_URL", ""),
+            deadline=float(os.environ.get("SOLVER_DEADLINE_EPOCH", "0") or 0),
+            run_id=os.environ.get("CTF_RUN_ID", ""),
         )
 
     def for_attempt(self, attempt_id: str) -> "RunContext":
@@ -97,6 +110,8 @@ class WorkerContext(threading.local):
         self.target_url = run.target_url
         self.attempt_id = run.attempt_id
         self.attempt_dir = run.attempt_dir
+        self.deadline = run.deadline
+        self.run_id = run.run_id
         self.workspace = str(Path(run.challenge_dir).parent)
         self.client = client
 
@@ -122,12 +137,15 @@ class WorkerContext(threading.local):
         self.run: RunContext | None = None
         self.unique_code = ""
         self.client = None
+        self.terminal_error = None
         self.workspace = "/workspace"
         self.challenge_id = ""
         self.target_url = ""
         self.challenge_dir = "/workspace"
         self.attempt_id = "primary"
         self.attempt_dir = "/workspace"
+        self.deadline = 0.0
+        self.run_id = ""
         self.recent_fingerprints: list[str] = []
         self.approach_counter: Counter = Counter()
         self.host_fail_counter: Counter = Counter()

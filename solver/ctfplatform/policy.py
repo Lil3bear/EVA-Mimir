@@ -77,6 +77,16 @@ def infer_challenge_type(
             "pentest",
             tuple(dict.fromkeys([primary_skill, "web", "pwn"])),
         )
+    # c-* is intentionally protocol-agnostic.  A port such as 3000, 8080
+    # or 1337 is only a weak hint and must not select Web before the first
+    # response fingerprint; keep Web/Pwn/Pentest available to the Solver.
+    if code.startswith("c-"):
+        return ChallengeProfile(
+            "→ 综合服务（先探测协议）",
+            "pentest",
+            ("web", "pwn"),
+            "probe",
+        )
     if ports & _HTTP_PORTS:
         if primary_skill == "web":
             return ChallengeProfile("→ Web 服务", "web", ("pentest",), "http")
@@ -85,12 +95,6 @@ def infer_challenge_type(
             primary_skill,
             tuple(dict.fromkeys(["web", "pentest"])),
             "http",
-        )
-    if code.startswith("c-"):
-        return ChallengeProfile(
-            "→ 综合服务（协议未定）",
-            "pentest",
-            tuple(dict.fromkeys(["web", primary_skill])),
         )
     if primary_skill == "web":
         return ChallengeProfile("→ 未知协议服务", "pentest", ("web",))

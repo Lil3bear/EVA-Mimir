@@ -7,6 +7,8 @@ from shared.jsonl import deserialize, write_line
 from solver.ctfplatform.tsecbench_client import (
     Challenge,
     DuplicateSubmit,
+    InvalidState,
+    TaskNotFound,
     TsecbenchClient,
 )
 from solver.runtime.submission_store import SubmissionOutcome, SubmissionStore
@@ -200,9 +202,29 @@ def _challenge_to_state(challenge: Challenge) -> dict:
 
 
 def _request_backend(action: str, params: dict) -> dict:
-    if _ctx.client is not None:
+    if _ctx.client is None:
+        return _request_bridge(action, params)
+    try:
         return _request_tsecbench(action, params)
-    return _request_bridge(action, params)
+    except (TaskNotFound, InvalidState) as exc:
+        # ToolRunner 将异常格式化成文本，但任务终止必须穿透到
+        # Agent/Scheduler，不能被当成普通 bash/submit 失败继续重跑。
+        text = " ".join(
+            str(value).lower()
+            for value in (exc, getattr(exc, "message", ""), getattr(exc, "detail", ""))
+        )
+        hint_completed = action == "challenge_get_hint" and any(
+            marker in text for marker in ("completed", "complete", "通关", "已完成")
+        )
+        capacity = (
+            "max active" in text
+            or ("active" in text and "limit" in text)
+            or "上限" in text
+            or "最大活跃" in text
+        )
+        if isinstance(exc, TaskNotFound) or (isinstance(exc, InvalidState) and not hint_completed and not capacity):
+            _ctx.terminal_error = exc
+        raise
 
 
 def _challenge_dir() -> str:

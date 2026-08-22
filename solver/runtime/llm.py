@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import os
+import threading
 import time
 from collections.abc import Callable
 from typing import Any
@@ -26,6 +28,18 @@ _RETRYABLE_ERRORS = (
 DEEPSEEK_V4_CONTEXT_TOKENS = 1_000_000
 DEEPSEEK_V4_MAX_OUTPUT_TOKENS = 8_192
 DEEPSEEK_V4_COMPACTION_RESERVE_TOKENS = 32_768
+
+
+def _llm_limit() -> int:
+    try:
+        return max(1, int(os.environ.get("LLM_MAX_CONCURRENCY", "4")))
+    except ValueError:
+        return 4
+
+
+# A process-wide gate prevents 3 challenges × 2 portfolio agents from
+# overwhelming the hosted gateway.  The limit is configurable for local runs.
+_LLM_SEMAPHORE = threading.BoundedSemaphore(_llm_limit())
 
 
 def is_deepseek_v4(model: str) -> bool:
@@ -90,7 +104,8 @@ def create_with_retry(
     request_snapshot = copy.deepcopy(kwargs)
     for attempt in range(1, attempts + 1):
         try:
-            return create(**copy.deepcopy(request_snapshot))
+            with _LLM_SEMAPHORE:
+                return create(**copy.deepcopy(request_snapshot))
         except Exception as exc:
             retryable = isinstance(exc, _RETRYABLE_ERRORS) or (
                 isinstance(exc, APIStatusError) and exc.status_code >= 500

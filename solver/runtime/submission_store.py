@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shutil
 import sys
 import threading
 import time
@@ -14,6 +16,82 @@ from typing import Callable, Iterator
 
 if sys.platform != "win32":
     import fcntl
+
+
+def benchmark_task_id(env: dict[str, str] | None = None) -> str:
+    """Return a non-secret identity for the current benchmark task."""
+    source = os.environ if env is None else env
+    base_url = str(source.get("BENCHMARK_BASE_URL", "")).strip()
+    token = str(source.get("BENCHMARK_TOKEN", "")).strip()
+    if not base_url or not token:
+        return ""
+    return hashlib.sha256(f"{base_url}\0{token}".encode()).hexdigest()[:24]
+
+
+def score_belongs_to_current_task(challenge_dir: str | Path) -> bool:
+    """Reject score files left by a different benchmark token."""
+    current = benchmark_task_id()
+    if not current:
+        return True
+    marker = Path(challenge_dir) / ".benchmark-task-id"
+    try:
+        return marker.read_text(encoding="utf-8").strip() == current
+    except OSError:
+        return False
+
+
+def prepare_challenge_state(challenge_dir: str | Path) -> bool:
+    """Start a clean state namespace when a mounted workspace changes task.
+
+    Submission state was already namespaced, but Memory/Ideas and execution
+    journals are also persistent files.  Without this boundary, a new task
+    reusing the same ``unique_code`` could see old IPs, credentials, or a
+    recoverable tool call before its first submit.  The current task marker is
+    a one-way hash of URL+token; the token itself is never persisted.
+
+    Returns ``True`` when old task state was removed.  Local bridge mode (no
+    benchmark identity) is intentionally left untouched for backwards
+    compatibility.
+    """
+    current = benchmark_task_id()
+    if not current:
+        return False
+
+    challenge_path = Path(challenge_dir)
+    store = SubmissionStore(challenge_path)
+    with store._locked():
+        try:
+            previous = store.task_marker_path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            previous = ""
+        if previous == current:
+            return False
+
+        # State that can contain answers, target-specific evidence, or a
+        # pending tool replay is task-scoped.  Keep generic source files and
+        # the lock directory intact.
+        for name in (
+            ".submitted_flags.json",
+            ".cumulative_score",
+            ".completed",
+            ".submission-run-id",
+            ".solver-history.jsonl",
+            ".execution-journal.jsonl",
+        ):
+            (challenge_path / name).unlink(missing_ok=True)
+
+        entries = challenge_path / "memory" / "entries"
+        if entries.is_dir():
+            for item in entries.glob("*.json"):
+                item.unlink(missing_ok=True)
+        (challenge_path / "ideas" / "index.json").unlink(missing_ok=True)
+        # Attempt journals and tool-result files are not useful across task
+        # identities and can otherwise feed stale recovery summaries.
+        shutil.rmtree(challenge_path / "attempts", ignore_errors=True)
+        shutil.rmtree(challenge_path / ".tool-results", ignore_errors=True)
+
+        store._write_text(store.task_marker_path, current)
+        return True
 
 
 @dataclass(frozen=True)
@@ -36,11 +114,16 @@ class SubmissionStore:
         self.challenge_dir = Path(challenge_dir)
         self.submissions_path = self.challenge_dir / ".submitted_flags.json"
         self.score_path = self.challenge_dir / ".cumulative_score"
+        self.completed_path = self.challenge_dir / ".completed"
+        self.run_marker_path = self.challenge_dir / ".submission-run-id"
+        self.task_marker_path = self.challenge_dir / ".benchmark-task-id"
+        self.task_id = benchmark_task_id()
+        self.run_id = os.environ.get("CTF_RUN_ID", f"pid-{os.getpid()}")
         self.lock_path = self.challenge_dir / "locks" / "submission.lock"
 
     def submit(self, flag: str, submitter: Callable[[], dict]) -> SubmissionOutcome:
         with self._locked():
-            submissions = self._read_submissions()
+            submissions = self._prepare_run_state(self._read_submissions())
             previous = submissions.get(flag)
             if previous in {"correct", "wrong"}:
                 return SubmissionOutcome(
@@ -66,6 +149,8 @@ class SubmissionStore:
             self._write_json(self.submissions_path, submissions)
             if status == "correct" and response.get("cumulative_score") is not None:
                 self._record_score(response.get("cumulative_score"))
+            if status == "correct" and response.get("is_completed"):
+                self._write_text(self.completed_path, "1")
             return SubmissionOutcome(
                 status=status,
                 response=response,
@@ -88,6 +173,42 @@ class SubmissionStore:
                 finally:
                     if sys.platform != "win32":
                         fcntl.flock(handle, fcntl.LOCK_UN)
+
+    def _prepare_run_state(self, submissions: dict[str, str]) -> dict[str, str]:
+        """Keep only state belonging to this task and current retry run.
+
+        A mounted workspace can outlive both a solver process and a benchmark
+        token.  Wrong guesses are discarded between runs, while correct flags
+        are retained only when the task identity (a hash, never the token)
+        matches.  This prevents stale state from blocking submissions or
+        inflating a later task's score.
+        """
+        previous_task = ""
+        try:
+            previous_task = self.task_marker_path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            pass
+
+        if self.task_id and previous_task != self.task_id:
+            submissions = {}
+            self.score_path.unlink(missing_ok=True)
+            self.completed_path.unlink(missing_ok=True)
+            self._write_text(self.task_marker_path, self.task_id)
+
+        previous_run = ""
+        try:
+            previous_run = self.run_marker_path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            pass
+        if previous_run != self.run_id:
+            submissions = {
+                flag: status
+                for flag, status in submissions.items()
+                if status == "correct"
+            }
+            self._write_json(self.submissions_path, submissions)
+            self._write_text(self.run_marker_path, self.run_id)
+        return submissions
 
     def _read_submissions(self) -> dict[str, str]:
         if not self.submissions_path.exists():

@@ -1,19 +1,30 @@
-"""One runtime policy for budgets, observation cadence, and stopping."""
+"""Single runtime policy for budgets, progress and observation cadence.
+
+The solver used to have independent hard-coded stopping rules in Agent,
+Observer and the scheduler.  This module is the one source of truth for the
+per-challenge policy.  Explicit settings still win, while the defaults keep
+the previously validated difficulty budgets.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 
-_ROUND_BUDGETS = {"easy": 24, "medium": 40, "hard": 64, "difficult": 64}
-_NO_PROGRESS_BUDGETS = {"easy": 10, "medium": 14, "hard": 18, "difficult": 18}
-_OBSERVER_INTERVALS = {"easy": 20, "medium": 16, "hard": 12, "difficult": 12}
+_ROUND_BUDGETS = {"easy": 30, "medium": 60, "hard": 120, "difficult": 120}
+_UNKNOWN_ROUND_BUDGET = 100
+_PENTEST_EXTRA = {"easy": 40, "medium": 120, "hard": 80, "difficult": 80}
+_CTYPE_EXTRA = {"easy": 30, "medium": 60, "hard": 40, "difficult": 40}
+_OBSERVER_INTERVALS = {"easy": 15, "medium": 12, "hard": 8, "difficult": 8}
+_DEFAULT_SWITCH_AFTER = {"easy": 10, "medium": 12, "hard": 12, "difficult": 12}
+_DEFAULT_STOP_AFTER = {"easy": 20, "medium": 24, "hard": 24, "difficult": 24}
 
 
 @dataclass(frozen=True)
 class ControlPolicy:
     max_rounds: int
-    no_progress_rounds: int
+    switch_after: int
+    stop_after: int
     observer_every_rounds: int
 
     @classmethod
@@ -22,33 +33,44 @@ class ControlPolicy:
         settings: dict,
         difficulty: str,
         *,
-        multi_flag: bool = False,
+        pentest: bool = False,
+        ctype: bool = False,
     ) -> "ControlPolicy":
         solver = settings.get("solver", {})
-        default_rounds = _ROUND_BUDGETS.get(difficulty, 40)
-        if multi_flag:
-            default_rounds += 16
+        difficulty = (difficulty or "").lower()
+        base = _ROUND_BUDGETS.get(difficulty, _UNKNOWN_ROUND_BUDGET)
+        if pentest:
+            base += _PENTEST_EXTRA.get(difficulty, 20)
+        if ctype:
+            base += _CTYPE_EXTRA.get(difficulty, 20)
+
+        def positive_setting(name: str, default: int) -> int:
+            value = solver.get(name)
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                value = 0
+            return value if value > 0 else default
+
         return cls(
-            max_rounds=int(solver.get("max_rounds") or default_rounds),
-            no_progress_rounds=max(
-                1,
-                int(
-                    solver.get("no_progress_rounds")
-                    or _NO_PROGRESS_BUDGETS.get(difficulty, 14)
-                ),
+            max_rounds=positive_setting("max_rounds", base),
+            switch_after=positive_setting(
+                "switch_after_rounds",
+                _DEFAULT_SWITCH_AFTER.get(difficulty, 12),
             ),
-            observer_every_rounds=max(
-                1,
-                int(
-                    solver.get("observer_every_rounds")
-                    or _OBSERVER_INTERVALS.get(difficulty, 16)
-                ),
+            stop_after=positive_setting(
+                "no_progress_rounds",
+                _DEFAULT_STOP_AFTER.get(difficulty, 24),
+            ),
+            observer_every_rounds=positive_setting(
+                "observer_every_rounds",
+                _OBSERVER_INTERVALS.get(difficulty, 10),
             ),
         )
 
     def stop_reason(self, round_num: int, last_progress_round: int) -> str:
-        idle_rounds = round_num - last_progress_round
-        if idle_rounds > self.no_progress_rounds:
+        idle_rounds = max(0, round_num - last_progress_round)
+        if idle_rounds > self.stop_after:
             return f"连续 {idle_rounds} 轮无新证据"
         if round_num > self.max_rounds:
             return f"达到 {self.max_rounds} 轮预算"

@@ -19,7 +19,6 @@
   },
   "solver": {
     "max_rounds": null,
-    "observer_every_rounds": 6,
     "observer_correction_max_lag": 3,
     "memory_limit": 10,
     "idea_limit": 8

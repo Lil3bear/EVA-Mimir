@@ -1,6 +1,6 @@
 # 图数据库利用（HugeGraph / Neo4j）
 
-> 适用：关联关系检索引擎、知识图谱、图数据库服务题（c-06 类）。
+> 适用：关联关系检索引擎、知识图谱、图数据库服务题（图数据库类）。
 
 ## 指纹识别
 - 端口 8080 + `/gremlin`、`/graphs`、`gremlin-server` → HugeGraph。
@@ -43,4 +43,4 @@ curl -s -X POST http://TARGET:8080/gremlin -H 'Content-Type: application/json' \
 1. 图数据库题通常不是让你"爆破"，而是**注入 Gremlin/Cypher 查询**或利用**未授权 RCE**。
 2. 先确认端点是否未授权，再找 Gremlin/Cypher 注入点。
 3. 目标是读图数据里的 flag，或 RCE 后搜文件。
-4. 同主机可能还有其他服务（c-06 类门户），逐个端口独立指纹。
+4. 同主机可能还有其他服务（图数据库类门户），逐个端口独立指纹。

@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from solver.tools.bash_tool import _extract_url_pattern, _inline_http_variant_count
+from solver.runtime.control import ControlPolicy
 
 
 class ObserverControlPlaneTests(unittest.TestCase):
@@ -25,6 +26,18 @@ class ObserverControlPlaneTests(unittest.TestCase):
         self.assertEqual(observer._round_logs, [])
         self.assertIsNone(observer._review_thread)
         self.assertEqual(observer._VECTOR_CYCLE_THRESHOLD, 4)
+
+    def test_stop_discards_pending_review_without_blocking_shutdown(self):
+        from solver.observer.loop import ObserverLoop
+
+        observer = ObserverLoop(settings={"solver": {"observer_enabled": True}})
+        observer.on_round_start(1)
+        observer.on_tool_call("bash", {"cmd": "id"}, "uid=0")
+        observer.on_round_end(1)
+        observer.stop()
+
+        self.assertFalse(observer.enabled)
+        self.assertEqual(observer._round_logs, [])
 
     @patch("solver.observer.agent.OpenAI")
     def test_observer_has_separate_bounded_budget(self, _mock_openai):
@@ -74,6 +87,51 @@ class ObserverPromptTests(unittest.TestCase):
         self.assertIn("仅保留末尾", result)
         self.assertTrue(result.endswith("TAIL"))
         self.assertLess(len(result), 12100)
+
+
+class ChallengeRoutingTests(unittest.TestCase):
+    def test_c_challenge_does_not_treat_port_as_http_proof(self):
+        from solver.ctfplatform.policy import infer_challenge_type
+
+        profile = infer_challenge_type("c-03", ("10.0.0.9:3000",))
+        self.assertEqual(profile.primary_skill, "pentest")
+        self.assertEqual(profile.protocol_hint, "probe")
+        self.assertIn("web", profile.candidate_skills)
+        self.assertIn("pwn", profile.candidate_skills)
+
+    def test_known_web_prefix_can_still_use_http_hint(self):
+        from solver.ctfplatform.policy import infer_challenge_type
+
+        profile = infer_challenge_type("a-03", ("10.0.0.9:80",))
+        self.assertEqual(profile.primary_skill, "web")
+        self.assertEqual(profile.protocol_hint, "http")
+
+
+class ControlPolicyTests(unittest.TestCase):
+    def test_difficulty_and_challenge_type_share_one_budget_policy(self):
+        easy = ControlPolicy.from_settings({"solver": {}}, "easy")
+        hard_pentest = ControlPolicy.from_settings(
+            {"solver": {}}, "hard", pentest=True
+        )
+        self.assertEqual(easy.max_rounds, 30)
+        self.assertEqual(hard_pentest.max_rounds, 200)
+        self.assertEqual(easy.observer_every_rounds, 15)
+        self.assertEqual(hard_pentest.observer_every_rounds, 8)
+
+    def test_explicit_policy_overrides_are_positive_only(self):
+        policy = ControlPolicy.from_settings(
+            {"solver": {
+                "max_rounds": 7,
+                "switch_after_rounds": 3,
+                "no_progress_rounds": 5,
+                "observer_every_rounds": 2,
+            }},
+            "medium",
+        )
+        self.assertEqual(
+            (policy.max_rounds, policy.switch_after, policy.stop_after, policy.observer_every_rounds),
+            (7, 3, 5, 2),
+        )
 
 
 class DifficultyMaxRoundsTests(unittest.TestCase):
@@ -222,6 +280,41 @@ class ExtractDifficultyTests(unittest.TestCase):
     def test_no_difficulty_returns_empty(self):
         from solver.agent import SolverAgent
         self.assertEqual(SolverAgent._extract_difficulty("no difficulty here"), "")
+
+
+class AutoSubmitSafetyTests(unittest.TestCase):
+    @patch("solver.agent.bridge_tools.submit_flag")
+    def test_rejects_flag_echoed_by_password_script(self, submit_flag):
+        """A dictionary result must not turn a failed password into a flag."""
+        from solver.agent import SolverAgent
+
+        agent = SolverAgent.__new__(SolverAgent)
+        agent._auto_submit_count = 0
+        output = (
+            "⚡ 发现疑似 flag：['flag{candidate123}']\n"
+            "[0] admin/flag{candidate123} => nope\n"
+        )
+
+        self.assertEqual(
+            agent._auto_submit_flags(
+                output,
+                tool_name="bash",
+                tool_args={"cmd": "./try-passwords.sh"},
+            ),
+            "",
+        )
+        submit_flag.assert_not_called()
+
+    @patch("solver.agent.bridge_tools.submit_flag")
+    def test_marker_without_visible_source_line_is_not_evidence(self, submit_flag):
+        from solver.agent import SolverAgent
+
+        agent = SolverAgent.__new__(SolverAgent)
+        agent._auto_submit_count = 0
+        marker_only = "⚡ 发现疑似 flag：['flag{truncated123}']"
+
+        self.assertEqual(agent._auto_submit_flags(marker_only, "bash", {}), "")
+        submit_flag.assert_not_called()
 
 
 class AutoExtractTests(unittest.TestCase):

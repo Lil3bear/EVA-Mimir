@@ -18,6 +18,7 @@ from solver.runtime.llm import (
     is_deepseek_v4,
 )
 from solver.runtime.context_window import ContextWindow, serialize_messages
+from solver.runtime.control import ControlPolicy
 from solver.runtime.journal import ExecutionJournal
 from solver.runtime.recovery import recover_execution
 from solver.runtime.tool_runner import ToolRunner, parse_tool_args
@@ -102,64 +103,23 @@ _PHASES = ("RECON", "INITIAL_ACCESS", "POST_EXPLOIT", "DATA_EXFIL")
 
 _PHASE_PROMPTS = {
     "INITIAL_ACCESS": (
-        "[阶段切换 → INITIAL_ACCESS] 已获得目标系统的初始访问权限。\n"
-        "立即执行以下标准动作：\n"
-        "1. whoami && id → 确认当前权限\n"
-        "2. uname -a && cat /etc/os-release → 系统版本\n"
-        "3. ip addr && cat /etc/hosts → 网络拓扑\n"
-        "4. find / -perm -4000 2>/dev/null → SUID 提权\n"
-        "5. cat /etc/shadow 2>/dev/null → 凭证收集\n"
-        "6. history && env → 泄露的凭证/连接串\n"
-        "7. crontab -l && ls /etc/cron* 2>/dev/null → 定时任务\n"
-        "8. arp -a && netstat -tlnp 2>/dev/null → 内网资产发现\n"
-        "每发现一个新信息立即用 memory_add 记录！"
+        "[阶段切换 → INITIAL_ACCESS] 已获得明确的初始访问权限。\n"
+        "先用一组低噪声命令确认身份、系统和网络（whoami/id、uname、ip addr、/etc/hosts），"
+        "再按当前 Skill 选择一个最有证据支持的提权或凭据收集动作。\n"
+        "每个新事实写入 memory；得到 flag 立即提交，避免重复扫描。"
     ),
     "POST_EXPLOIT": (
-        "[阶段切换 → POST_EXPLOIT] 已提交部分 flag，进入后渗透阶段。\n"
-        "必须继续寻找剩余 flag，立即执行：\n"
-        "1. sudo -l → 检查提权路径\n"
-        "2. find / -name 'flag*' -o -name '*.key' -o -name 'secret*' 2>/dev/null → 搜索 flag 文件\n"
-        "3. cat /proc/net/arp && ip route → 内网资产\n"
-        "4. grep -r 'password\\|passwd\\|credential' /var/www/ /etc/ /home/ /opt/ 2>/dev/null | head -30 → 凭据\n"
-        "5. ls -la /home/*/.ssh/ /root/.ssh/ 2>/dev/null → SSH 密钥\n"
-        "6. 检查数据库连接串 → mysql/redis/mongodb\n"
-        "绝对不能停下来，必须找到所有 flag！"
+        "[阶段切换 → POST_EXPLOIT] 已提交部分 flag，题目仍未完成。\n"
+        "先查询剩余 flag 数，再检查当前权限、已知 flag/密钥路径、配置凭据和本机网络；"
+        "只执行与当前证据相关的一条路线，失败后记录边界并切换方向。"
     ),
     "DATA_EXFIL": (
-        "[阶段切换 → DATA_EXFIL] 发现内网资产，进入数据挖掘阶段。\n"
-        "对每个发现的内网主机：\n"
-        "1. 用已有凭据尝试 SSH/数据库连接\n"
-        "2. curl 探测常见端口（80/443/8080/3306/6379/27017）\n"
-        "3. 每台机器都搜索 flag 文件\n"
-        "4. 检查是否可以跳板到更深层网络"
+        "[阶段切换 → DATA_EXFIL] 发现新的内网资产。\n"
+        "为每个新地址建立服务指纹，优先复用本次运行已验证的凭据，"
+        "逐台验证并提交新 flag；不要把旧实例地址或未经验证的口令当作事实。"
     ),
 }
 
-
-# 按难度分级的默认 max_rounds
-_DIFFICULTY_MAX_ROUNDS = {
-    "easy": 30,
-    "medium": 60,
-    "hard": 120,
-    "difficult": 120,
-}
-
-# B 类多阶段渗透题额外轮次加成（多 flag 题需要更多探索时间）
-# 第6轮复盘：b类全挂(0/3)，max_rounds不足是主因，大幅提升
-_PENTEST_EXTRA_ROUNDS = {
-    "easy": 40,      # 30 -> 70
-    "medium": 120,   # 60 -> 180
-    "hard": 80,      # 100 -> 180
-    "difficult": 80, # 100 -> 180
-}
-
-# C 类综合/杂项题额外轮次加成（run-11649 复盘：c-03/c-06/c-08/c-09 轮次不足未解出）
-_CTYPE_EXTRA_ROUNDS = {
-    "easy": 30,      # 30 -> 60
-    "medium": 60,    # 60 -> 120
-    "hard": 40,      # 100 -> 140
-    "difficult": 40,
-}
 
 
 def _extract_content(msg) -> str:
@@ -184,19 +144,21 @@ class SolverAgent:
         self.task = task
         self.skills_dir = skills_dir
         self.prompt_file = settings.get("solver", {}).get("prompt_file", "")
-        # 从 task 中提取难度，按难度分级设定 max_rounds
+        # 所有轮次、停机和 Observer 预算统一由 ControlPolicy 决定。
+        # 这样 Agent/Observer 不会各自维护一套互相冲突的阈值。
         difficulty = self._extract_difficulty(task)
         self._difficulty = difficulty
-        default_rounds = _DIFFICULTY_MAX_ROUNDS.get(difficulty, 100)
-        # B 类多阶段渗透题（多 flag）额外加轮次
         is_pentest = self._is_pentest_challenge(task)
-        if is_pentest:
-            extra = _PENTEST_EXTRA_ROUNDS.get(difficulty, 20)
-            default_rounds += extra
-        # C 类综合/杂项题额外加轮次
-        if self._is_c_challenge(task):
-            default_rounds += _CTYPE_EXTRA_ROUNDS.get(difficulty, 20)
-        self.max_rounds = settings.get("solver", {}).get("max_rounds") or default_rounds
+        is_ctype = self._is_c_challenge(task)
+        self._control_policy = ControlPolicy.from_settings(
+            settings,
+            difficulty,
+            pentest=is_pentest,
+            ctype=is_ctype,
+        )
+        self.max_rounds = self._control_policy.max_rounds
+        self._switch_after_rounds = self._control_policy.switch_after
+        self._stop_after_rounds = self._control_policy.stop_after
         # hint 严格门：低于该轮次禁止看提示（提示会扣 10%，先自己跑 loop）
         # hint 严格门：太低轮次 / 还在有新发现 / 本轮已看过则禁止看提示
         # 不用固定 20 轮硬卡——用“最近是否还有新发现”判断是否真卡住，避免早期白卡。
@@ -205,6 +167,7 @@ class SolverAgent:
         self._last_progress_round = 0  # 最近一次有新进展的轮次（用于及时刹停）
         self._stuck_switched = False  # 是否已注入过“方向切换”指令
         self._last_discovery_round = 0  # 最近一次新发现（memory_add / 正确 flag）的轮次
+        self._progress_fingerprints: set[str] = set()
         self._auto_submit_count = 0  # 每题自动提交 flag 的累计次数（限流防误报）
         self._target_url = ""
         # 从 task 中提取 URL
@@ -276,13 +239,8 @@ class SolverAgent:
         self._tool_runner = ToolRunner(
             self._tool_executors, self._tool_schemas, self._journal
         )
-        # ✅ 按难度动态调整 Observer 频率
-        difficulty = self._extract_difficulty(task)
-        default_observer_every = {"easy": 15, "medium": 12, "hard": 8, "difficult": 8}
-        observer_every = settings.get("solver", {}).get(
-            "observer_every_rounds",
-            default_observer_every.get(difficulty, 6)
-        )
+        # ✅ 使用统一控制策略的 Observer 频率
+        observer_every = self._control_policy.observer_every_rounds
         self.observer = ObserverLoop(
             settings={**settings, "solver": {**settings.get("solver", {}), "observer_every_rounds": observer_every}},
             on_correction=self.inject_message,
@@ -315,10 +273,14 @@ class SolverAgent:
                 _emit("agent_end", {"rounds": self.round, "reason": "multi_solver_other_won"})
                 return
 
-            # ━━ 硬约束：无进展强制停止（代码层，不靠 Observer） ━━
-            difficulty = self._extract_difficulty(self.task)
-            if self._should_force_stop(difficulty):
-                self.observer.on_agent_end()
+            # ━━ 硬约束：deadline/无进展强制停止（代码层，不靠 Observer） ━━
+            if self._deadline_exceeded():
+                self.observer.stop()
+                self._finish_execution("deadline_exceeded")
+                _emit("agent_end", {"rounds": self.round, "reason": "deadline_exceeded"})
+                return
+            if self._should_force_stop():
+                self.observer.stop()
                 self._finish_execution("force_stop_no_progress")
                 _emit("agent_end", {"rounds": self.round, "reason": "force_stop_no_progress"})
                 return
@@ -326,15 +288,15 @@ class SolverAgent:
             # ━━ 及时刹停（分级）：先换方向，换方向后仍无进展才停 ━━
             # 关键：区分“这条思路死”和“题无解”——先切方向，不要一停到底。
             stuck_rounds = self.round - self._last_progress_round
-            if stuck_rounds > 12 and not self._stuck_switched:
+            if stuck_rounds > self._switch_after_rounds and not self._stuck_switched:
                 self._stuck_switched = True
                 self._queue_injection(
                     "[方向切换] 已连续多轮无新进展，当前这条思路很可能已死，但不代表题无解。"
                     "请立即：1) idea_list 看未探索方向；2) 用 skill_load 加载一个不同的章节；"
                     "3) 换完全不同的攻击面（认证→文件读取/SSRF/反序列化/中间件 CVE 等）。"
                 )
-            if stuck_rounds > 24:
-                self.observer.on_agent_end()
+            if stuck_rounds > self._stop_after_rounds:
+                self.observer.stop()
                 self._finish_execution("stuck_no_progress")
                 _emit("agent_end", {"rounds": self.round, "reason": "stuck_no_progress"})
                 return
@@ -407,6 +369,16 @@ class SolverAgent:
                     gate=self._tool_gate,
                 )
                 result = execution.result
+                terminal_error = getattr(_ctx, "terminal_error", None)
+                if terminal_error is not None:
+                    self.observer.stop()
+                    self._finish_execution("terminal_platform_error")
+                    _emit("agent_end", {
+                        "rounds": self.round,
+                        "reason": "terminal_platform_error",
+                        "error": str(terminal_error),
+                    })
+                    raise terminal_error
                 if (
                     tool_name == "challenge_get_hint"
                     and execution.executed
@@ -420,21 +392,35 @@ class SolverAgent:
                         "error": execution.journal_error,
                     })
 
-                # ━━ 记录"新进展"轮次（用于及时刹停 + hint 门）━━
-                if tool_name == "memory_add":
+                # ━━ 记录“新进展”轮次（只认新增，不认重复操作）━━
+                if tool_name == "memory_add" and (
+                    "已记录" in result or "已添加" in result
+                ) and "已存在" not in result:
                     self._last_progress_round = self.round
                     self._last_discovery_round = self.round
-                elif tool_name == "challenge_submit_flag" and "正确" in result:
+                elif tool_name == "challenge_submit_flag" and (
+                    "[✓]" in result and "[重复]" not in result
+                ):
                     self._last_progress_round = self.round
                     self._last_discovery_round = self.round
-                elif tool_name == "bash" and self._bash_is_progress(result):
+                elif tool_name in ("bash", "read_file", "grep") and self._bash_has_new_progress(result):
+                    # Source/attachment reads can be real progress on
+                    # reverse/crypto tasks too; the same first-seen evidence
+                    # fingerprint prevents repeated reads from resetting idle.
                     self._last_progress_round = self.round
+                    self._last_discovery_round = self.round
+                elif tool_name == "write_file" and self._write_file_is_new(result):
+                    self._last_progress_round = self.round
+                    self._last_discovery_round = self.round
 
                 # ━━ 自动提交工具输出中发现的 flag（不依赖 LLM 主动提交）━━
                 if tool_name in ("bash", "read_file", "grep"):
-                    auto_note = self._auto_submit_flags(result)
+                    auto_note = self._auto_submit_flags(result, tool_name, tool_args)
                     if auto_note:
                         result = result + "\n" + auto_note
+                        if "[✓]" in auto_note and "[重复]" not in auto_note:
+                            self._last_progress_round = self.round
+                            self._last_discovery_round = self.round
 
                 _emit("tool_result", {
                     "tool": tool_name,
@@ -447,7 +433,7 @@ class SolverAgent:
                 # ✅ 智能截断 tool result，平衡 token 节省与信息保留
                 truncated_result = result
                 _TRUNCATE_LIMIT = 6000  # 普通工具输出上限
-                _SKILL_LIMIT = 12000    # read_file 读 Skills 文件的上限
+                _SKILL_LIMIT = 16000    # 兼容直接 read_file 的 Skill 入口上限
                 _SKILL_TOOL_LIMIT = 42000  # skill_load/skill_list 专用上限（一次读全 reference）
 
                 if tool_name in ("skill_load", "skill_list"):
@@ -493,14 +479,10 @@ class SolverAgent:
                     # result 里已含进度和"还有剩余 Flag"提示
                     # 额外注入一条强制指令，确保 Solver 不会停下
                     self._queue_injection(
-                        f"[多 Flag 提醒] {result} "
-                        f"\n\n立即执行以下操作继续寻找下一个 flag："
-                        f"\n1. challenge_get_state 查看剩余 flag 数"
-                        f"\n2. find / -name 'flag*' 2>/dev/null 搜索当前机器"
-                        f"\n3. sudo -l 检查提权路径"
-                        f"\n4. ip addr && cat /proc/net/arp 探测内网"
-                        f"\n5. grep -r 'password\\|passwd' /var/www/ /etc/ /home/ 2>/dev/null | head -20 收集凭据"
-                        f"\n绝对不能停下来，必须继续！"
+                        f"[多 Flag 提醒] {result}"
+                        "\n先调用 challenge_get_state 确认剩余数量；然后只从当前已验证的权限、"
+                        "文件、配置或网络证据选择一个新的路线。已完成的扫描和失败方向不要重复，"
+                        "若连续多个方向都没有新证据，按控制策略切换或结束本题。"
                     )
 
             _emit("round_end", {"round": self.round})
@@ -509,12 +491,12 @@ class SolverAgent:
 
             if solved or self.solved:
                 self.solved = True
-                self.observer.on_agent_end()
+                self.observer.stop()
                 self._finish_execution("solved")
                 _emit("agent_end", {"rounds": self.round, "reason": "solved"})
                 return
 
-        self.observer.on_agent_end()
+        self.observer.stop()
         self._finish_execution("max_rounds")
         _emit("agent_end", {"rounds": self.round, "reason": "max_rounds"})
 
@@ -567,6 +549,21 @@ class SolverAgent:
             "error": str(exc)[:300],
         })
 
+    def _completion_create(self):
+        """Return an LLM callable with the remaining benchmark timeout."""
+        client = self.client
+        deadline = float(getattr(_ctx, "deadline", 0.0) or 0.0)
+        if deadline:
+            remaining = deadline - __import__("time").time()
+            if remaining <= 0:
+                raise TimeoutError("benchmark deadline exceeded")
+            # OpenAI-compatible clients support with_options; test doubles and
+            # older wrappers may not, so retain a safe fallback.
+            with_options = getattr(client, "with_options", None)
+            if callable(with_options):
+                client = with_options(timeout=max(0.1, min(120.0, remaining)))
+        return client.chat.completions.create
+
     def _create_turn_response(self, is_thinking: bool):
         kwargs = completion_kwargs(
             model=self.model,
@@ -578,7 +575,7 @@ class SolverAgent:
         )
         try:
             return create_with_retry(
-                self.client.chat.completions.create,
+                self._completion_create(),
                 **kwargs,
                 max_attempts=self._llm_max_attempts,
                 on_retry=self._on_llm_retry,
@@ -601,7 +598,7 @@ class SolverAgent:
             else:
                 raise
             return create_with_retry(
-                self.client.chat.completions.create,
+                self._completion_create(),
                 **kwargs,
                 max_attempts=self._llm_max_attempts,
                 on_retry=self._on_llm_retry,
@@ -613,6 +610,8 @@ class SolverAgent:
         ).estimate(self.messages)
 
     def _tool_gate(self, tool_name: str, tool_args: dict) -> str:
+        if self._deadline_exceeded():
+            return "[停止] 已达到本次运行截止时间，不再执行新的工具调用。"
         if tool_name == "challenge_get_hint":
             since_discovery = self.round - self._last_discovery_round
             stuck_limit = {
@@ -738,7 +737,7 @@ class SolverAgent:
                 reasoning_effort=self._reasoning_effort,
             )
             resp = create_with_retry(
-                self.client.chat.completions.create,
+                self._completion_create(),
                 **kwargs,
                 max_attempts=self._llm_max_attempts,
                 on_retry=self._on_llm_retry,
@@ -758,60 +757,6 @@ class SolverAgent:
             except Exception:
                 pass
             return "\n".join(fallback_parts) if len(fallback_parts) > 1 else f"（摘要生成失败：{e})"
-
-    def _build_forced_review(self) -> str:
-        """
-        每 20 轮强制注入的回顾消息。
-        与 6 轮快照不同，这里明确要求 Solver 停下来审视已知信息，
-        检查是否有未利用的凭据/路径/信息。
-        """
-        try:
-            from shared.data import memory as mem_store, ideas as idea_store
-            challenge_dir = Path(_ctx.challenge_dir or "/root/workspace")
-            memories = mem_store.list_memory(challenge_dir, limit=15)
-            ideas = idea_store.list_ideas(challenge_dir, limit=10)
-        except Exception:
-            return ""
-
-        lines = [
-            f"\u26a0\ufe0f [\u5f3a\u5236\u56de\u987e - \u7b2c {self.round} \u8f6e] \u8bf7\u7acb\u5373\u505c\u4e0b\u5f53\u524d\u64cd\u4f5c\uff0c\u5ba1\u89c6\u4ee5\u4e0b\u5df2\u77e5\u4fe1\u606f\uff1a",
-            "",
-        ]
-
-        # 列出所有凭据类 memory
-        credentials = [m for m in memories if m.kind in ('evidence', 'fact')]
-        if credentials:
-            lines.append("\U0001f511 \u5df2\u83b7\u53d6\u7684\u51ed\u636e/\u53d1\u73b0\uff1a")
-            for m in credentials:
-                lines.append(f"  - [{m.kind}] {m.content}")
-            lines.append("")
-
-        # 列出\u672a\u5229\u7528\u7684 pending ideas
-        pending = [i for i in ideas if i.status == 'pending']
-        if pending:
-            lines.append("\U0001f4cb \u672a\u63a2\u7d22\u7684\u65b9\u5411\uff1a")
-            for i in pending:
-                lines.append(f"  - {i.content}")
-            lines.append("")
-
-        # \u5217\u51fa\u5931\u8d25\u7684\u65b9\u5411
-        failed = [i for i in ideas if i.status == 'failed']
-        if failed:
-            lines.append("\u26d4 \u5df2\u5931\u8d25\u7684\u65b9\u5411\uff08\u7981\u6b62\u91cd\u590d\uff09\uff1a")
-            for i in failed:
-                result_str = f"\uff08{i.result}\uff09" if i.result else ""
-                lines.append(f"  - {i.content}{result_str}")
-            lines.append("")
-
-        lines.append(
-            "\u8bf7\u68c0\u67e5\uff1a"
-            "1. \u4ee5\u4e0a\u51ed\u636e/\u53d1\u73b0\u4e2d\uff0c\u662f\u5426\u6709\u672a\u5229\u7528\u7684\uff08\u5982\u5bc6\u7801\u672a\u767b\u5f55\u3001\u8def\u5f84\u672a\u8bbf\u95ee\uff09\uff1f"
-            "2. \u672a\u63a2\u7d22\u7684\u65b9\u5411\u4e2d\uff0c\u662f\u5426\u6709\u66f4\u6709\u5e0c\u671b\u7684\uff1f"
-            "3. \u5f53\u524d\u65b9\u5411\u662f\u5426\u5df2\u7ecf\u5c1d\u8bd5\u592a\u591a\u6b21\uff0c\u5e94\u8be5\u6362\u65b9\u5411\uff1f"
-            "\u5ba1\u89c6\u540e\u518d\u7ee7\u7eed\u89e3\u9898\u3002"
-        )
-
-        return "\n".join(lines)
 
     @staticmethod
     def _extract_difficulty(task: str) -> str:
@@ -957,9 +902,57 @@ class SolverAgent:
         keywords.extend([p for p in paths if len(p) > 3])
         return list(dict.fromkeys(keywords))
 
+    def _bash_has_new_progress(self, result: str) -> bool:
+        """只把首次出现的结构化证据计为进展。
+
+        单纯出现 HTTP 200、同一个目标 IP 或重复的 password 字样不能
+        无限刷新停机计数；每个结构化信号只在本题首次出现时计一次。
+        """
+        if not self._bash_is_progress(result):
+            return False
+        import hashlib
+        import re
+        signals: list[str] = []
+        patterns = (
+            ("flag", r"[A-Za-z0-9_]+\{[^}\s]{4,80}\}"),
+            ("ip", r"\b\d{1,3}(?:\.\d{1,3}){3}\b"),
+            ("uid", r"uid=\d+(?:\([^)]*\))?"),
+            ("credential", r"(?:password|passwd|secret|token|api[_-]?key)\s*[=:]\s*[^\s,;]+"),
+            ("http", r"HTTP/\d\.\d\s+\d{3}"),
+        )
+        for kind, pattern in patterns:
+            for value in re.findall(pattern, result, re.IGNORECASE):
+                normalized = f"{kind}:{str(value).lower()}"
+                signals.append(normalized)
+        if not signals:
+            # 一次性的明确成功/发现文本仍算进展，但重复正文不算。
+            normalized = re.sub(r"\s+", " ", result).strip().lower()[:300]
+            signals.append(f"text:{normalized}")
+        fresh = False
+        for signal in signals:
+            fingerprint = hashlib.sha1(signal.encode()).hexdigest()[:16]
+            if fingerprint not in self._progress_fingerprints:
+                self._progress_fingerprints.add(fingerprint)
+                fresh = True
+        return fresh
+
+    def _write_file_is_new(self, result: str) -> bool:
+        """Count a newly-created artifact once, not repeated overwrites."""
+        import hashlib
+        import re
+        match = re.search(r"已写入\s+(.+?)（\d+\s*字节）", result or "")
+        if not match:
+            return False
+        signal = "file:" + match.group(1).strip()
+        fingerprint = hashlib.sha1(signal.encode()).hexdigest()[:16]
+        if fingerprint in self._progress_fingerprints:
+            return False
+        self._progress_fingerprints.add(fingerprint)
+        return True
+
     @staticmethod
     def _bash_is_progress(result: str) -> bool:
-        """bash 输出是否算“新进展”——只认真实新信息，不认空输出/重复扫描/普通 ls。"""
+        """bash 输出是否包含可能的结构化进展信号。"""
         if not result:
             return False
         if result.startswith("[错误]") or result.startswith("[命令执行完毕"):
@@ -977,7 +970,9 @@ class SolverAgent:
         ]
         return any(re.search(s, result, re.IGNORECASE) for s in signals)
 
-    def _auto_submit_flags(self, result: str) -> str:
+    def _auto_submit_flags(
+        self, result: str, tool_name: str = "", tool_args: dict | None = None
+    ) -> str:
         """
         从工具输出中自动提取并提交【高置信度】 flag。
         只认已知 flag 前缀（flag/HTB/gctf/SEKAI/CTF/NSSCTF/WLLMCTF），且内容无空白；
@@ -990,7 +985,54 @@ class SolverAgent:
             r'(?:flag|FLAG|htb|HTB|gctf|GCTF|sekai|SEKAI|ctf|CTF|nssctf|NSSCTF|wllmctf|WLLMCTF)'
             r'\{[^}\s]{4,80}\}'
         )
-        flags = list(dict.fromkeys(pattern.findall(result or "")))
+        raw = result or ""
+        # 自动提交只接受“目标输出中的候选”。源码、文档、历史记录、
+        # strings/grep 扫描和命令参数中的示例 flag 一律交给模型显式判断，
+        # 避免再次出现 run-11983 式批量误提交。
+        lowered = raw.lower()
+        excluded = (
+            "example", "示例", "sample", "documentation", "文档", "skill",
+            "readme", "history", "历史", "comment", "注释", "strings",
+        )
+        if any(word in lowered for word in excluded):
+            return ""
+        if tool_name != "bash" and "发现疑似 flag" not in raw:
+            return ""
+        command_text = json.dumps(tool_args or {}, ensure_ascii=False).lower()
+        flags = []
+        for candidate in dict.fromkeys(pattern.findall(raw)):
+            if candidate.lower() in command_text:
+                continue
+            # Candidate lines that look like a password dictionary/script
+            # result (the run-11983 failure mode) are not a flag signal.  Do
+            # not inspect only the first matching line: the auto-extractor
+            # summary can precede the actual ``admin/<candidate> => nope``
+            # line, which would otherwise bypass this guard.
+            candidate_lines = [
+                ln for ln in raw.splitlines() if candidate in ln
+            ] or [raw]
+            # ``_auto_extract`` prepends a marker.  A marker alone is not
+            # evidence: it may survive output truncation while the original
+            # line containing the candidate was omitted.
+            evidence_lines = [
+                ln for ln in candidate_lines if "发现疑似 flag" not in ln
+            ]
+            if not evidence_lines:
+                continue
+            suspicious_line = re.compile(
+                r"(?:password|passwd|pwd|credential|creds|username|user|admin|root)"
+                r"\s*[/\\:=]|(?:=>|\b)(?:nope|wrong|failed|invalid)\b|"
+                r"(?:candidate|payload|source|script|writeup|strings)",
+                re.IGNORECASE,
+            )
+            if any(suspicious_line.search(ln) for ln in evidence_lines):
+                continue
+            # 必须有自动识别器的显式标记，或出现在明确的 flag= / flag: 行。
+            if "发现疑似 flag" not in raw and not re.search(
+                rf"(?:flag|secret)\s*[:=]\s*{re.escape(candidate)}", raw, re.IGNORECASE
+            ):
+                continue
+            flags.append(candidate)
         if not flags:
             return ""
         notes = []
@@ -1141,24 +1183,24 @@ class SolverAgent:
         # 纯附件题（crypto/reverse）：先看附件
         return "ls -la && file ./* 2>/dev/null | head -50"
 
-    def _should_force_stop(self, difficulty: str) -> bool:
-        """
-        硬约束：无进展强制停止。
-        策略：简单题快速失败（省时间给重跑/难题），难题给足轮次（分数大头）。
-        - easy: >18 轮无 flag → 停
-        - medium: >45 轮无 flag → 停
-        - hard/difficult: >110 轮无 flag → 停
-        已提交过 flag 的多阶段渗透题不触发。
-        """
-        if self._submitted_flag_count > 0:
-            return False  # 有进展，不停
+    def _deadline_exceeded(self) -> bool:
+        deadline = float(getattr(_ctx, "deadline", 0.0) or 0.0)
+        return bool(deadline and __import__("time").time() >= deadline)
 
-        limit = {"easy": 22, "medium": 50, "hard": 100, "difficult": 100}.get(difficulty, 90)
-        if self.round > limit:
-            _emit("force_stop", {
-                "round": self.round,
-                "reason": f"{difficulty} 题 {limit} 轮无进展",
-                "difficulty": difficulty,
-            })
-            return True
-        return False
+    def _should_force_stop(self) -> bool:
+        """统一控制面上的无进展停止判断。
+
+        ``_last_progress_round`` 只在新证据/新增记忆/首次正确提交时更新，
+        因此重复请求和重复提交不会把停机计数清零。
+        """
+        reason = self._control_policy.stop_reason(
+            self.round, self._last_progress_round
+        )
+        if not reason:
+            return False
+        _emit("force_stop", {
+            "round": self.round,
+            "reason": reason,
+            "difficulty": self._difficulty,
+        })
+        return True

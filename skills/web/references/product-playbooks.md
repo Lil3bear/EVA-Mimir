@@ -4,9 +4,8 @@
 
 ### 6.1 1Panel
 
-> ⚠️ **拿到 psession 后，唯一正确的 RCE 路径是 CVE-2024-39907 SQLi 注入写 webshell**。
-> 不要尝试 files/edit / files/content / files/upload 等文件操作端点——这些端点已证实无法 RCE。
-> 如果 Observer 让你打 SQLi，**立即执行下面的 SQLi payload，不要继续探索文件端点**。
+> ⚠️ 拿到 psession 后，可优先验证 CVE-2024-39907 SQLi 写文件路线；文件操作端点是否可用必须以当前响应确认。
+> 不要因为 Observer 或本 playbook 给出示例就跳过验证，也不要在同一失败结构上重复消耗轮次。
 
 ```bash
 # 登录 API（密码需 base64 编码）
@@ -91,7 +90,7 @@ req = b"GET /api/manager/db_mode?value=none\rsecurity_level%20%3D%20weak HTTP/1.
 s.send(req)
 print(s.recv(4096))
 ```
-- 如果题目描述中提到 CVE-2025-67303，优先按上述攻击链执行，不要从零探测
+- 如果当前响应和版本指纹支持 CVE-2025-67303，先做无害/安全检查，再按响应决定是否进入利用；不要把版本名称本身当作漏洞已证实。
 
 ### 6.6 Dify / React2Shell (CVE-2025-55182) 多版本利用
 
@@ -112,7 +111,7 @@ done
 ```
 如果发现其他服务（如 HugeGraph 8080、Gradio 7860 等），优先用它们的已知 CVE 打穿主机，再读 Dify 的 flag 文件。
 
-**React2Shell 直接利用**（当同主机无其他服务时）：
+**React2Shell 验证与利用**（当当前指纹支持且同主机没有更合适入口时）：
 
 ```bash
 # 1. 下载官方 scanner
@@ -149,7 +148,7 @@ if resp.status_code in (307, 303):
 
 | 响应特征 | 可能版本 | 策略 |
 |----------|----------|------|
-| 307→303→X-Action-Redirect 回显 | 旧版 SELF_HOSTED | ✅ 直接读 flag |
+| 307→303→X-Action-Redirect 回显 | 可能存在可控动作回显 | 进一步验证命令输出/文件读取，不把回显直接当 flag |
 | 307→500 | 新版/Cloud 版 | 尝试不同 `$ACTION_ID_` 前缀（x, 0, 1, 2, 3）|
 | 307→200 无回显 | 已修复 | 放弃 React2Shell，扫同主机其他服务 |
 
@@ -173,6 +172,6 @@ done
 ```
 
 **⚠️ 关键陷阱**：
-- **不要只看默认端口**——同主机常运行多个服务，flag 可能藏在同主机其他服务（如门户跑在 3000，同机 8080 可能还有别的中间件）。对每个端口独立做指纹与 CVE 匹配。
+- **不要只看默认端口**——同主机可能运行多个服务。对发现的每个端口独立做协议/产品指纹，再选择与证据匹配的 CVE；端口号本身不是漏洞判据。
 - scanner.py 的 `build_rce_payload()` 默认 payload 在新版 Dify 上可能返回 500
 - 如果 10 轮内 React2Shell 无进展，立即切换到端口扫描同主机其他服务

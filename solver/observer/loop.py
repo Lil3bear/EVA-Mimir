@@ -73,7 +73,9 @@ class ObserverLoop:
     """
 
     REVIEW_EVERY_ROUNDS = 6
-    NO_PROGRESS_THRESHOLD = 1  # 连续几个审查周期无进展才触发强干预
+    # 一次快照不变不代表方向已死；至少两个审查周期再强干预，
+    # 避免 Observer 与 Solver 的正常验证动作互相打断。
+    NO_PROGRESS_THRESHOLD = 2
 
     def __init__(self, settings: dict, on_correction: callable = None):
         self.settings = settings
@@ -83,7 +85,12 @@ class ObserverLoop:
         self._current_round: dict | None = None
         self._lock = threading.Lock()
         self._review_thread: threading.Thread | None = None
-        self.review_every = settings.get("solver", {}).get("observer_every_rounds", 6)
+        try:
+            self.review_every = max(
+                1, int(settings.get("solver", {}).get("observer_every_rounds", 6))
+            )
+        except (TypeError, ValueError):
+            self.review_every = 6
         # 内容指纹去重：相同方向的纠偏只发一次，不限轮次
         self._sent_correction_fps: set[str] = set()
         # 无进展检测：记录上次审查时 ideas 的 active 状态快照
@@ -222,6 +229,7 @@ class ObserverLoop:
         self.trigger_now(reason=f"vector_cycle:{dominant}")
 
     def on_agent_end(self) -> None:
+        """Optionally flush one final review for a normal local run."""
         if not self.enabled:
             return
         with self._lock:
@@ -232,6 +240,22 @@ class ObserverLoop:
 
         if self._review_thread and self._review_thread.is_alive():
             self._review_thread.join(timeout=60)
+
+    def stop(self) -> None:
+        """Stop scheduling observer work when the Solver has already ended.
+
+        A solved/deadline/terminal Solver must not pay for a final LLM review
+        after its useful work is over.  An already-running daemon review gets
+        a short chance to notice the disabled flag, but is never allowed to
+        block shutdown for the full observer timeout.
+        """
+        self.enabled = False
+        with self._lock:
+            self._round_logs = []
+            self._current_round = None
+        thread = self._review_thread
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=0.2)
 
     def _trigger_review(self, force: bool = False) -> None:
         if self._review_thread and self._review_thread.is_alive():
@@ -346,6 +370,8 @@ class ObserverLoop:
     def _run_review(
         self, rounds: list[dict], challenge_dir: Path, attempt_dir: Path
     ) -> None:
+        if not self.enabled:
+            return
         current_round = rounds[-1]["round"] if rounds else 0
 
         def guarded_correction(content: str) -> None:

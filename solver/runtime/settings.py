@@ -22,14 +22,19 @@ def apply_llm_gateway(url: str, environ: Mapping[str, str] | None = None) -> str
     if env.get("LLM_GATEWAY", "").strip().lower() not in {"1", "true", "yes", "on"}:
         return url
     url = (url or "").strip()
-    if not url or ".tsecbench.gw" in url:
+    if not url:
         return url
     parsed = urlparse(url)
-    host = (parsed.hostname or "").strip()
+    host = (parsed.hostname or "").strip().rstrip(".")
     if not parsed.scheme or not host:
         return url
+    # Gateway requests are always plain HTTP.  This also normalizes a URL
+    # that was already manually suffixed with .tsecbench.gw but still used
+    # the original https scheme.
+    if not host.endswith(".tsecbench.gw"):
+        host = f"{host}.tsecbench.gw"
     port = f":{parsed.port}" if parsed.port else ""
-    return urlunparse(parsed._replace(scheme="http", netloc=f"{host}.tsecbench.gw{port}"))
+    return urlunparse(parsed._replace(scheme="http", netloc=f"{host}{port}"))
 
 
 def load_settings(

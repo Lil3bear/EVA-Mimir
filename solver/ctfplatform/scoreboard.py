@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from solver.runtime.submission_store import score_belongs_to_current_task
+
 
 @dataclass
 class ChallengeRow:
@@ -118,14 +120,17 @@ class Scoreboard:
 
         earned = 0
         for r in self._rows.values():
-            if not r.status.startswith("✅"):
-                continue
-            # 优先用 submit 回传的实际累计分（含 hint 扣分），否则回退到满分
-            score_file = self._path.parent / r.unique_code / ".cumulative_score"
+            # 部分通关也可能已经获得分数；所有本地累计分都要计入。
+            challenge_dir = self._path.parent / r.unique_code
+            score_file = challenge_dir / ".cumulative_score"
             try:
-                earned += int(score_file.read_text(encoding="utf-8").strip())
-            except Exception:
-                earned += r.total_score
+                if not score_belongs_to_current_task(challenge_dir):
+                    continue
+                earned += max(0, int(score_file.read_text(encoding="utf-8").strip()))
+            except (OSError, ValueError):
+                # 只有明确解出的题才可回退到满分，部分/失败题缺失记录按 0。
+                if r.status.startswith("✅"):
+                    earned += r.total_score
 
         # 正在运行的题目列表
         running_codes = [c for c in self._order if self._rows[c].status.startswith("🔄")]

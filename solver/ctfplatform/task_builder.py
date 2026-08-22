@@ -38,8 +38,8 @@ def build_task_from_challenge(
             f"\n## 已找到 {challenge.correct_flag_count} 个 Flag（继续寻找剩余的）",
             "\n⚠️ **这是重跑轮次**。上一轮发现的内网 IP 和端口可能已变化，必须重新扫描确认。",
             "不要直接使用 memory 中的旧 IP 地址，先重新执行 `ip addr` + `cat /proc/net/arp` + 端口探测。",
-            "\n💡 **优先重建已有解法**：如果 memory 中已记录了完整的攻击链（如「error.log 投毒 RCE」「admin/Admin@123 登录」），",
-            "直接按记忆中的步骤快速重建立足点，不要从零重新探测。重建优先级：先重建 RCE → 再验证内网拓扑 → 再用新 IP 执行横向移动。",
+            "\n💡 **优先复用本次运行已验证的事实**：如果 memory 中已经记录了可复现的入口、凭据或成功判据，",
+            "先按当前实例重新验证这些事实，再继续下一阶段；不得把旧地址、旧凭据或未验证的历史方法当作答案。",
         ])
     lines.append("\n请开始解题，找到 flag 后调用 challenge_submit_flag 工具提交。")
     return "\n".join(lines)

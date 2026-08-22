@@ -7,14 +7,14 @@ description: 处理 HTTP/Web 入口的 CTF 题。发现 HTTP 响应、Web 框架
 
 ## 首次流程
 1. 确认协议与入口：`curl -si <URL>` 保留响应头、正文、Cookie。
-2. **先对照下面的「响应特征 → 产品识别」表确定产品/漏洞方向。**
-3. 再用 `skill_load(name="web", resource=...)` 加载对应 reference，不读无关章节。
+2. **先对照下面的「响应特征 → 产品识别」表提出候选产品/漏洞方向。**
+3. 再用 `skill_load(name="web", resource=...)` 加载对应 reference；只验证与当前证据匹配的一条路线。
 
-## ❗ 响应特征 → 产品识别（curl 后先对照，最重要）
+## ❗ 响应特征 → 产品识别（curl 后先对照）
 
-首页响应返回后，立即对照此表。匹配到特征就按「立即执行」操作，不要自己猜。
+首页响应返回后，对照此表形成候选。端口是弱信号，产品/CVE 必须由响应或路径特征佐证；表中的动作是验证建议，不是成功结论。
 
-| 响应特征 | 产品/漏洞 | 立即执行 |
+| 响应特征 | 产品/漏洞 | 验证建议 |
 |---|---|---|
 | HTML 含 `gradio` 或 `gr-` 前缀，端口 7860 | Gradio | `skill_load(web, product-playbooks.md)` + CVE-2024-1561 文件读 |
 | 端口 3000 + HTML 含 `Next.js` 或 `data-public-api-prefix` | Dify(Next.js) | CVE-2025-55182 React2Shell + 扫同主机其他端口 |

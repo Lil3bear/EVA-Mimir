@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 
 _CACHE: dict | None = None
+_CACHE_ROOT = ""
 
 _PRODUCT_ROUTES = {
     "Gradio": ("web", "product-playbooks.md"),
@@ -20,19 +21,22 @@ _PRODUCT_ROUTES = {
     "HugeGraph": ("web", "product-playbooks.md"),
     "ComfyUI-Manager": ("web", "product-playbooks.md"),
     "Apache OFBiz": ("web", "java-exploitation.md"),
+    "1Panel": ("web", "known-product-exploit.md"),
+    "GeoServer": ("web", "known-product-exploit.md"),
 }
 
 
 def _load_cheatsheet() -> dict:
-    global _CACHE
-    if _CACHE is None:
-        root = os.environ.get("CTF_SKILLS_DIR", "/skills")
+    global _CACHE, _CACHE_ROOT
+    root = os.environ.get("CTF_SKILLS_DIR", "/skills")
+    if _CACHE is None or _CACHE_ROOT != root:
         path = Path(root) / "cve-cheatsheet.json"
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             _CACHE = data if isinstance(data, dict) else {}
         except Exception:
             _CACHE = {}
+        _CACHE_ROOT = root
     return _CACHE
 
 
@@ -40,19 +44,25 @@ def _fingerprint_products(output: str, context: str) -> set[str]:
     """Recognize products from response markers plus the requested endpoint."""
     out = (output or "").lower()
     ctx = (context or "").lower()
+    combined = f"{out} {ctx}"
     products: set[str] = set()
 
-    if "gradio" in out or (":7860" in ctx and any(x in out for x in ("gr-", "/queue/", "config"))):
+    if "gradio" in out or (":7860" in combined and any(x in combined for x in ("gr-", "/queue/", "/file="))):
         products.add("Gradio")
-    if (":3000" in ctx or "dify" in out) and any(
-        x in out for x in ("dify", "data-public-api-prefix", "self_hosted")
-    ):
+    dify_markers = ("dify", "data-public-api-prefix", "self_hosted")
+    dify_path_markers = ("/console/", "/apps/", "/api/console")
+    if "dify" in combined or any(x in combined for x in dify_markers[1:]):
         products.add("Dify")
-    if "hugegraph" in out or any(x in out for x in ("gremlin-groovy", "hugegraph-server")):
+    elif ":3000" in combined and "next.js" in combined and any(
+        x in combined for x in dify_path_markers
+    ):
+        # Port+Next.js alone is a generic app; require a Dify-shaped route.
+        products.add("Dify")
+    if "hugegraph" in combined or any(x in combined for x in ("gremlin-groovy", "hugegraph-server")):
         products.add("HugeGraph")
-    if "comfyui" in out or (":8188" in ctx and "/api/manager" in out):
+    if "comfyui" in combined or (":8188" in combined and "/api/manager" in combined):
         products.add("ComfyUI-Manager")
-    if "ofbiz" in out or (":8443" in ctx and "/webtools/" in out):
+    if "ofbiz" in combined or (":8443" in combined and "/webtools/" in combined):
         products.add("Apache OFBiz")
     return products
 
@@ -65,12 +75,26 @@ def lookup(output: str, context: str = "") -> str:
         return ""
 
     out_lower = (output or "").lower()
+    combined_lower = f"{out_lower} {(context or '').lower()}"
     detected = _fingerprint_products(output, context)
     hits: list[tuple[str, dict]] = []
     for product, entry in middleware.items():
         if not isinstance(entry, dict):
             continue
-        if product.lower() in out_lower or product in detected:
+        match = entry.get("match") or {}
+        body_any = [str(v).lower() for v in match.get("body_any", [])]
+        path_any = [str(v).lower() for v in match.get("path_any", [])]
+        # Ports are only weak hints.  Never route a CVE/playbook from
+        # ``:8443``/``:10086`` alone; a response or endpoint fingerprint must
+        # corroborate it, otherwise arbitrary services on common ports are
+        # misclassified as OFBiz/1Panel.
+        matched = (
+            product in detected
+            or product.lower() in out_lower
+            or any(value in out_lower for value in body_any)
+            or any(value in combined_lower for value in path_any)
+        )
+        if matched:
             hits.append((product, entry))
 
     if not hits:

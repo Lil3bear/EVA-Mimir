@@ -1,6 +1,7 @@
 import json
 import os
 import tempfile
+import time
 import unittest
 import threading
 from pathlib import Path
@@ -9,6 +10,8 @@ from unittest.mock import MagicMock, patch
 from solver.ctfplatform.tsecbench_client import (
     Challenge,
     InvalidState,
+    ResourceUnavailable,
+    TaskNotFound,
     StartResult,
     CloseResult,
     TsecbenchClient,
@@ -283,91 +286,61 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class AttackChainTests(unittest.TestCase):
-    """攻击链持久化与注入：sanitize、by_code 存储、同题精确注入优先级。"""
+class ComplianceHistoryTests(unittest.TestCase):
+    """历史题目解法不得进入运行时提示或镜像。"""
 
+    def test_challenge_specific_history_is_disabled(self):
+        from solver.ctfplatform.scheduler import _load_recent_chain
+        self.assertEqual(_load_recent_chain("a-18", "/tmp/nonexistent-skills"), "")
+
+
+class TerminalAndDeadlineSchedulerTests(unittest.TestCase):
     def setUp(self):
-        self._tmpdir = tempfile.mkdtemp(prefix="test-chain-")
-        self._old_ws = os.environ.get("CTF_WORKSPACE")
-        os.environ["CTF_WORKSPACE"] = self._tmpdir
+        self._tmpdir = tempfile.mkdtemp(prefix="test-terminal-scheduler-")
 
-    def tearDown(self):
-        if self._old_ws is None:
-            os.environ.pop("CTF_WORKSPACE", None)
-        else:
-            os.environ["CTF_WORKSPACE"] = self._old_ws
+    def test_invalid_state_from_solver_is_terminal(self):
+        challenge = _make_challenge("web-terminal")
+        client = MagicMock(spec=TsecbenchClient)
+        client.check_vpn.return_value = VpnCheckResult("ok", "10.0.0.1", "now")
+        client.list_challenges.return_value = [challenge]
+        client.start_challenge.return_value = StartResult(
+            "web-terminal", ("10.0.0.2:8080",)
+        )
+        client.close_challenge.return_value = CloseResult("web-terminal", True)
+        agent = MagicMock(round=1)
+        agent.run.side_effect = InvalidState("invalid_state", "task ended")
 
-    def _make_skills_dir(self, seed: dict) -> str:
-        skills = os.path.join(self._tmpdir, "skills")
-        ref = os.path.join(skills, "experiences", "references")
-        os.makedirs(ref, exist_ok=True)
-        with open(os.path.join(ref, "attack-chains.json"), "w", encoding="utf-8") as f:
-            json.dump(seed, f, ensure_ascii=False)
-        return skills
+        scheduler = Scheduler(
+            client,
+            settings={"llm": {}, "solver": {}},
+            agent_factory=MagicMock(return_value=agent),
+            workspace_dir=self._tmpdir,
+        )
+        with self.assertRaises(InvalidState):
+            scheduler.run_all()
+        client.close_challenge.assert_called_with("web-terminal")
 
-    def test_sanitize_strips_flag_and_ip(self):
-        from solver.ctfplatform.scheduler import _sanitize_chain_text
-        text = "访问 10.0.162.64:80 后台 /admin，提交 flag{abc123} 得分"
-        out = _sanitize_chain_text(text)
-        self.assertNotIn("flag{abc123}", out)
-        self.assertNotIn("10.0.162.64", out)
-        self.assertIn("<flag>", out)
-        self.assertIn("<IP>", out)
-
-    def test_save_stores_by_code_and_sanitizes(self):
-        import json as _json
-        from solver.ctfplatform.scheduler import _save_attack_chain, _CHAIN_STORE_FILE
-        ws = Path(self._tmpdir) / "a-18"
-        (ws / "ideas").mkdir(parents=True)
-        (ws / "ideas" / "index.json").write_text(_json.dumps([
-            {"content": "后台弱口令 admin/admin123 登录 10.0.1.5 拿 flag{real_one} 后提权", "status": "verified"}
-        ]), encoding="utf-8")
-        _save_attack_chain(str(ws), "a-18", True)
-        store = _json.loads((Path(self._tmpdir) / _CHAIN_STORE_FILE).read_text(encoding="utf-8"))
-        entry = store["by_code"]["a-18"]
-        self.assertIn("admin/admin123", entry["summary"])
-        self.assertNotIn("flag{real_one}", entry["summary"])
-        self.assertNotIn("10.0.1.5", entry["summary"])
-
-    def test_exact_code_seed_takes_priority(self):
-        from solver.ctfplatform.scheduler import _load_recent_chain
-        skills = self._make_skills_dir({
-            "by_code": {"a-18": {"code": "a-18", "prefix": "a-", "summary": "历史解法XYZ", "time": 1}},
-            "chains": {"a-": [{"code": "a-01", "prefix": "a-", "summary": "同类解法", "time": 1}]},
-        })
-        text = _load_recent_chain("a-18", skills)
-        self.assertIn("本题历史解法", text)
-        self.assertIn("历史解法XYZ", text)
-
-    def test_prefix_fallback_from_seed(self):
-        from solver.ctfplatform.scheduler import _load_recent_chain
-        skills = self._make_skills_dir({
-            "by_code": {},
-            "chains": {"a-": [{"code": "a-01", "prefix": "a-", "summary": "同类解法ABC", "time": 1}]},
-        })
-        text = _load_recent_chain("a-18", skills)
-        self.assertIn("同类题经验", text)
-        self.assertIn("同类解法ABC", text)
-
-    def test_extract_successful_writeups_from_journal(self):
-        import json as _json
-        from solver.ctfplatform.scheduler import _extract_successful_writeups
-        ws = Path(self._tmpdir) / "f2-05"
-        ws.mkdir(parents=True)
-        events = [
-            {"type": "prepared", "run_id": "r1", "call_id": "c1", "tool": "challenge_submit_flag",
-             "args": {"flag": "flag{x}", "writeup": "登录接口 union 注入读 flags 表"}},
-            {"type": "completed", "run_id": "r1", "call_id": "c1", "tool": "challenge_submit_flag",
-             "result": "[✓] Flag 提交正确：flag{x}，本次得分 300"},
-            {"type": "prepared", "run_id": "r1", "call_id": "c2", "tool": "challenge_submit_flag",
-             "args": {"flag": "flag{y}", "writeup": "猜的"}},
-            {"type": "completed", "run_id": "r1", "call_id": "c2", "tool": "challenge_submit_flag",
-             "result": "[✗] Flag 提交错误"},
-        ]
-        (ws / ".execution-journal.jsonl").write_text(
-            "\n".join(_json.dumps(e, ensure_ascii=False) for e in events), encoding="utf-8")
-        writeups = _extract_successful_writeups(ws)
-        self.assertEqual(writeups, ["登录接口 union 注入读 flags 表"])
+    def test_start_retry_respects_deadline(self):
+        challenge = _make_challenge("web-deadline")
+        client = MagicMock(spec=TsecbenchClient)
+        client.check_vpn.return_value = VpnCheckResult("ok", "10.0.0.1", "now")
+        client.list_challenges.return_value = [challenge]
+        client.start_challenge.side_effect = ResourceUnavailable(
+            "resource_unavailable", "not ready"
+        )
+        client.close_challenge.return_value = CloseResult("web-deadline", True)
+        scheduler = Scheduler(
+            client,
+            settings={"llm": {}, "solver": {}},
+            workspace_dir=self._tmpdir,
+            start_retry_interval=30,
+            start_retry_max=5,
+            deadline=time.time() + 0.05,
+        )
+        started = time.time()
+        report = scheduler.run_all()
+        self.assertLess(time.time() - started, 1.0)
+        self.assertEqual(report.failed, 1)
 
 
 class ParallelSchedulerTests(unittest.TestCase):

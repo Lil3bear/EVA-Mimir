@@ -25,9 +25,8 @@ if [ -z "$TOKEN" ]; then
     exit 1
 fi
 
-if [ ! -f "$PROJECT_DIR/settings.local.json" ]; then
-    echo "缺少 settings.local.json，请从 settings.local.example.json 创建并填入 LLM 配置。" >&2
-    exit 1
+if [ ! -f "$PROJECT_DIR/settings.local.json" ] && [ ! -f "$PROJECT_DIR/settings.json" ]; then
+    echo "未找到 settings.local.json/settings.json，将仅使用运行时环境变量。"
 fi
 
 echo "============================================"
@@ -83,9 +82,15 @@ docker rm -f eva-mimir-run 2>/dev/null || true
 # ---- 启动 ----
 echo "[4/4] 启动解题..."
 echo ""
-PREFIX_ENV=""
+PREFIX_ENV=()
 if [ -n "$PREFIX_FILTER" ]; then
-    PREFIX_ENV="-e SOLVER_PREFIX_FILTER=$PREFIX_FILTER"
+    PREFIX_ENV=(-e "SOLVER_PREFIX_FILTER=$PREFIX_FILTER")
+fi
+SETTINGS_MOUNT=()
+if [ -f "$PROJECT_DIR/settings.local.json" ]; then
+    SETTINGS_MOUNT=(-v "$PROJECT_DIR/settings.local.json:/workspace/settings.local.json:ro")
+elif [ -f "$PROJECT_DIR/settings.json" ]; then
+    SETTINGS_MOUNT=(-v "$PROJECT_DIR/settings.json:/workspace/settings.json:ro")
 fi
 
 docker run --rm --network host \
@@ -97,8 +102,13 @@ docker run --rm --network host \
   -e SOLVER_MAX_PARALLEL="${SOLVER_MAX_PARALLEL:-3}" \
   -e SOLVER_MAX_RETRY_ROUNDS="${SOLVER_MAX_RETRY_ROUNDS:-5}" \
   -e SOLVER_TOTAL_TIMEOUT="${SOLVER_TOTAL_TIMEOUT:-350}" \
-  $PREFIX_ENV \
-  -v "$PROJECT_DIR/settings.local.json:/workspace/settings.local.json:ro" \
+  -e LLM_BASE_URL="${LLM_BASE_URL:-}" \
+  -e LLM_API_KEY="${LLM_API_KEY:-}" \
+  -e LLM_MODEL="${LLM_MODEL:-deepseek-v4-flash}" \
+  -e LLM_GATEWAY="${LLM_GATEWAY:-1}" \
+  -e LLM_MAX_CONCURRENCY="${LLM_MAX_CONCURRENCY:-4}" \
+  "${PREFIX_ENV[@]}" \
+  "${SETTINGS_MOUNT[@]}" \
   -v "$PROJECT_DIR/workspace:/workspace" \
   -v "$PROJECT_DIR/skills:/opt/ctf-agent/skills:ro" \
   -v "$PROJECT_DIR/prompts:/opt/ctf-agent/prompts:ro" \

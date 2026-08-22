@@ -85,6 +85,50 @@ class KnowledgeRouterTests(unittest.TestCase):
     def test_nextjs_not_mistaken_for_dify(self):
         # 只有 Gradio 在表里，Next.js 不应命中
         self.assertEqual(knowledge_router.lookup("Next.js app"), "")
+        self.assertNotIn(
+            "Dify",
+            knowledge_router._fingerprint_products(
+                "Next.js app", "curl http://target:3000/"
+            ),
+        )
+        self.assertIn(
+            "Dify",
+            knowledge_router._fingerprint_products(
+                "Next.js app", "curl http://target:3000/console/api/"
+            ),
+        )
+
+    def test_endpoint_context_can_complete_product_fingerprint(self):
+        out = knowledge_router.lookup(
+            "HTTP/1.1 200 OK\nPython server\n", "curl http://target:8188/api/manager"
+        )
+        # The local fixture has no ComfyUI entry; this assertion exercises the
+        # context path without making a false positive for an unrelated page.
+        self.assertEqual(out, "")
+
+    def test_port_alone_is_not_a_product_fingerprint(self):
+        path = Path(self._tmp).joinpath("cve-cheatsheet.json")
+        path.write_text(
+            '{"middleware": {"Apache OFBiz": {"cves": ["CVE-X"], '
+            '"match": {"ports": ["8443"]}}}}',
+            encoding="utf-8",
+        )
+        knowledge_router._CACHE = None
+        self.assertEqual(
+            knowledge_router.lookup("HTTP/1.1 200 OK", "curl http://target:8443/"),
+            "",
+        )
+
+    def test_match_table_uses_body_and_path_signals(self):
+        path = Path(self._tmp).joinpath("cve-cheatsheet.json")
+        path.write_text(
+            '{"middleware": {"Demo": {"cves": ["CVE-X"], '
+            '"match": {"body_any": ["x-demo"], "path_any": ["/special"]}}}}',
+            encoding="utf-8",
+        )
+        knowledge_router._CACHE = None
+        self.assertIn("CVE-X", knowledge_router.lookup("x-demo banner"))
+        self.assertIn("CVE-X", knowledge_router.lookup("plain", "GET /special HTTP/1.1"))
 
 
 class RepositorySkillIntegrityTests(unittest.TestCase):

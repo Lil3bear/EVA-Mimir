@@ -196,8 +196,22 @@ def execute(args: dict) -> str:
     if not cmd:
         return "[错误] 命令不能为空"
 
+    # 将全局 benchmark deadline 传递到工具层，避免一个 600 秒脚本
+    # 越过总时限。没有 deadline 的本地 Bridge 模式保持旧行为。
+    import time
+    deadline = float(getattr(_ctx, "deadline", 0.0) or 0.0)
+    if deadline and time.time() >= deadline:
+        return "[停止] 已达到本次运行截止时间，命令未执行。"
+
     requested_timeout = args.get("timeout")
     timeout = _get_timeout(cmd, requested_timeout)
+    if deadline:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return "[停止] 已达到本次运行截止时间，命令未执行。"
+        # subprocess timeout accepts fractions; using the real remaining
+        # budget avoids the old minimum-10s window crossing the benchmark end.
+        timeout = min(float(timeout), max(0.1, remaining))
 
     # 重复操作检测（命令级）
     fp = _cmd_fingerprint(cmd)

@@ -25,7 +25,7 @@ from solver.worker_context import ctx as _ctx
 # 单次 skill_load 返回上限：覆盖仓库内当前最大的 reference，保持一次读全。
 MAX_BODY = 40000
 # skill_load(name) 入口文档的返回上限（入口应 < 200 行）。
-MAX_ENTRY = 12000
+MAX_ENTRY = 16000
 
 
 def _skills_root() -> str:
