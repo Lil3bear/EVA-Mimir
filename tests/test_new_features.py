@@ -136,7 +136,7 @@ class ControlPolicyTests(unittest.TestCase):
             {"solver": {}}, "hard", pentest=True
         )
         self.assertEqual(easy.max_rounds, 40)
-        self.assertEqual(hard_pentest.max_rounds, 200)
+        self.assertEqual(hard_pentest.max_rounds, 190)
         self.assertEqual(easy.observer_every_rounds, 15)
         self.assertEqual(hard_pentest.observer_every_rounds, 8)
         # hard 多阶段题的 stop_after 必须足够宽，避免侦察阶段就 force_stop
@@ -192,12 +192,12 @@ class DifficultyMaxRoundsTests(unittest.TestCase):
     @patch("solver.agent.ObserverLoop")
     @patch("solver.agent.OpenAI")
     @patch("solver.agent.search_tool")
-    def test_medium_gets_100_rounds(self, mock_search, mock_openai, mock_observer):
+    def test_medium_gets_70_rounds(self, mock_search, mock_openai, mock_observer):
         from solver.agent import SolverAgent
         task = "# CTF 题目：a-03\n- 难度：medium\n- 目标地址：http://10.0.1.1"
         settings = {"llm": {"base_url": "http://x", "api_key": "k"}}
         agent = SolverAgent(task=task, settings=settings, skills_dir="/skills")
-        self.assertEqual(agent.max_rounds, 100)
+        self.assertEqual(agent.max_rounds, 70)
 
     @patch("solver.agent.ObserverLoop")
     @patch("solver.agent.OpenAI")
@@ -244,12 +244,12 @@ class DifficultyMaxRoundsTests(unittest.TestCase):
     @patch("solver.agent.ObserverLoop")
     @patch("solver.agent.OpenAI")
     @patch("solver.agent.search_tool")
-    def test_hard_gets_120_rounds(self, mock_search, mock_openai, mock_observer):
+    def test_hard_gets_110_rounds(self, mock_search, mock_openai, mock_observer):
         from solver.agent import SolverAgent
         task = "# CTF 题目：a-13\n- 难度：hard\n- 目标地址：http://10.0.1.1"
         settings = {"llm": {"base_url": "http://x", "api_key": "k"}}
         agent = SolverAgent(task=task, settings=settings, skills_dir="/skills")
-        self.assertEqual(agent.max_rounds, 120)
+        self.assertEqual(agent.max_rounds, 110)
 
     @patch("solver.agent.ObserverLoop")
     @patch("solver.agent.OpenAI")

@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
-_ROUND_BUDGETS = {"easy": 40, "medium": 100, "hard": 120, "difficult": 130}
+_ROUND_BUDGETS = {"easy": 40, "medium": 70, "hard": 110, "difficult": 130}
 _UNKNOWN_ROUND_BUDGET = 100
 _PENTEST_EXTRA = {"easy": 40, "medium": 120, "hard": 80, "difficult": 80}
 _CTYPE_EXTRA = {"easy": 30, "medium": 60, "hard": 40, "difficult": 40}
