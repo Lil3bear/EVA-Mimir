@@ -1,6 +1,7 @@
-"""Small, explicit policy for parallel solver attempts."""
+from __future__ import annotations
 
 from dataclasses import dataclass
+import threading
 
 
 @dataclass(frozen=True)
@@ -14,7 +15,90 @@ class AttemptSpec:
     strategy_hint: str = ""
 
 
-# 能力短板题型（f1=二进制服务 / c=综合杂项 / e2=沙箱逃逸·漏洞利用），
+class PortfolioBudget:
+    """A challenge-scoped round budget shared by parallel Attempts.
+
+    Every Attempt receives its normal quota first.  If a peer exits early,
+    the surviving Attempt may borrow the unused quota.  This preserves the
+    old aggregate ceiling while removing the waste caused by a failed sibling.
+    """
+
+    def __init__(self, expected_attempts: int):
+        self.expected_attempts = max(1, int(expected_attempts or 1))
+        self._quotas: dict[str, int] = {}
+        self._used: dict[str, int] = {}
+        self._active: set[str] = set()
+        self._lock = threading.RLock()
+        self._ready = threading.Event()
+
+    def register(self, attempt_id: str, quota: int) -> None:
+        attempt_id = str(attempt_id or "primary")
+        quota = max(1, int(quota or 1))
+        with self._lock:
+            if attempt_id not in self._quotas:
+                self._quotas[attempt_id] = quota
+                self._used[attempt_id] = 0
+            else:
+                self._quotas[attempt_id] = max(self._quotas[attempt_id], quota)
+            self._active.add(attempt_id)
+            if len(self._quotas) >= self.expected_attempts:
+                self._ready.set()
+
+    def wait_until_ready(self, timeout: float = 2.0) -> bool:
+        return self._ready.wait(max(0.0, float(timeout or 0.0)))
+
+    @property
+    def total_quota(self) -> int:
+        with self._lock:
+            return sum(self._quotas.values())
+
+    @property
+    def total_used(self) -> int:
+        with self._lock:
+            return sum(self._used.values())
+
+    def claim_round(self, attempt_id: str) -> bool:
+        """Atomically claim one round for an active Attempt."""
+        attempt_id = str(attempt_id or "primary")
+        with self._lock:
+            if attempt_id not in self._quotas:
+                return False
+            used = self._used[attempt_id]
+            quota = self._quotas[attempt_id]
+            total = sum(self._quotas.values())
+            if sum(self._used.values()) >= total:
+                return False
+            if used >= quota and any(
+                peer != attempt_id for peer in self._active
+            ):
+                return False
+            self._used[attempt_id] = used + 1
+            return True
+
+    def release_round(self, attempt_id: str) -> None:
+        """Return a claim when a no-tool nudge did not consume a real round."""
+        attempt_id = str(attempt_id or "primary")
+        with self._lock:
+            if attempt_id in self._used and self._used[attempt_id] > 0:
+                self._used[attempt_id] -= 1
+
+    def mark_done(self, attempt_id: str) -> None:
+        with self._lock:
+            self._active.discard(str(attempt_id or "primary"))
+
+    def snapshot(self) -> dict[str, object]:
+        with self._lock:
+            return {
+                "expected_attempts": self.expected_attempts,
+                "registered": len(self._quotas),
+                "quotas": dict(self._quotas),
+                "used": dict(self._used),
+                "active": sorted(self._active),
+                "total_quota": sum(self._quotas.values()),
+                "total_used": sum(self._used.values()),
+            }
+
+
 # medium 也开启双策略，提高解出概率。
 _MULTI_SOLVE_PREFIXES = {"f1", "c", "e2"}
 

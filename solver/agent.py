@@ -348,6 +348,14 @@ class SolverAgent:
 
         consecutive_empty = 0
         while self.round < self.max_rounds:
+            if not self._claim_portfolio_round():
+                self.observer.stop()
+                self._finish_execution("portfolio_budget_exhausted")
+                _emit("agent_end", {
+                    "rounds": self.round,
+                    "reason": "portfolio_budget_exhausted",
+                })
+                return
             self.round += 1
 
             # ━━ Multi-Solver：另一个 Solver 已解出，本实例停止 ━━
@@ -444,6 +452,7 @@ class SolverAgent:
                     _emit("agent_end", {"rounds": self.round, "reason": "stuck_no_tool"})
                     return
                 # nudge：撤销本轮计数，追加 user 消息后重试
+                self._release_portfolio_round()
                 self.round -= 1
                 probe = self._default_probe()
                 self.messages.append({
@@ -639,13 +648,71 @@ class SolverAgent:
             getattr(self, "_tool_executors", TOOL_EXECUTORS),
         )
 
+    def _claim_portfolio_round(self) -> bool:
+        budget = getattr(self, "_portfolio_budget", None)
+        if budget is None:
+            return True
+        attempt_id = getattr(self, "_portfolio_attempt_id", None) or getattr(
+            _ctx, "attempt_id", "primary"
+        )
+        try:
+            return bool(budget.claim_round(attempt_id))
+        except Exception as exc:
+            _emit("portfolio_budget_error", {
+                "operation": "claim",
+                "attempt_id": attempt_id,
+                "error": str(exc),
+            })
+            return False
+
+    def _release_portfolio_round(self) -> None:
+        budget = getattr(self, "_portfolio_budget", None)
+        if budget is None:
+            return
+        attempt_id = getattr(self, "_portfolio_attempt_id", None) or getattr(
+            _ctx, "attempt_id", "primary"
+        )
+        try:
+            budget.release_round(attempt_id)
+        except Exception as exc:
+            _emit("portfolio_budget_error", {
+                "operation": "release",
+                "attempt_id": attempt_id,
+                "error": str(exc),
+            })
+
     def _finish_execution(self, reason: str) -> None:
         try:
             self._journal.finish(reason)
         except Exception as exc:
             _emit("execution_journal_error", {"phase": "finish", "error": str(exc)})
 
-    def inject_message(self, content: str, reviewed_round: int | None = None) -> None:
+    def inject_message(self, content, reviewed_round: int | None = None) -> None:
+        from solver.runtime.observer_advice import ObserverAdvice
+
+        if isinstance(content, ObserverAdvice):
+            reviewed_round = content.reviewed_round
+            controller = getattr(self, "_strategy_controller", None)
+            try:
+                current_version = (
+                    controller.snapshot().state_version if controller is not None else 0
+                )
+            except Exception:
+                current_version = 0
+            if not content.is_applicable(
+                current_state_version=current_version,
+                current_round=self.round,
+            ):
+                _emit("observer_correction_stale", {
+                    "reason": "version_or_expiry",
+                    "advice": content.to_dict(),
+                    "current_state_version": current_version,
+                    "current_round": self.round,
+                })
+                return
+            content = content.render()
+        else:
+            content = str(content)
         if reviewed_round is not None:
             lag = max(0, self.round - reviewed_round)
             if lag > self._observer_correction_max_lag:

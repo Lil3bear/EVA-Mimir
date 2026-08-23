@@ -61,6 +61,23 @@ def idea_add(args: dict) -> str:
         _challenge_dir(), content=content, source="solver",
         owner_attempt_id=_ctx.attempt_id,
     )
+    try:
+        from solver.runtime.strategy_controller import StrategyController
+        controller = StrategyController(
+            _challenge_dir(), attempt_id=_ctx.attempt_id
+        )
+        hypothesis = controller.register_hypothesis(content)
+        if controller.claim_hypothesis(
+            hypothesis.id,
+            round_num=0,
+            lease_rounds=8,
+        ):
+            return (
+                f"[Ideas] 已添加 [{idea.status}] {idea.id}：{content}\n"
+                f"[Hypothesis] 已绑定 {hypothesis.id}，owner={_ctx.attempt_id}"
+            )
+    except Exception:
+        pass
     return f"[Ideas] 已添加 [{idea.status}] {idea.id}：{content}"
 
 

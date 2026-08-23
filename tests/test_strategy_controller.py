@@ -9,6 +9,8 @@ from solver.runtime.decision_state import (
     classify_action,
     extract_evidence_fingerprints,
 )
+from solver.runtime.observer_advice import ObserverAdvice
+from solver.runtime.portfolio import PortfolioBudget
 from solver.runtime.strategy_controller import StrategyController
 
 
@@ -47,6 +49,26 @@ class DecisionStateClassificationTests(unittest.TestCase):
         )
         self.assertFalse(outcome.positive_progress)
         self.assertEqual(outcome.kind, ActionOutcomeKind.SUBMISSION.value)
+
+
+class ObserverAdviceTests(unittest.TestCase):
+    def test_version_and_expiry_guard(self):
+        advice = ObserverAdvice.from_mapping(
+            {
+                "action": "switch_strategy",
+                "mode": "alternate",
+                "reason": "repeat",
+                "message": "change direction",
+                "state_version": 7,
+                "expires_after_rounds": 3,
+            },
+            default_state_version=0,
+            default_round=10,
+        )
+        self.assertTrue(advice.is_applicable(current_state_version=7, current_round=12))
+        self.assertFalse(advice.is_applicable(current_state_version=8, current_round=12))
+        self.assertFalse(advice.is_applicable(current_state_version=7, current_round=14))
+        self.assertEqual(advice.mode, "ALTERNATE")
 
 
 class StrategyControllerTests(unittest.TestCase):
@@ -153,6 +175,39 @@ class StrategyControllerTests(unittest.TestCase):
         self.assertEqual(state.state_version, 20)
         self.assertEqual(state.total_actions, 20)
         self.assertTrue((self.root / ".decision-state.json").exists())
+
+
+class PortfolioBudgetTests(unittest.TestCase):
+    def test_live_peers_cannot_consume_each_others_reserve(self):
+        budget = PortfolioBudget(expected_attempts=2)
+        budget.register("aggressive", 2)
+        budget.register("steady", 2)
+
+        self.assertTrue(budget.claim_round("aggressive"))
+        self.assertTrue(budget.claim_round("aggressive"))
+        self.assertFalse(budget.claim_round("aggressive"))
+        self.assertTrue(budget.claim_round("steady"))
+
+    def test_survivor_borrows_unused_peer_quota(self):
+        budget = PortfolioBudget(expected_attempts=2)
+        budget.register("aggressive", 2)
+        budget.register("steady", 3)
+        self.assertTrue(budget.claim_round("aggressive"))
+        budget.mark_done("steady")
+
+        self.assertTrue(budget.claim_round("aggressive"))
+        self.assertTrue(budget.claim_round("aggressive"))
+        self.assertTrue(budget.claim_round("aggressive"))
+        self.assertTrue(budget.claim_round("aggressive"))
+        self.assertFalse(budget.claim_round("aggressive"))
+        self.assertEqual(budget.snapshot()["total_used"], 5)
+
+    def test_no_tool_round_can_be_returned(self):
+        budget = PortfolioBudget(expected_attempts=1)
+        budget.register("primary", 1)
+        self.assertTrue(budget.claim_round("primary"))
+        budget.release_round("primary")
+        self.assertTrue(budget.claim_round("primary"))
 
 
 if __name__ == "__main__":

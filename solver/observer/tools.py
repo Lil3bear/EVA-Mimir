@@ -151,18 +151,38 @@ SEND_CORRECTION_TOOL_DEF = {
     "function": {
         "name": "send_correction",
         "description": (
-            "向 Solver 发送纠偏消息。只在 Solver 明显陷入低效循环或方向错误时使用，"
-            "不要干扰正常推进。消息要简短具体，给出明确的下一步方向。"
+            "向 Solver 发送带版本和失效条件的结构化纠偏。只在 Solver 明显陷入低效循环或方向错误时使用，"
+            "不要干扰正常推进。state_version 必须复制当前决策控制状态版本。"
         ),
         "parameters": {
             "type": "object",
             "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        "switch_strategy", "verify_evidence", "review_blackboard",
+                        "continue_current", "stop_exhausted"
+                    ],
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["MAP", "EXPLORE", "EXPLOIT", "ALTERNATE", "VERIFY", "RECOVER"],
+                },
+                "reason": {"type": "string"},
                 "message": {
                     "type": "string",
-                    "description": "发给 Solver 的纠偏内容，要简短有力",
+                    "description": "发给 Solver 的简短方向性纠偏",
+                },
+                "state_version": {
+                    "type": "integer",
+                    "description": "审查时看到的决策控制 state_version",
+                },
+                "priority": {"type": "integer", "minimum": 0, "maximum": 100},
+                "expires_after_rounds": {
+                    "type": "integer", "minimum": 1, "maximum": 24,
                 },
             },
-            "required": ["message"],
+            "required": ["action", "mode", "reason", "message", "state_version"],
         },
     },
 }

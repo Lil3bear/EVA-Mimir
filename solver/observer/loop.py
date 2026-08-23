@@ -374,16 +374,21 @@ class ObserverLoop:
             return
         current_round = rounds[-1]["round"] if rounds else 0
 
-        def guarded_correction(content: str) -> None:
+        def guarded_correction(content) -> None:
             if not self.enabled:
                 return
-            if self._should_send_correction(content, current_round):
+            advice_round = int(getattr(content, "reviewed_round", current_round) or 0)
+            rendered = content.render() if hasattr(content, "render") else str(content)
+            if self._should_send_correction(rendered, advice_round):
                 if self.on_correction:
-                    self.on_correction(content, current_round)
+                    try:
+                        self.on_correction(content, advice_round)
+                    except TypeError:
+                        self.on_correction(rendered, advice_round)
             else:
                 write_line({
                     "type": "observer_correction_suppressed",
-                    "data": {"reason": "cooldown_or_duplicate", "round": current_round},
+                    "data": {"reason": "cooldown_or_duplicate", "round": advice_round},
                 })
 
         try:

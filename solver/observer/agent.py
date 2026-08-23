@@ -28,7 +28,7 @@ challenge_get_hint；不要提及 restart 或其它不存在的接口。
    删除已经被新证据替代或明显过时的记录。不要把旧实例 IP、旧凭据、题号经验或历史攻击链当作答案。
 3. 检查已有 idea 是否应更新为 testing/verified/failed。一次 payload 失败只记录边界，不要轻易关闭整条路线。
 4. 只有确认 Solver 遗忘了当前 Memory 中与主线直接相关的事实，或同一请求/方向重复且无新证据，才纠偏。
-5. 没有明确改动时返回 NO_CHANGE；每次纠偏保持简短，说明已尝试的方向、证据边界和一个新的大方向，
+5. 没有明确改动时返回 NO_CHANGE；需要纠偏时必须调用 `send_correction`，填写当前 `state_version`、动作、模式、优先级和失效轮数。message 保持 1--3 句话，说明已尝试方向、证据边界和一个新的大方向，
    不给未经验证的具体 payload、固定路径或凭据。
 
 ## 触发与安全门
@@ -226,7 +226,12 @@ class ObserverAgent:
         user_prompt = _build_observer_prompt(recent_rounds, challenge_dir, attempt_dir)
 
         tool_registry = build_tool_registry(
-            lambda args: _handle_correction(args, on_correction)
+            lambda args: _handle_correction(
+                args,
+                on_correction,
+                challenge_dir=challenge_dir,
+                reviewed_round=recent_rounds[-1].get("round", 0) if recent_rounds else 0,
+            )
         )
 
         messages = [
@@ -303,11 +308,40 @@ class ObserverAgent:
         return "NO_CHANGE"
 
 
-def _handle_correction(args: dict, on_correction: callable) -> str:
-    message = args.get("message", "").strip()
-    if not message:
+def _handle_correction(
+    args: dict,
+    on_correction: callable,
+    *,
+    challenge_dir: Path | None = None,
+    reviewed_round: int = 0,
+) -> str:
+    from solver.runtime.observer_advice import ObserverAdvice
+    from solver.runtime.strategy_controller import load_decision_summary
+
+    summary = load_decision_summary(challenge_dir) if challenge_dir else {}
+    current_version = int(summary.get("state_version", 0) or 0)
+    advice = ObserverAdvice.from_mapping(
+        args,
+        default_state_version=current_version,
+        default_round=reviewed_round,
+    )
+    if not advice.message:
         return "[错误] 纠偏消息不能为空"
+    if advice.state_version != current_version:
+        _emit("observer_correction_stale", {
+            "reason": "state_version_mismatch",
+            "advice": advice.to_dict(),
+            "current_state_version": current_version,
+        })
+        return (
+            f"[过期] state_version={advice.state_version}，"
+            f"当前版本={current_version}，未发送纠偏"
+        )
     if on_correction:
-        on_correction(message)
-    _emit("observer_correction", {"message": message})
-    return f"[纠偏] 已发送：{message}"
+        try:
+            on_correction(advice)
+        except TypeError:
+            # Compatibility with local callbacks that still accept text.
+            on_correction(advice.render())
+    _emit("observer_correction", advice.to_dict())
+    return f"[纠偏] 已发送：{advice.render()}"

@@ -45,7 +45,7 @@ from solver.runtime.submission_store import (
     score_belongs_to_current_task,
 )
 from solver.worker_context import RunContext, ctx as _ctx
-from solver.runtime.portfolio import build_portfolio
+from solver.runtime.portfolio import PortfolioBudget, build_portfolio
 
 DEFAULT_MAX_PARALLEL = 3
 
@@ -471,6 +471,7 @@ class Scheduler:
 
         portfolio = build_portfolio(challenge)
         observer_leader = portfolio[0].name
+        portfolio_budget = PortfolioBudget(expected_attempts=len(portfolio))
 
         def _run_one(spec):
             """运行一个 Solver 实例。"""
@@ -501,6 +502,8 @@ class Scheduler:
                     "error": str(e),
                     "traceback": traceback.format_exc(),
                 })
+            finally:
+                portfolio_budget.mark_done(spec.name)
 
         def _run_bound_attempt(
             spec,
@@ -532,6 +535,21 @@ class Scheduler:
                 settings=strategy_settings,
                 skills_dir=self.skills_dir,
             )
+            # Register before run so all parallel attempts share one aggregate
+            # budget.  A peer that exits early releases its unused quota.
+            try:
+                quota = int(agent.max_rounds)
+            except (TypeError, ValueError):
+                quota = 100
+            quota = quota if quota > 0 else 100
+            portfolio_budget.register(spec.name, quota)
+            portfolio_budget.wait_until_ready(timeout=2.0)
+            try:
+                agent.max_rounds = max(quota, portfolio_budget.total_quota)
+            except Exception:
+                pass
+            agent._portfolio_budget = portfolio_budget
+            agent._portfolio_attempt_id = spec.name
             agent._stop_event = stop_event
 
             agent.run()
@@ -577,6 +595,10 @@ class Scheduler:
 
         if terminal_error:
             raise terminal_error[0]
+        _emit("multi_solver_budget", {
+            "unique_code": code,
+            **portfolio_budget.snapshot(),
+        })
         return best_result
 
     def _attempt_challenge(self, challenge: Challenge) -> SchedulerResult:
