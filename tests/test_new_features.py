@@ -177,9 +177,17 @@ class DifficultyMaxRoundsTests(unittest.TestCase):
             967_232,
         )
         self.assertEqual(agent._max_output_tokens, 8_192)
-        agent.round = 20
-        agent._last_discovery_round = 0
+        # 早期无卡死 → easy 默认拒绝 hint
+        agent.round = 5
+        agent._last_discovery_round = 5
         self.assertIn("easy 题默认不查看提示", agent._tool_gate("challenge_get_hint", {}))
+        # 卡死（连续无发现 15 轮）→ easy 兜底解锁，不再拒绝
+        agent.round = 20
+        agent._last_discovery_round = 5
+        self.assertNotIn(
+            "easy 题默认不查看提示",
+            agent._tool_gate("challenge_get_hint", {}),
+        )
 
     @patch("solver.agent.ObserverLoop")
     @patch("solver.agent.OpenAI")

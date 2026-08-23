@@ -709,14 +709,19 @@ class SolverAgent:
             return "[停止] 已达到本次运行截止时间，不再执行新的工具调用。"
         if tool_name == "challenge_get_hint":
             if self._difficulty == "easy" and not self._allow_easy_hint:
-                # easy 题默认禁止看 hint，但轮次快用完还没解时兜底解锁：
-                # 简单题本应快速解决，卡到后期说明方向错了，看 hint（扣 10%）
-                # 远好过 0 分。
-                late_no_flag = (
-                    self.round > int(self.max_rounds * 0.8)
-                    and self._submitted_flag_count == 0
+                # easy 题默认禁止看 hint，但出现卡死信号时兜底解锁：
+                # 简单题本应快速解决，卡住说明方向错或 payload 不对，
+                # 看 hint（扣 10%）远好过 0 分。
+                since_disc = self.round - self._last_discovery_round
+                stuck = (
+                    since_disc >= 12
+                    or self._submission_wrong_count() >= 3
+                    or (
+                        self.round > int(self.max_rounds * 0.5)
+                        and self._submitted_flag_count == 0
+                    )
                 )
-                if not late_no_flag:
+                if not stuck:
                     return (
                         "[拒绝] easy 题默认不查看提示，避免为本应快速解决的题扣分。"
                         "请切换攻击面；若确需启用，显式设置 solver.allow_easy_hint=true。"
