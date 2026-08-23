@@ -16,9 +16,9 @@ _DESCRIPTION_REFERENCE_HINTS = (
     (("jwt", "token", "签名", "oauth"), "JWT/签名 → 必须 skill_load(name=\"web\", resource=\"jwt-attacks.md\")"),
     (("授权", "license", "serial", "序列号", "校验器"), "授权/序列号 → 必须 skill_load(name=\"reverse\", resource=\"embedded-license.md\")"),
     (("云函数", "serverless", "cloudfunc", "lambda"), "Serverless → 必须 skill_load(name=\"cloud\", resource=\"serverless.md\")"),
-    (("ssrf", "内网探测", "资产探测", "请求伪造"), "SSRF → 必须 skill_load(name=\"web\", resource=\"ssrf.md\")"),
-    (("xxe", "xml", "实体注入"), "XXE → 必须 skill_load(name=\"payloads\", resource=\"xxe-injection.md\")"),
-    (("上传", "upload"), "文件上传 → 必须 skill_load(name=\"payloads\", resource=\"upload-insecure-files.md\")"),
+    (("ssrf", "内网探测", "资产探测", "请求伪造", "同步数据", "合作伙伴", "追踪 api", "导入", "抓取"), "SSRF/URL 请求 → 必须 skill_load(name=\"web\", resource=\"ssrf.md\")"),
+    (("xxe", "xml", "实体注入", "图片", "svg"), "XXE/文件上传 → 必须 skill_load(name=\"payloads\", resource=\"xxe-injection.md\") 和 skill_load(name=\"payloads\", resource=\"upload-insecure-files.md\")"),
+    (("上传", "upload", "附件", "头像"), "文件上传 → 必须 skill_load(name=\"payloads\", resource=\"upload-insecure-files.md\")"),
     (("图数据库", "hugegraph", "neo4j", "关联检索", "gremlin"), "图数据库 → 必须 skill_load(name=\"web\", resource=\"graph-db.md\")"),
 )
 
