@@ -23,6 +23,7 @@ from solver.runtime.context_window import ContextWindow, serialize_messages
 from solver.runtime.control import ControlPolicy
 from solver.runtime.journal import ExecutionJournal
 from solver.runtime.recovery import recover_execution
+from solver.runtime.strategy_controller import StrategyController
 from solver.runtime.tool_runner import ToolRunner, parse_tool_args
 from solver.tools.registry import ToolRegistry, ToolSpec, load_plugin_tools
 from solver.worker_context import RunContext, ctx as _ctx
@@ -183,6 +184,45 @@ class SolverAgent:
         challenge_dir = getattr(_ctx, "challenge_dir", "")
         self._ledger = (
             ChallengeLedger(challenge_dir)
+            if challenge_dir and challenge_dir != "/workspace"
+            else None
+        )
+        decision_cfg = settings.get("solver", {}).get("decision_control", {})
+        if not isinstance(decision_cfg, dict):
+            decision_cfg = {}
+        raw_decision_enabled = decision_cfg.get(
+            "enabled",
+            settings.get("solver", {}).get("decision_control_enabled", True),
+        )
+        if isinstance(raw_decision_enabled, str):
+            decision_enabled = raw_decision_enabled.strip().lower() not in {
+                "0", "false", "no", "off"
+            }
+        else:
+            decision_enabled = bool(raw_decision_enabled)
+
+        def _decision_int(name: str, default: int) -> int:
+            try:
+                value = int(decision_cfg.get(name, default))
+            except (TypeError, ValueError):
+                value = default
+            return max(2, value)
+
+        self._strategy_controller = (
+            StrategyController(
+                challenge_dir,
+                attempt_id=getattr(_ctx, "attempt_id", "primary"),
+                difficulty=difficulty,
+                switch_after=self._switch_after_rounds,
+                stop_after=self._stop_after_rounds,
+                action_repeat_threshold=_decision_int(
+                    "action_repeat_threshold", 4
+                ),
+                vector_repeat_threshold=_decision_int(
+                    "vector_repeat_threshold", 4
+                ),
+                enabled=decision_enabled,
+            )
             if challenge_dir and challenge_dir != "/workspace"
             else None
         )
@@ -493,6 +533,15 @@ class SolverAgent:
                             self._last_progress_round = self.round
                             self._last_discovery_round = self.round
                             self._material_progress_count += 1
+
+                # P0 decision control: keep the legacy soft-progress counter
+                # for benchmark continuity, while a separate durable control
+                # plane tracks novel evidence and repeated directions across
+                # portfolio attempts.
+                if execution.executed:
+                    self._record_strategy_observation(
+                        tool_name, tool_args, result, self.round
+                    )
 
                 _emit("tool_result", {
                     "tool": tool_name,
@@ -916,6 +965,23 @@ class SolverAgent:
 
         lines = ["[状态快照] 当前看板（自动注入，请对照行动）："]
 
+        controller = getattr(self, "_strategy_controller", None)
+        if controller is not None:
+            try:
+                decision = controller.summary()
+            except Exception:
+                decision = {}
+            if decision:
+                lines.append(
+                    "🧭 决策控制："
+                    f"模式={decision.get('strategy_mode', 'EXPLORE')}，"
+                    f"阶段={decision.get('stage', 'CLASSIFY')}，"
+                    f"状态版本={decision.get('state_version', 0)}，"
+                    f"同动作连续={decision.get('same_action_streak', 0)}，"
+                    f"同向量连续={decision.get('same_vector_streak', 0)}，"
+                    f"策略切换={decision.get('switch_count', 0)}。"
+                )
+
         ledger = getattr(self, "_ledger", None)
         if ledger is not None:
             try:
@@ -1036,6 +1102,50 @@ class SolverAgent:
         paths = re.findall(r'(/[a-zA-Z0-9_\-./]+)', content)
         keywords.extend([p for p in paths if len(p) > 3])
         return list(dict.fromkeys(keywords))
+
+    def _record_strategy_observation(
+        self, tool_name: str, tool_args: dict, result: str, round_num: int
+    ) -> None:
+        """Feed a completed action into the deterministic control plane.
+
+        This path is deliberately fail-open: a damaged optional decision
+        snapshot must never prevent the Solver from continuing or submitting.
+        The existing benchmark-facing progress counters remain unchanged.
+        """
+        controller = getattr(self, "_strategy_controller", None)
+        if controller is None:
+            return
+        try:
+            advice = controller.observe(
+                tool_name,
+                tool_args,
+                result,
+                round_num,
+            )
+            try:
+                _emit("decision_observation", controller.summary())
+            except Exception:
+                pass
+            if advice is None:
+                return
+            _emit("strategy_advice", advice.to_dict())
+            if advice.action == "switch_strategy":
+                # Suppress the older one-shot switch injection; the durable
+                # controller has already accounted for this challenge across
+                # aggressive/steady attempts.
+                self._stuck_switched = True
+                self._queue_injection(
+                    "[策略控制] 当前方向缺少有效的新证据，必须切换思考模式。"
+                    f"建议模式：{advice.mode}；原因：{advice.reason}。"
+                    "请停止重复同一请求结构/攻击向量，先查看 idea_list 和 memory_list，"
+                    "再选择一个与当前路线正交的未验证方向，并为它设定可观察的成功条件。"
+                )
+        except Exception as exc:
+            _emit("strategy_control_error", {
+                "round": round_num,
+                "tool": tool_name,
+                "error": str(exc),
+            })
 
     def _bash_has_new_progress(self, result: str) -> bool:
         """宽松进展判定：不指纹去重，直接判断是否含结构化证据。

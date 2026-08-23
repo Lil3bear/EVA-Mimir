@@ -23,7 +23,7 @@ memory_add、memory_list、idea_list、security_search、challenge_submit_flag�
 challenge_get_hint；不要提及 restart 或其它不存在的接口。
 
 ## 单一审查循环
-1. 先使用用户消息中的 Memory/Ideas 与最近行为摘要；只有存在无法解释的具体矛盾时才读 history。
+1. 先使用用户消息中的 Memory/Ideas、决策控制状态与最近行为摘要；决策状态中的重复计数和版本号优先于你的主观估计，只有存在无法解释的具体矛盾时才读 history。
 2. 以当前运行的实测证据为准。evidence（凭据/有效 flag）不可删除；合并重复的 fact/failure，
    删除已经被新证据替代或明显过时的记录。不要把旧实例 IP、旧凭据、题号经验或历史攻击链当作答案。
 3. 检查已有 idea 是否应更新为 testing/verified/failed。一次 payload 失败只记录边界，不要轻易关闭整条路线。
@@ -64,6 +64,25 @@ def _build_observer_prompt(
     ideas = idea_store.list_ideas(challenge_dir, limit=8)
 
     lines = ["## 当前看板状态"]
+
+    # The deterministic control plane is the source of truth for repetition
+    # and strategy mode.  Observer may advise, but must not infer these fields
+    # from a truncated six-round window alone.
+    try:
+        from solver.runtime.strategy_controller import load_decision_summary
+        decision = load_decision_summary(challenge_dir)
+    except Exception:
+        decision = {}
+    if decision:
+        lines.append(
+            "### 决策控制状态\n"
+            f"- mode={decision.get('strategy_mode', 'EXPLORE')}"
+            f", stage={decision.get('stage', 'CLASSIFY')}"
+            f", state_version={decision.get('state_version', 0)}"
+            f", same_action_streak={decision.get('same_action_streak', 0)}"
+            f", same_vector_streak={decision.get('same_vector_streak', 0)}"
+            f", switch_count={decision.get('switch_count', 0)}"
+        )
 
     if memories:
         lines.append(f"### Memory（{len(memories)} 条）")

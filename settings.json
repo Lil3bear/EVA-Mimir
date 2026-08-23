@@ -22,6 +22,11 @@
     "allow_easy_hint": false,
     "observer_correction_max_lag": 3,
     "memory_limit": 10,
-    "idea_limit": 8
+    "idea_limit": 8,
+    "decision_control": {
+      "enabled": true,
+      "action_repeat_threshold": 4,
+      "vector_repeat_threshold": 4
+    }
   }
 }

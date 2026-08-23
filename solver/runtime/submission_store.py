@@ -78,6 +78,7 @@ def prepare_challenge_state(challenge_dir: str | Path) -> bool:
             ".solver-history.jsonl",
             ".execution-journal.jsonl",
             ".challenge-ledger.json",
+            ".decision-state.json",
         ):
             (challenge_path / name).unlink(missing_ok=True)
 

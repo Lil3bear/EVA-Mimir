@@ -92,11 +92,22 @@ class TaskBuilder:
         *,
         strategy_name: str = "",
         strategy_hint: str = "",
+        role: str = "executor",
+        objective: str = "完成当前题目并验证提交结果",
+        success_condition: str = "获得可重复验证的 flag 或明确记录终止边界",
         attempt_context: RunContext | None = None,
     ) -> str:
         task = build_task_from_challenge(challenge, container_addr)
         if strategy_name:
             task += f"\n\n## 策略：{strategy_name}（本策略为 Multi-Solver 并行模式，另一策略也在同时解题）"
+        task += (
+            "\n\n## Attempt 任务契约"
+            f"\n- 角色：{role}"
+            f"\n- 当前目标：{objective}"
+            f"\n- 完成条件：{success_condition}"
+            "\n- 每次关键动作前先明确一个可验证假设；动作后用 memory_add 记录新证据、失败边界或阻塞原因。"
+            "\n- 不要重复其他 Attempt 已经验证过的同一请求结构；需要复核时必须说明方法发生了什么变化。"
+        )
         if strategy_hint:
             task += f"\n{strategy_hint}"
         if attempt_context:

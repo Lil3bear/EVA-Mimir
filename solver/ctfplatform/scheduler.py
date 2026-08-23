@@ -421,6 +421,9 @@ class Scheduler:
         *,
         strategy_name: str = "",
         strategy_hint: str = "",
+        role: str = "executor",
+        objective: str = "完成当前题目并验证提交结果",
+        success_condition: str = "获得可重复验证的 flag 或明确记录终止边界",
         attempt_context: RunContext | None = None,
     ) -> str:
         return TaskBuilder(
@@ -432,6 +435,9 @@ class Scheduler:
             challenge_workspace,
             strategy_name=strategy_name,
             strategy_hint=strategy_hint,
+            role=role,
+            objective=objective,
+            success_condition=success_condition,
             attempt_context=attempt_context,
         )
 
@@ -508,6 +514,9 @@ class Scheduler:
                 challenge_workspace,
                 strategy_name=spec.name,
                 strategy_hint=spec.strategy_hint,
+                role=spec.role,
+                objective=spec.objective,
+                success_condition=spec.success_condition,
                 attempt_context=attempt_context,
             )
 
