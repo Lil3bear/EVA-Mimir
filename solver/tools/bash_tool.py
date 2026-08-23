@@ -140,6 +140,9 @@ def _is_connection_refused(output: str) -> bool:
         'curl: (28)',  # curl 超时
         'Network unreachable',
         'No route to host',
+        'timed out',
+        'TimeoutError',
+        'Operation timed out',
     ]
     return any(p.lower() in output.lower() for p in patterns)
 
@@ -293,11 +296,23 @@ def execute(args: dict) -> str:
         _ctx.host_fail_counter[host] += 1
         fail_count = _ctx.host_fail_counter[host]
         if fail_count >= _HOST_FAIL_WARN_THRESHOLD:
-            conn_warn = (
-                f"\n⚠️ [目标不可达] {host} 已连续 {fail_count} 次 Connection Refused。"
-                f"目标实例可能已下线。请调用 challenge_get_state 确认题目 URL 是否变化，"
-                f"不要继续猜端口或换节点重试。\n"
+            # 区分两类失败：端口拒绝（实例下线） vs 应用层超时（TCP 通但服务无响应）
+            is_timeout = any(
+                p in output.lower()
+                for p in ('timed out', 'timeouterror', 'operation timed out', 'curl: (28)')
             )
+            if is_timeout:
+                conn_warn = (
+                    f"\n⚠️ [目标异常] {host} 已连续 {fail_count} 次超时（TCP 可能可连但应用层无响应）。"
+                    f"实例可能未就绪或已崩。请先 challenge_get_state 确认容器状态，"
+                    f"若状态异常则 challenge_close 后重新 start，不要继续猜端口或反复 curl。\n"
+                )
+            else:
+                conn_warn = (
+                    f"\n⚠️ [目标不可达] {host} 已连续 {fail_count} 次 Connection Refused。"
+                    f"目标实例可能已下线。请调用 challenge_get_state 确认题目 URL 是否变化，"
+                    f"不要继续猜端口或换节点重试。\n"
+                )
     elif host and not _is_connection_refused(output):
         # 连接成功，重置该 host 的失败计数
         _ctx.host_fail_counter[host] = 0
