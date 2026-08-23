@@ -135,7 +135,7 @@ class ControlPolicyTests(unittest.TestCase):
         hard_pentest = ControlPolicy.from_settings(
             {"solver": {}}, "hard", pentest=True
         )
-        self.assertEqual(easy.max_rounds, 30)
+        self.assertEqual(easy.max_rounds, 80)
         self.assertEqual(hard_pentest.max_rounds, 200)
         self.assertEqual(easy.observer_every_rounds, 15)
         self.assertEqual(hard_pentest.observer_every_rounds, 8)
@@ -165,12 +165,12 @@ class DifficultyMaxRoundsTests(unittest.TestCase):
     @patch("solver.agent.ObserverLoop")
     @patch("solver.agent.OpenAI")
     @patch("solver.agent.search_tool")
-    def test_easy_gets_30_rounds(self, mock_search, mock_openai, mock_observer):
+    def test_easy_gets_80_rounds(self, mock_search, mock_openai, mock_observer):
         from solver.agent import SolverAgent
         task = "# CTF 题目：a-05\n- 难度：easy\n- 目标地址：http://10.0.1.1"
         settings = {"llm": {"base_url": "http://x", "api_key": "k"}}
         agent = SolverAgent(task=task, settings=settings, skills_dir="/skills")
-        self.assertEqual(agent.max_rounds, 30)
+        self.assertEqual(agent.max_rounds, 80)
         self.assertEqual(agent._context_window_tokens, 1_000_000)
         self.assertEqual(
             agent._context_window_tokens - agent._reserve_tokens,
@@ -184,12 +184,12 @@ class DifficultyMaxRoundsTests(unittest.TestCase):
     @patch("solver.agent.ObserverLoop")
     @patch("solver.agent.OpenAI")
     @patch("solver.agent.search_tool")
-    def test_medium_gets_60_rounds(self, mock_search, mock_openai, mock_observer):
+    def test_medium_gets_100_rounds(self, mock_search, mock_openai, mock_observer):
         from solver.agent import SolverAgent
         task = "# CTF 题目：a-03\n- 难度：medium\n- 目标地址：http://10.0.1.1"
         settings = {"llm": {"base_url": "http://x", "api_key": "k"}}
         agent = SolverAgent(task=task, settings=settings, skills_dir="/skills")
-        self.assertEqual(agent.max_rounds, 60)
+        self.assertEqual(agent.max_rounds, 100)
 
     @patch("solver.agent.ObserverLoop")
     @patch("solver.agent.OpenAI")

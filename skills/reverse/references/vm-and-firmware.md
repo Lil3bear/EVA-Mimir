@@ -233,6 +233,42 @@ for combo_name, combo in [
 4. **用 FLAG{ 前缀验证**：取前 5 个字符，与 'FLAG{' 比对，确认编码方式
 5. **写 Python 一行推导**，不要反复跑模拟器
 
+#### D.6 VM 解密型题专项（输入 key → VM 解密 → 输出 flag）
+
+**识别**：程序要求输入 access_code/key，通过后输出 N 个字符（可能全是 `.` 占位或
+看似无意义的字符），data 段有 N 字节密文 + 短 key 表。这类题的 flag 就是 VM
+解密出的那 N 字节，**不要离线枚举加密算法**（XOR/AES/TEA/RC4/LCG/z3 全试一遍
+是无效消耗）。
+
+**正确流程（动态调试优先，别静态瞎猜）**：
+
+```bash
+# 1. 用 gdb 在"输出字符"处下断点，观察每轮输出字符怎么派生
+#    先跑一遍看程序完整执行，再断点看关键 handler
+gdb -q -batch -ex 'run VM_KEY07' ./validator
+# 找输出点：objdump 找 putchar/putc 调用
+objdump -d -Mintel ./validator | grep -B3 -A3 'putchar\|putc\|fputc'
+
+# 2. 在输出点下断点，看每轮 eax/edx 的值（输出的字符从哪个寄存器来）
+gdb -q -batch \
+  -ex 'b *0x12b0+OFFSET' \
+  -ex 'run VM_KEY07' \
+  -ex 'info registers eax edx r14' \
+  ./validator
+
+# 3. 逆向"输出 handler"：字符 = 密文[i] ⊕ key[i & 3] 或 密文[i] ⊕ 字节码[i] 之类
+#    确定派生公式后，写 Python 直接解密，不要继续跑模拟器
+```
+
+**关键判据**：
+- 输出是 `.` 占位 → 真正的 flag 字符是 VM 内部算出来的，逆向输出 handler 才能看到
+- keystream 动态计算 → 不要静态搜二进制里的字节，要跟 gdb 看每轮实际用到的值
+- 密文在 data 段（如 0x4020 有 31 字节），key 表也在附近（如 0x401a）→ 优先 `objdump -s -j .data` dump 这两段
+- 用 `FLAG{` 前缀验证任何解密公式，前 5 字节对不上就换公式
+
+**最短路径**：gdb 断点拿到第 1 轮输出的字符和它对应的密文/key/字节码，反推出
+公式，一次写出 31 字节 flag。不要先把 VM 全部 handler 逆向完。
+
 ## 常见加密算法识别标志
 
 | 特征 | 算法 | 关键常量 |
