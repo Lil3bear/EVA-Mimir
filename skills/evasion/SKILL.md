@@ -13,6 +13,7 @@ description: 处理 CTF 中的过滤规则、WAF、上传限制与二进制检�
 | XSS 或命令参数过滤 | `xss-command.md` |
 | 上传、PHP 或文件类型检测 | `upload-and-php.md` |
 | ELF/PE 校验、沙箱或二进制检测 | `binary-evasion.md` |
+| 进程注入代码检测（/check 评估注入代码、检测规则绕过） | `process-injection-bypass.md` |
 
 ## 适用场景
 CTF 对抗规避类题目，包括 WAF 绕过、IDS/IPS 规避、沙箱逃逸、AV 免杀、编码绕过、流量伪装、Binary Patching 绕过检测等。
