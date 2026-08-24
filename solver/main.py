@@ -4,6 +4,7 @@ import sys
 import time
 import threading
 import uuid
+import copy
 from pathlib import Path
 
 from shared.jsonl import deserialize, write_line
@@ -29,6 +30,12 @@ def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
     if value < minimum:
         raise ValueError(f"环境变量 {name} 必须大于等于 {minimum}，实际为 {value}")
     return value
+
+
+def _env_codes(name: str, default: str) -> set[str]:
+    """读逗号分隔的题号列表（环境变量），用于跳过名单。"""
+    raw = os.environ.get(name, default).strip()
+    return {code.strip() for code in raw.split(",") if code.strip()}
 
 
 def _read_stdin_loop(agent) -> None:
@@ -204,6 +211,11 @@ def _run_tsecbench_mode() -> None:
     # 避免 hard 多阶段题在拿不到新增 flag 时被提前暂停。
     fail_streak: dict[str, int] = {}
     abandoned_codes: set[str] = set()
+    # 能力瓶颈题（多次 run 从未解出）：暂缓，把时间留给可保分的题。
+    # 等 58 题稳定后再通过 SOLVER_SKIP_CODES 清空回来攻关。
+    pre_skip_codes = _env_codes(
+        "SOLVER_SKIP_CODES", "a-18,c-03,c-06,c-08,f2-05"
+    )
     MAX_FAIL_STREAK = 4
     cumulative_report: dict = {}
     # Only report a total count that came from a successful platform snapshot;
@@ -257,15 +269,22 @@ def _run_tsecbench_mode() -> None:
                     "message": str(exc),
                 })
 
+        # 第 2 轮起，用 baseline 宽松模式重跑未解题（无早停/无切换/无强干预，
+        # 完整预算自由探索，用于兑底保分）。首轮仍走 Fast/Deep Lane。
+        round_settings = settings
+        if round_idx >= 2:
+            round_settings = copy.deepcopy(settings)
+            round_settings.setdefault("solver", {})["baseline_mode"] = True
+
         scheduler = Scheduler(
             client=client,
-            settings=settings,
+            settings=round_settings,
             skills_dir=skills_dir,
             workspace_dir=workspace_dir,
             max_parallel=max_parallel,
             deadline=deadline,
             skip_completed=True,
-            skip_codes=abandoned_codes | skip_hard_new,
+            skip_codes=pre_skip_codes | abandoned_codes | skip_hard_new,
             prefix_filter=prefix_filter,
         )
 
@@ -336,7 +355,9 @@ def _run_tsecbench_mode() -> None:
             known_total_count = len(remaining_challenges)
             undone = [
                 c for c in remaining_challenges
-                if not c.is_completed and c.unique_code not in abandoned_codes
+                if not c.is_completed
+                and c.unique_code not in abandoned_codes
+                and c.unique_code not in pre_skip_codes
             ]
             if not undone:
                 _emit("retry_stop", {"reason": "all_completed"})

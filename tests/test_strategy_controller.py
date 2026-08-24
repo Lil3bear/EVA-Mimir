@@ -364,6 +364,21 @@ class LaneTerminationTests(unittest.TestCase):
         two._stuck_switched = True
         self.assertTrue(two._runtime_control_decision().terminal)
 
+    def test_baseline_mode_never_upgrades_or_stops(self):
+        from solver.runtime.control import ControlAction
+
+        agent = self._make(
+            "fast", rounds=60, last_progress=0, difficulty="medium",
+        )
+        agent._baseline_mode = True
+        agent._lane = "fast"
+        agent._fast_lane = True
+        agent._upgrade_after = 0
+        decision = agent._runtime_control_decision()
+        self.assertEqual(decision.action, ControlAction.CONTINUE.value)
+        self.assertFalse(decision.terminal)
+        self.assertFalse(agent._deep_controls_active())
+
 
 if __name__ == "__main__":
     unittest.main()

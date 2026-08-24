@@ -179,6 +179,15 @@ class SolverAgent:
         self._upgrade_after = self._control_policy.fast_lane_rounds
         self._strategy_failure_count = 0
         self._last_strategy_failure_round = 0
+        # baseline 兑底模式：重跑轮次对 easy/medium 永久宽松（不升级、不早停、
+        # 不切换、无 Observer 强干预），完整预算自由探索，用于保分。
+        self._baseline_mode = bool(
+            settings.get("solver", {}).get("baseline_mode", False)
+        ) and difficulty in ("easy", "medium")
+        if self._baseline_mode:
+            self._lane = LaneMode.FAST.value
+            self._fast_lane = True
+            self._upgrade_after = 0
         # hint 严格门：低于该轮次禁止看提示（提示会扣分，先自己跑 loop）。
         # 难题更早允许看 hint：hard/difficult 解不出风险高，hint 价值/成本比更高；
         # 显式配置 hint_min_round 时以配置为准。
@@ -1590,6 +1599,12 @@ class SolverAgent:
 
     def _runtime_control_decision(self) -> ControlDecision:
         """唯一的 lane/switch/no-progress 终态入口。"""
+        if getattr(self, "_baseline_mode", False):
+            # baseline 兑底：不升级、不切换、不早停，用完整预算自由探索。
+            return ControlDecision(
+                action=ControlAction.CONTINUE.value,
+                idle_rounds=0,
+            )
         return self._control_policy.decide(
             round_num=self.round,
             last_progress_round=self._last_progress_round,
