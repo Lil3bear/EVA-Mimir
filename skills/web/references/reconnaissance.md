@@ -34,25 +34,11 @@ curl http://TARGET_URL/sitemap.xml
 3. 异常原因才是线索：登录页恒 500 可能是模板缺失/DB 异常/配置缺失——先搞清楚为什么 500，再决定是爆破、session 伪造还是源码泄漏。
 4. **禁止在未确认异常根因前就跑弱口令/SQLi/大规模爆破**（浪费轮次）。
 
-### 1.2 目录扫描
+### 1.2 目录/参数发现（受预算约束，禁止字典扫描）
 ```bash
-# 常用字典扫描
-ffuf -u http://TARGET_URL/FUZZ -w /usr/share/wordlists/dirb/common.txt -mc 200,301,302,403
-
-# 扩展名扫描
-ffuf -u http://TARGET_URL/FUZZ -w /usr/share/wordlists/dirb/common.txt -e .php,.html,.txt,.bak,.zip,.tar.gz -mc 200,301,302,403
-
-# 递归扫描某个子路径
-ffuf -u http://TARGET_URL/api/FUZZ -w /usr/share/wordlists/dirb/common.txt -mc 200,201,301,302
-```
-
-### 1.3 参数发现
-```bash
-# 对已知页面枚举 GET 参数
-ffuf -u "http://TARGET_URL/page?FUZZ=test" -w /usr/share/wordlists/dirb/common.txt -fs 1234
-
-# POST 参数枚举（先观察正常表单的响应大小，用 -fs 过滤）
-ffuf -u http://TARGET_URL/login -X POST -d "FUZZ=test&password=test" -w /usr/share/wordlists/dirb/common.txt -fs 1234
+# 平台对同一请求结构有 3 次硬预算：ffuf/dirb/gobuster 字典扫描会一次性烧光并封死通道，禁止使用。
+# 目录与参数只能从题目描述、响应体注释/源码、Memory 里的线索推导，再精确访问一次。
+curl -si http://TARGET_URL/<从线索推导出的唯一路径>
 ```
 
 ---

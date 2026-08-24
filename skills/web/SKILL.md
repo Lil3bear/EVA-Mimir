@@ -17,7 +17,7 @@ description: 处理 HTTP/Web 入口的 CTF 题。发现 HTTP 响应、Web 框架
 | 响应特征 | 产品/漏洞 | 验证建议 |
 |---|---|---|
 | HTML 含 `gradio` 或 `gr-` 前缀，端口 7860 | Gradio | `skill_load(web, product-playbooks.md)` + CVE-2024-1561 文件读 |
-| 端口 3000 + HTML 含 `Next.js` 或 `data-public-api-prefix` | Dify(Next.js) | CVE-2025-55182 React2Shell + 扫同主机其他端口 |
+| 端口 3000 + HTML 含 `Next.js` 或 `data-public-api-prefix` | Dify(Next.js) | CVE-2025-55182 React2Shell；不要扫同主机端口，复用题目地址与已验证端口 |
 | HTTPS 8443 + HTML 含 `ofbiz` 或 `webtools` | Apache OFBiz | CVE-2023-51467 未授权 RCE + 试 admin/ofbiz |
 | `Server: Python` + 路径含 `/api/manager` | ComfyUI-Manager | CVE-2025-67303 config RCE |
 | HTML 含 `1panel` 或 `/api/v1/auth/login` | 1Panel | CVE-2024-39907 SQLi 写 shell |
