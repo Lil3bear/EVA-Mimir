@@ -2,6 +2,13 @@
 
 from solver.runtime.challenge_ledger import ChallengeLedger
 from solver.runtime.context import RunContext, ctx
+from solver.runtime.control import (
+    ControlAction,
+    ControlDecision,
+    ControlPolicy,
+    FailureScope,
+    LaneMode,
+)
 from solver.runtime.decision_state import (
     ActionOutcome,
     ActionOutcomeKind,
@@ -24,12 +31,17 @@ __all__ = [
     "ActionOutcomeKind",
     "AttemptSpec",
     "ChallengeLedger",
+    "ControlAction",
     "ControlAdvice",
+    "ControlDecision",
+    "ControlPolicy",
     "DecisionState",
     "DecisionStateStore",
     "ExecutionJournal",
+    "FailureScope",
     "Hypothesis",
     "HypothesisStatus",
+    "LaneMode",
     "ObserverAdvice",
     "PortfolioBudget",
     "RunContext",

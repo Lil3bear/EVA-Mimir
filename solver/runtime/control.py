@@ -1,14 +1,20 @@
-"""Single runtime policy for budgets, progress and observation cadence.
+"""Single runtime policy for budgets, lanes and terminal decisions.
 
-The solver used to have independent hard-coded stopping rules in Agent,
-Observer and the scheduler.  This module is the one source of truth for the
-per-challenge policy.  Explicit settings still win, while the defaults keep
-the previously validated difficulty budgets.
+The policy deliberately separates three different facts:
+
+* an action failed (retry or adjust parameters),
+* a strategy stalled (change direction), and
+* the task exhausted the evidence/time budget (terminal).
+
+Only :meth:`ControlPolicy.decide` may turn lack of progress into a terminal
+result.  Deadline, platform cancellation, peer success and a correct flag are
+external terminal events and are handled by the caller.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 
 
 _ROUND_BUDGETS = {"easy": 40, "medium": 70, "hard": 110, "difficult": 130}
@@ -22,6 +28,40 @@ _DEFAULT_SWITCH_AFTER = {"easy": 10, "medium": 12, "hard": 12, "difficult": 12}
 _DEFAULT_STOP_AFTER = {"easy": 20, "medium": 30, "hard": 48, "difficult": 48}
 _STOP_PENTEST_EXTRA = 24
 _STOP_CTYPE_EXTRA = 12
+_FAST_LANE_ROUNDS = {"easy": 20, "medium": 20}
+
+
+class LaneMode(str, Enum):
+    FAST = "fast"
+    DEEP = "deep"
+
+
+class FailureScope(str, Enum):
+    """How much evidence is needed before declaring a failure."""
+
+    NONE = "none"
+    ACTION = "action_failure"
+    STRATEGY = "strategy_failure"
+    TASK = "task_exhausted"
+
+
+class ControlAction(str, Enum):
+    CONTINUE = "continue"
+    UPGRADE_LANE = "upgrade_lane"
+    SWITCH_STRATEGY = "switch_strategy"
+    STOP = "stop"
+
+
+@dataclass(frozen=True)
+class ControlDecision:
+    action: str = ControlAction.CONTINUE.value
+    reason: str = ""
+    failure_scope: str = FailureScope.NONE.value
+    idle_rounds: int = 0
+
+    @property
+    def terminal(self) -> bool:
+        return self.action == ControlAction.STOP.value
 
 
 @dataclass(frozen=True)
@@ -30,6 +70,9 @@ class ControlPolicy:
     switch_after: int
     stop_after: int
     observer_every_rounds: int
+    difficulty: str = ""
+    fast_lane_rounds: int = 0
+    min_strategy_failures_before_stop: int = 2
 
     @classmethod
     def from_settings(
@@ -62,26 +105,100 @@ class ControlPolicy:
         if ctype:
             stop_after += _STOP_CTYPE_EXTRA
 
+        fast_default = 0 if pentest or ctype else _FAST_LANE_ROUNDS.get(difficulty, 0)
         return cls(
             max_rounds=positive_setting("max_rounds", base),
             switch_after=positive_setting(
                 "switch_after_rounds",
                 _DEFAULT_SWITCH_AFTER.get(difficulty, 12),
             ),
-            stop_after=positive_setting(
-                "no_progress_rounds",
-                stop_after,
-            ),
+            stop_after=positive_setting("no_progress_rounds", stop_after),
             observer_every_rounds=positive_setting(
                 "observer_every_rounds",
                 _OBSERVER_INTERVALS.get(difficulty, 10),
             ),
+            difficulty=difficulty,
+            fast_lane_rounds=positive_setting(
+                "fast_lane_rounds", fast_default
+            ) if fast_default else 0,
+            min_strategy_failures_before_stop=positive_setting(
+                "min_strategy_failures_before_stop", 2
+            ),
         )
 
-    def stop_reason(self, round_num: int, last_progress_round: int) -> str:
-        idle_rounds = max(0, round_num - last_progress_round)
-        if idle_rounds > self.stop_after:
-            return f"连续 {idle_rounds} 轮无新证据"
-        if round_num > self.max_rounds:
-            return f"达到 {self.max_rounds} 轮预算"
-        return ""
+    @property
+    def allows_no_progress_intervention(self) -> bool:
+        """Easy never abandons or forcibly rotates only because it is idle."""
+        return self.difficulty != "easy"
+
+    def decide(
+        self,
+        *,
+        round_num: int,
+        last_progress_round: int,
+        lane: str,
+        lane_entered_round: int = 0,
+        strategy_failures: int = 0,
+        switch_already_requested: bool = False,
+        hint_focus_exhausted: bool = False,
+    ) -> ControlDecision:
+        """Return the sole policy decision for lane/switch/no-progress stop.
+
+        A Deep Lane upgrade starts a fresh progress epoch.  This prevents a
+        medium task from upgrading at round 20 and immediately inheriting 20
+        stale rounds, which previously caused an instant switch/early stop.
+        Easy may upgrade to gain Observer help, but it still cannot be stopped
+        or forcibly switched merely for having no progress.
+        """
+        round_num = max(0, int(round_num))
+        lane_entered_round = max(0, int(lane_entered_round))
+        progress_anchor = max(int(last_progress_round), lane_entered_round)
+        idle_rounds = max(0, round_num - progress_anchor)
+
+        if (
+            lane == LaneMode.FAST.value
+            and self.fast_lane_rounds > 0
+            and round_num >= self.fast_lane_rounds
+        ):
+            return ControlDecision(
+                action=ControlAction.UPGRADE_LANE.value,
+                reason="fast_lane_budget_exhausted",
+                idle_rounds=idle_rounds,
+            )
+
+        # The key easy invariant: no idle/hint terminal and no legacy forced
+        # switch.  It runs until solved, deadline/platform terminal, or the
+        # complete max_rounds budget.
+        if not self.allows_no_progress_intervention:
+            return ControlDecision(idle_rounds=idle_rounds)
+
+        if lane != LaneMode.DEEP.value:
+            return ControlDecision(idle_rounds=idle_rounds)
+
+        enough_failed_strategies = (
+            int(strategy_failures) >= self.min_strategy_failures_before_stop
+        )
+        if enough_failed_strategies and (
+            idle_rounds > self.stop_after or hint_focus_exhausted
+        ):
+            reason = (
+                "hint_focus_exhausted"
+                if hint_focus_exhausted
+                else "no_progress_after_strategy_changes"
+            )
+            return ControlDecision(
+                action=ControlAction.STOP.value,
+                reason=reason,
+                failure_scope=FailureScope.TASK.value,
+                idle_rounds=idle_rounds,
+            )
+
+        if idle_rounds > self.switch_after and not switch_already_requested:
+            return ControlDecision(
+                action=ControlAction.SWITCH_STRATEGY.value,
+                reason="strategy_without_new_evidence",
+                failure_scope=FailureScope.STRATEGY.value,
+                idle_rounds=idle_rounds,
+            )
+
+        return ControlDecision(idle_rounds=idle_rounds)

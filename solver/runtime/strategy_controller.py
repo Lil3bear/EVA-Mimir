@@ -182,8 +182,15 @@ class StrategyController:
         tool_args: Mapping[str, Any] | None,
         result: str,
         round_num: int,
+        *,
+        allow_switch: bool = True,
     ) -> ControlAdvice | None:
-        """Record one tool result and optionally emit one bounded switch advice."""
+        """Record one result and optionally emit a bounded strategy failure.
+
+        Fast Lane passes ``allow_switch=False`` so evidence is still durable,
+        but merely observing repeated actions cannot mutate the strategy mode
+        or consume a switch before Deep Lane actually starts.
+        """
         if not self.enabled:
             return None
 
@@ -259,7 +266,7 @@ class StrategyController:
             elif idle_novel >= self.switch_after and not outcome.novel_progress:
                 repeat_reason = "no_novel_progress"
 
-            if not repeat_reason or in_cooldown:
+            if not repeat_reason or in_cooldown or not allow_switch:
                 return None
 
             next_mode = self._MODE_AFTER_SWITCH.get(

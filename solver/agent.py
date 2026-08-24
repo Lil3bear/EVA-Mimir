@@ -20,7 +20,14 @@ from solver.runtime.llm import (
 )
 from solver.runtime.challenge_ledger import ChallengeLedger
 from solver.runtime.context_window import ContextWindow, serialize_messages
-from solver.runtime.control import ControlPolicy
+from solver.runtime.decision_state import ActionOutcomeKind
+from solver.runtime.control import (
+    ControlAction,
+    ControlDecision,
+    ControlPolicy,
+    FailureScope,
+    LaneMode,
+)
 from solver.runtime.journal import ExecutionJournal
 from solver.runtime.recovery import recover_execution
 from solver.runtime.strategy_controller import StrategyController
@@ -162,14 +169,16 @@ class SolverAgent:
         self.max_rounds = self._control_policy.max_rounds
         self._switch_after_rounds = self._control_policy.switch_after
         self._stop_after_rounds = self._control_policy.stop_after
-        # Fast Lane / Deep Lane：简单题（easy + 简单 medium）走直接执行路径，
-        # 不承担完整控制面成本；复杂题（hard/difficult/pentest/ctype）走 Deep Lane。
-        # fast lane 不因“暂时无新证据”提前停，只用 max_rounds 兜底。
+        # Fast Lane / Deep Lane：easy 与普通 medium 先直接执行，复杂题直接进入
+        # Deep Lane。lane 只决定控制面开销；difficulty 决定是否允许无进展
+        # 强制换向/早停。因此 easy 即使升级，也绝不会因 idle 被提前放弃。
         self._lane = self._classify_lane(difficulty, is_pentest, is_ctype)
-        self._fast_lane = self._lane == "fast"
+        self._fast_lane = self._lane == LaneMode.FAST.value
         self._lane_upgraded = False
-        # fast lane 运行到该轮次仍未解，升级到 deep lane 启用完整控制。
-        self._upgrade_after = {"easy": 15, "medium": 20}.get(difficulty, 0)
+        self._lane_entered_round = 0
+        self._upgrade_after = self._control_policy.fast_lane_rounds
+        self._strategy_failure_count = 0
+        self._last_strategy_failure_round = 0
         # hint 严格门：低于该轮次禁止看提示（提示会扣分，先自己跑 loop）。
         # 难题更早允许看 hint：hard/difficult 解不出风险高，hint 价值/成本比更高；
         # 显式配置 hint_min_round 时以配置为准。
@@ -245,6 +254,10 @@ class SolverAgent:
             not self._fast_lane
             and (difficulty in ("medium", "hard", "difficult") or inject_easy)
         )
+        # The easy invariant wins over configuration: legacy/deterministic
+        # no-progress switching is never injected for easy tasks.
+        if difficulty == "easy":
+            self._inject_strategy_switch = False
         self._material_progress_count = 0
         try:
             cached_hints = self._ledger.cached_hints() if self._ledger else []
@@ -342,9 +355,10 @@ class SolverAgent:
         observer_every = self._control_policy.observer_every_rounds
         # fast lane 默认关闭 Observer，避免简单题被旁路强干预带偏；
         # 升级到 deep lane 后再动态启用。
-        observer_enabled = bool(
+        self._observer_permitted = bool(
             settings.get("solver", {}).get("observer_enabled", True)
-        ) and not self._fast_lane
+        )
+        observer_enabled = self._observer_permitted and not self._fast_lane
         self.observer = ObserverLoop(
             settings={**settings, "solver": {**settings.get("solver", {}),
                 "observer_every_rounds": observer_every,
@@ -392,58 +406,37 @@ class SolverAgent:
                 _emit("agent_end", {"rounds": self.round, "reason": "multi_solver_other_won"})
                 return
 
-            # ━━ Fast Lane → Deep Lane 升级：简单题跑了 upgrade_after 轮仍未解，
-            # 说明复杂度被低估，启用完整策略控制（Observer + 方向切换 + 无进展早停）。━━
-            if (
-                self._fast_lane
-                and not self._lane_upgraded
-                and self._upgrade_after
-                and self.round >= self._upgrade_after
-            ):
-                self._lane_upgraded = True
-                self._inject_strategy_switch = True
-                if not self.observer.enabled:
-                    self.observer.enabled = True
-                _emit("lane_upgrade", {
-                    "round": self.round,
-                    "difficulty": self._difficulty,
-                })
-                self._queue_injection(
-                    "[复杂度升级] 本题比预期更复杂，已启用完整策略控制。"
-                    "请审视已尝试方向，避免同一路线低效重复；"
-                    "但若当前已接近答案，先完成验证再换方向。"
-                )
-
-            # ━━ 硬约束：deadline（所有 lane 生效） ━━
+            # ━━ 外部硬终态：deadline 对所有 lane 生效。━━
             if self._deadline_exceeded():
                 self.observer.stop()
                 self._finish_execution("deadline_exceeded")
                 _emit("agent_end", {"rounds": self.round, "reason": "deadline_exceeded"})
                 return
 
-            # ━━ 单一终态决策：无进展早停只对 Deep Lane 生效。
-            # fast lane 不因“无新证据”提前停，只用 max_rounds 兜底。━━
-            terminate_reason = self._terminate_reason()
-            if terminate_reason:
+            # ━━ 唯一的策略控制决策点 ━━
+            # ControlPolicy 在同一次判定中处理 Fast→Deep、策略失败和题目预算
+            # 耗尽，避免 Agent 内多套 idle/hint 终止条件互相抢权。
+            control_decision = self._runtime_control_decision()
+            if control_decision.action == ControlAction.UPGRADE_LANE.value:
+                self._upgrade_to_deep_lane(control_decision)
+            elif control_decision.action == ControlAction.SWITCH_STRATEGY.value:
+                self._record_strategy_failure(control_decision)
+                self._stuck_switched = True
+                self._queue_injection(
+                    "[策略失败，不是题目失败] 当前方向连续多轮没有新证据。"
+                    "请先保留已验证事实，再选择一个正交、尚未验证的方向；"
+                    "单个请求超时、404 或 payload 失败不等于题目不可解。"
+                )
+            elif control_decision.terminal:
+                reason = "task_exhausted_no_progress"
                 self.observer.stop()
-                self._finish_execution(terminate_reason)
+                self._finish_execution(reason)
                 _emit("agent_end", {
                     "rounds": self.round,
-                    "reason": terminate_reason,
+                    "reason": reason,
+                    "control": control_decision.__dict__,
                 })
                 return
-
-            # ━━ 方向切换（仅 Deep Lane）：先换方向，换方向后仍无进展才由
-            # 上面的 _terminate_reason 停。区分“思路死”和“题无解”。━━
-            if self._deep_controls_active():
-                stuck_rounds = self.round - self._last_progress_round
-                if stuck_rounds > self._switch_after_rounds and not self._stuck_switched:
-                    self._stuck_switched = True
-                    self._queue_injection(
-                        "[方向切换] 已连续多轮无新进展，当前这条思路很可能已死，但不代表题无解。"
-                        "请立即：1) idea_list 看未探索方向；2) 用 skill_load 加载一个不同的章节；"
-                        "3) 换完全不同的攻击面（认证→文件读取/SSRF/反序列化/中间件 CVE 等）。"
-                    )
 
             _emit("round_start", {"round": self.round})
             self.observer.on_round_start(self.round)
@@ -487,20 +480,41 @@ class SolverAgent:
             msg = response.choices[0].message
             self.messages.append(assistant_message_dict(msg))
 
-            # 无工具调用时追加一次明确的执行提示。
+            # 无工具调用是“操作失败”，不是题目终态。前四次免费 nudge；
+            # 连续第五次升级为“当前执行策略失败”并消耗一轮，但仍继续。
+            # 这样 easy 不会因模型偶发漏 tool_call 被直接判 0 分，也不会因
+            # 一直撤销轮次而形成无限循环。
             if not msg.tool_calls:
                 consecutive_empty += 1
-                if consecutive_empty >= 5:
-                    self._finish_execution("stuck_no_tool")
-                    _emit("agent_end", {"rounds": self.round, "reason": "stuck_no_tool"})
-                    return
-                # nudge：撤销本轮计数，追加 user 消息后重试
-                self._release_portfolio_round()
-                self.round -= 1
+                _emit("failure_classified", {
+                    "scope": FailureScope.ACTION.value,
+                    "round": self.round,
+                    "reason": "missing_tool_call",
+                    "streak": consecutive_empty,
+                    "terminal": False,
+                })
                 probe = self._default_probe()
+                if consecutive_empty < 5:
+                    self._release_portfolio_round()
+                    self.round -= 1
+                    self.messages.append({
+                        "role": "user",
+                        "content": f"请立即调用 bash 工具执行：{probe}",
+                    })
+                    continue
+                consecutive_empty = 0
+                decision = ControlDecision(
+                    action=ControlAction.SWITCH_STRATEGY.value,
+                    reason="repeated_missing_tool_call",
+                    failure_scope=FailureScope.STRATEGY.value,
+                )
+                self._record_strategy_failure(decision)
                 self.messages.append({
                     "role": "user",
-                    "content": f"请立即调用 bash 工具执行：{probe}",
+                    "content": (
+                        "[操作失败恢复] 连续回复未执行工具不代表题目不可解。"
+                        f"现在必须执行一个可验证动作，建议先调用 bash：{probe}"
+                    ),
                 })
                 continue
 
@@ -560,21 +574,15 @@ class SolverAgent:
                     "已记录" in result or "已添加" in result
                 ) and "已存在" not in result:
                     # 任何 memory_add 都算进展（旧版宽松语义，保留探索机会）
-                    self._last_progress_round = self.round
-                    self._last_discovery_round = self.round
-                    self._material_progress_count += 1
+                    self._mark_material_progress()
                 elif tool_name == "challenge_submit_flag" and (
                     "[✓]" in result and "[重复]" not in result
                 ):
-                    self._last_progress_round = self.round
-                    self._last_discovery_round = self.round
-                    self._material_progress_count += 1
+                    self._mark_material_progress()
                 elif tool_name in ("bash", "read_file", "grep") and self._bash_is_progress(result):
                     # 无指纹去重：每次出现新结构化证据都刷新停机计数，
                     # 重复 HTTP 200/IP 不再被去重误判为“死循环”。
-                    self._last_progress_round = self.round
-                    self._last_discovery_round = self.round
-                    self._material_progress_count += 1
+                    self._mark_material_progress()
 
                 # ━━ 自动提交工具输出中发现的 flag（不依赖 LLM 主动提交）━━
                 if tool_name in ("bash", "read_file", "grep"):
@@ -582,9 +590,7 @@ class SolverAgent:
                     if auto_note:
                         result = result + "\n" + auto_note
                         if "[✓]" in auto_note and "[重复]" not in auto_note:
-                            self._last_progress_round = self.round
-                            self._last_discovery_round = self.round
-                            self._material_progress_count += 1
+                            self._mark_material_progress()
 
                 # P0 decision control: keep the legacy soft-progress counter
                 # for benchmark continuity, while a separate durable control
@@ -656,6 +662,12 @@ class SolverAgent:
                         "若连续多个方向都没有新证据，按控制策略切换或结束本题。"
                     )
                 elif tool_name == "challenge_submit_flag" and ("提交错误" in result or "[✗]" in result):
+                    _emit("failure_classified", {
+                        "scope": FailureScope.ACTION.value,
+                        "round": self.round,
+                        "reason": "wrong_submission",
+                        "terminal": False,
+                    })
                     # 连续错误提交：停止盲目猜，强制回到证据分析。避免 f2-05 类
                     # 题连续猜 key 烧完提交额度。
                     self._wrong_submit_streak += 1
@@ -1231,9 +1243,24 @@ class SolverAgent:
                 tool_args,
                 result,
                 round_num,
+                allow_switch=(
+                    self._deep_controls_active() and self._difficulty != "easy"
+                ),
             )
             try:
-                _emit("decision_observation", controller.summary())
+                summary = controller.summary()
+                _emit("decision_observation", summary)
+                if summary.get("last_outcome") in {
+                    ActionOutcomeKind.TIMEOUT.value,
+                    ActionOutcomeKind.ERROR.value,
+                    ActionOutcomeKind.BLOCKED.value,
+                }:
+                    _emit("failure_classified", {
+                        "scope": FailureScope.ACTION.value,
+                        "round": round_num,
+                        "outcome": summary.get("last_outcome"),
+                        "terminal": False,
+                    })
             except Exception:
                 pass
             if advice is None:
@@ -1241,8 +1268,7 @@ class SolverAgent:
             _emit("strategy_advice", advice.to_dict())
             if advice.action == "switch_strategy":
                 if not getattr(self, "_inject_strategy_switch", True):
-                    # easy 题不注入策略切换，保留旧的方向切换逻辑兜底，
-                    # 避免简单题被“切换思考模式”带偏。
+                    # easy/Fast Lane 只记录证据，不执行无进展强制换向。
                     _emit("strategy_switch_suppressed", {
                         "round": round_num,
                         "difficulty": self._difficulty,
@@ -1250,6 +1276,11 @@ class SolverAgent:
                         "reason": advice.reason,
                     })
                     return
+                self._record_strategy_failure(ControlDecision(
+                    action=ControlAction.SWITCH_STRATEGY.value,
+                    reason=advice.reason,
+                    failure_scope=FailureScope.STRATEGY.value,
+                ))
                 # Suppress the older one-shot switch injection; the durable
                 # controller has already accounted for this challenge across
                 # aggressive/steady attempts.
@@ -1535,46 +1566,83 @@ class SolverAgent:
 
     @staticmethod
     def _classify_lane(difficulty: str, pentest: bool, ctype: bool) -> str:
-        """Fast Lane 只给简单题：easy + 简单 medium；其余走 Deep Lane。"""
-        if difficulty in ("hard", "difficult"):
-            return "deep"
-        if pentest or ctype:
-            return "deep"
-        return "fast"
+        """Fast Lane 只给简单题：easy + 普通 medium；其余直接 Deep。"""
+        if difficulty in ("hard", "difficult") or pentest or ctype:
+            return LaneMode.DEEP.value
+        return LaneMode.FAST.value
 
     def _current_lane(self) -> str:
         """升级后的 fast lane 视为 deep lane。"""
-        return "deep" if self._lane_upgraded else self._lane
+        return (
+            LaneMode.DEEP.value
+            if getattr(self, "_lane_upgraded", False)
+            else self._lane
+        )
 
     def _deep_controls_active(self) -> bool:
-        return self._current_lane() == "deep"
+        if not hasattr(self, "_lane"):
+            return bool(getattr(self, "_inject_strategy_switch", False))
+        return self._current_lane() == LaneMode.DEEP.value
 
-    def _terminate_reason(self) -> str:
-        """单一终态决策：返回停止原因或空串。
-
-        终止层级（从轻到重）：
-        - 某次操作失败（连接超时/404/payload 被拒）：不终止，换参数/入口重试或记录边界
-        - 当前策略失败（同一方向连续无新证据）：Deep Lane 注入方向切换，仍不终止
-        - 长期无新证据：Deep Lane 触发无进展早停（force_stop / hint_exhausted）
-        - 预算耗尽/截止：max_rounds / deadline 兜底终止（所有 lane）
-
-        fast lane 只保留最后一层，简单题不因“暂时无新证据”被提前终止。
-        ``_last_progress_round`` 只在新证据/新增记忆/首次正确提交时更新，
-        因此重复请求和重复提交不会把停机计数清零。
-        """
-        if not self._deep_controls_active():
-            return ""
-        reason = self._control_policy.stop_reason(
-            self.round, self._last_progress_round
+    def _runtime_control_decision(self) -> ControlDecision:
+        """唯一的 lane/switch/no-progress 终态入口。"""
+        return self._control_policy.decide(
+            round_num=self.round,
+            last_progress_round=self._last_progress_round,
+            lane=self._current_lane(),
+            lane_entered_round=getattr(self, "_lane_entered_round", 0),
+            strategy_failures=getattr(self, "_strategy_failure_count", 0),
+            switch_already_requested=getattr(self, "_stuck_switched", False),
+            hint_focus_exhausted=self._hint_focus_exhausted(),
         )
-        if reason:
-            _emit("force_stop", {
-                "round": self.round,
-                "reason": reason,
-                "difficulty": self._difficulty,
-                "lane": self._current_lane(),
-            })
-            return "force_stop_no_progress"
-        if self._hint_focus_exhausted():
-            return "hint_exhausted_no_progress"
-        return ""
+
+    def _upgrade_to_deep_lane(self, decision: ControlDecision) -> None:
+        """Activate richer supervision without inheriting stale Fast-Lane idle."""
+        self._lane_upgraded = True
+        self._lane_entered_round = self.round
+        # easy gets Observer/recovery help after upgrade, but keeps the hard
+        # invariant of no forced switch and no no-progress early stop.
+        self._inject_strategy_switch = self._difficulty != "easy"
+        if getattr(self, "_observer_permitted", True):
+            if not self.observer.enabled:
+                self.observer.enabled = True
+            bash_tool.register_observer_trigger(
+                lambda reason="": self.observer.trigger_now(reason=reason)
+            )
+        _emit("lane_upgrade", {
+            "round": self.round,
+            "difficulty": self._difficulty,
+            "reason": decision.reason,
+            "no_progress_stop_allowed": (
+                self._control_policy.allows_no_progress_intervention
+            ),
+        })
+        self._queue_injection(
+            "[Fast Lane → Deep Lane] 直接解法尚未完成，现启用结构化复盘。"
+            "先整理已验证事实与失败边界，再继续最接近成功的验证；"
+            "单次操作失败不是策略失败，更不代表题目不可解。"
+        )
+
+    def _record_strategy_failure(self, decision: ControlDecision) -> None:
+        """Record a failed direction; this is non-terminal by definition."""
+        self._strategy_failure_count = (
+            getattr(self, "_strategy_failure_count", 0) + 1
+        )
+        event_round = int(getattr(self, "round", 0) or 0)
+        self._last_strategy_failure_round = event_round
+        _emit("failure_classified", {
+            "scope": FailureScope.STRATEGY.value,
+            "round": event_round,
+            "reason": decision.reason,
+            "count_since_progress": self._strategy_failure_count,
+            "terminal": False,
+        })
+
+    def _mark_material_progress(self) -> None:
+        """Start a fresh control epoch after useful evidence."""
+        self._last_progress_round = self.round
+        self._last_discovery_round = self.round
+        self._material_progress_count += 1
+        self._strategy_failure_count = 0
+        self._last_strategy_failure_round = 0
+        self._stuck_switched = False

@@ -99,6 +99,27 @@ class StrategyControllerTests(unittest.TestCase):
         self.assertEqual(state.same_action_streak, 4)
         self.assertEqual(state.switch_count, 1)
 
+    def test_fast_lane_records_evidence_without_consuming_a_switch(self):
+        controller = StrategyController(
+            self.root,
+            switch_after=6,
+            action_repeat_threshold=3,
+        )
+        output = "HTTP/1.1 200 OK\nServer: demo"
+        for round_num in range(1, 7):
+            advice = controller.observe(
+                "bash",
+                {"cmd": "curl http://target/"},
+                output,
+                round_num,
+                allow_switch=False,
+            )
+            self.assertIsNone(advice)
+
+        state = controller.snapshot()
+        self.assertEqual(state.total_actions, 6)
+        self.assertEqual(state.switch_count, 0)
+
     def test_switch_advice_has_a_cooldown(self):
         controller = StrategyController(
             self.root,
@@ -235,7 +256,7 @@ class StrategySwitchInjectionTests(unittest.TestCase):
         agent._strategy_controller = controller
         return agent
 
-    def test_easy_does_not_inject_switch_and_keeps_legacy_fallback(self):
+    def test_easy_does_not_inject_any_strategy_switch(self):
         agent = self._make_agent(inject_switch=False)
 
         agent._record_strategy_observation(
@@ -257,10 +278,11 @@ class StrategySwitchInjectionTests(unittest.TestCase):
 
 
 class LaneTerminationTests(unittest.TestCase):
-    """Fast Lane / Deep Lane 升级与终态决策。"""
+    """Fast/Deep Lane and the single no-progress terminal authority."""
 
     def _make(self, lane: str, *, upgraded: bool = False, rounds: int = 0,
-              last_progress: int = 0, difficulty: str = "easy"):
+              last_progress: int = 0, difficulty: str = "easy",
+              lane_entered: int = 0, strategy_failures: int = 0):
         from solver.agent import SolverAgent
         from solver.runtime.control import ControlPolicy
 
@@ -268,6 +290,9 @@ class LaneTerminationTests(unittest.TestCase):
         agent._lane = lane
         agent._fast_lane = lane == "fast"
         agent._lane_upgraded = upgraded
+        agent._lane_entered_round = lane_entered
+        agent._strategy_failure_count = strategy_failures
+        agent._stuck_switched = False
         agent.round = rounds
         agent._last_progress_round = last_progress
         agent._difficulty = difficulty
@@ -288,23 +313,56 @@ class LaneTerminationTests(unittest.TestCase):
         self.assertEqual(SolverAgent._classify_lane("medium", True, False), "deep")
         self.assertEqual(SolverAgent._classify_lane("medium", False, True), "deep")
 
-    def test_fast_lane_does_not_early_stop_on_no_progress(self):
-        # easy 的 stop_after=20，但 fast lane 不因无进展提前停。
-        agent = self._make("fast", rounds=39, last_progress=0)
-        self.assertEqual(agent._terminate_reason(), "")
-        self.assertFalse(agent._deep_controls_active())
+    def test_easy_fast_lane_upgrades_instead_of_stopping(self):
+        from solver.runtime.control import ControlAction
 
-    def test_deep_lane_stops_after_no_progress(self):
-        # easy 难度（stop_after=20）但强制 deep lane，仍按无进展早停。
-        agent = self._make("deep", rounds=21, last_progress=0, difficulty="easy")
-        self.assertEqual(agent._terminate_reason(), "force_stop_no_progress")
+        agent = self._make("fast", rounds=20, last_progress=0)
+        decision = agent._runtime_control_decision()
+        self.assertEqual(decision.action, ControlAction.UPGRADE_LANE.value)
+        self.assertFalse(decision.terminal)
 
-    def test_upgraded_fast_lane_acts_as_deep(self):
+    def test_easy_never_idle_stops_or_forced_switches_even_after_upgrade(self):
+        from solver.runtime.control import ControlAction
+
         agent = self._make(
-            "fast", upgraded=True, rounds=21, last_progress=0, difficulty="easy"
+            "fast", upgraded=True, rounds=39, last_progress=0,
+            difficulty="easy", lane_entered=20, strategy_failures=9,
         )
         self.assertTrue(agent._deep_controls_active())
-        self.assertEqual(agent._terminate_reason(), "force_stop_no_progress")
+        decision = agent._runtime_control_decision()
+        self.assertEqual(decision.action, ControlAction.CONTINUE.value)
+        self.assertFalse(decision.terminal)
+
+    def test_medium_upgrade_starts_a_fresh_idle_epoch(self):
+        from solver.runtime.control import ControlAction
+
+        agent = self._make(
+            "fast", upgraded=True, rounds=21, last_progress=0,
+            difficulty="medium", lane_entered=20,
+        )
+        decision = agent._runtime_control_decision()
+        self.assertEqual(decision.action, ControlAction.CONTINUE.value)
+        self.assertEqual(decision.idle_rounds, 1)
+
+    def test_medium_requires_multiple_failed_strategies_before_terminal(self):
+        from solver.runtime.control import ControlAction
+
+        one = self._make(
+            "deep", rounds=40, last_progress=0, difficulty="medium",
+            strategy_failures=1,
+        )
+        one._stuck_switched = True
+        self.assertEqual(
+            one._runtime_control_decision().action,
+            ControlAction.CONTINUE.value,
+        )
+
+        two = self._make(
+            "deep", rounds=40, last_progress=0, difficulty="medium",
+            strategy_failures=2,
+        )
+        two._stuck_switched = True
+        self.assertTrue(two._runtime_control_decision().terminal)
 
 
 if __name__ == "__main__":
