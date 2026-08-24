@@ -93,6 +93,13 @@ elif [ -f "$PROJECT_DIR/settings.json" ]; then
     SETTINGS_MOUNT=(-v "$PROJECT_DIR/settings.json:/workspace/settings.json:ro")
 fi
 
+# LLM 环境变量：仅在显式设置时覆盖镜像 ENV 默认；否则用镜像内置配置。
+LLM_ENV_ARGS=()
+if [ -n "${LLM_BASE_URL:-}" ]; then LLM_ENV_ARGS+=(-e "LLM_BASE_URL=${LLM_BASE_URL}"); fi
+if [ -n "${LLM_API_KEY:-}" ]; then LLM_ENV_ARGS+=(-e "LLM_API_KEY=${LLM_API_KEY}"); fi
+if [ -n "${LLM_MODEL:-}" ]; then LLM_ENV_ARGS+=(-e "LLM_MODEL=${LLM_MODEL}"); fi
+if [ -n "${LLM_GATEWAY:-}" ]; then LLM_ENV_ARGS+=(-e "LLM_GATEWAY=${LLM_GATEWAY}"); fi
+
 docker run --rm --network host \
   --name eva-mimir-run \
   -e BENCHMARK_BASE_URL="$BASE_URL" \
@@ -102,11 +109,8 @@ docker run --rm --network host \
   -e SOLVER_MAX_PARALLEL="${SOLVER_MAX_PARALLEL:-3}" \
   -e SOLVER_MAX_RETRY_ROUNDS="${SOLVER_MAX_RETRY_ROUNDS:-5}" \
   -e SOLVER_TOTAL_TIMEOUT="${SOLVER_TOTAL_TIMEOUT:-350}" \
-  -e LLM_BASE_URL="${LLM_BASE_URL:-}" \
-  -e LLM_API_KEY="${LLM_API_KEY:-}" \
-  -e LLM_MODEL="${LLM_MODEL:-deepseek-v4-flash}" \
-  -e LLM_GATEWAY="${LLM_GATEWAY:-1}" \
   -e LLM_MAX_CONCURRENCY="${LLM_MAX_CONCURRENCY:-4}" \
+  "${LLM_ENV_ARGS[@]}" \
   "${PREFIX_ENV[@]}" \
   "${SETTINGS_MOUNT[@]}" \
   -v "$PROJECT_DIR/workspace:/workspace" \

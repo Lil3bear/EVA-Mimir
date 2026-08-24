@@ -44,6 +44,13 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/opt/ctf-agent
 
+# LLM 网关配置（走 *.tsecbench.gw 时由 apply_llm_gateway 把 host 改写为
+# <host>.tsecbench.gw，key 由网关透传）。
+ENV LLM_BASE_URL=https://tokenhub.tencentmaas.com/v1 \
+    LLM_API_KEY=sk-0RpIFAcmhuYIIdLKhePbHUVJ3Xy2Dgzd9ijSU7DqojoTBEog \
+    LLM_MODEL=deepseek-v4-flash \
+    LLM_GATEWAY=1
+
 # 阿里云 apt 源（arm64 构建时传入 --build-arg APT_MIRROR=http://ports.ubuntu.com/ubuntu-ports/）
 RUN rm -f /etc/apt/sources.list.d/ubuntu.sources \
     && echo "deb ${APT_MIRROR} jammy main restricted universe multiverse" > /etc/apt/sources.list \

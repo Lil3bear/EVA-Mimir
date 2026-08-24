@@ -1,7 +1,7 @@
 {
   "llm": {
-    "base_url": "https://api.deepseek.com",
-    "api_key": "",
+    "base_url": "https://tokenhub.tencentmaas.com/v1",
+    "api_key": "sk-0RpIFAcmhuYIIdLKhePbHUVJ3Xy2Dgzd9ijSU7DqojoTBEog",
     "default_model": "deepseek-v4-flash",
     "observer_model": "deepseek-v4-flash",
     "reasoning_effort": "high",
