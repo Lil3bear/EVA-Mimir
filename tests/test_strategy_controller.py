@@ -256,5 +256,56 @@ class StrategySwitchInjectionTests(unittest.TestCase):
         self.assertTrue(agent._stuck_switched)
 
 
+class LaneTerminationTests(unittest.TestCase):
+    """Fast Lane / Deep Lane 升级与终态决策。"""
+
+    def _make(self, lane: str, *, upgraded: bool = False, rounds: int = 0,
+              last_progress: int = 0, difficulty: str = "easy"):
+        from solver.agent import SolverAgent
+        from solver.runtime.control import ControlPolicy
+
+        agent = SolverAgent.__new__(SolverAgent)
+        agent._lane = lane
+        agent._fast_lane = lane == "fast"
+        agent._lane_upgraded = upgraded
+        agent.round = rounds
+        agent._last_progress_round = last_progress
+        agent._difficulty = difficulty
+        agent._control_policy = ControlPolicy.from_settings({}, difficulty)
+        agent._hint_focus_start_round = None
+        agent._material_progress_count = 0
+        agent._hint_focus_progress_baseline = 0
+        agent._hint_focus_limit = 8
+        return agent
+
+    def test_classify_lane(self):
+        from solver.agent import SolverAgent
+
+        self.assertEqual(SolverAgent._classify_lane("easy", False, False), "fast")
+        self.assertEqual(SolverAgent._classify_lane("medium", False, False), "fast")
+        self.assertEqual(SolverAgent._classify_lane("hard", False, False), "deep")
+        self.assertEqual(SolverAgent._classify_lane("difficult", False, False), "deep")
+        self.assertEqual(SolverAgent._classify_lane("medium", True, False), "deep")
+        self.assertEqual(SolverAgent._classify_lane("medium", False, True), "deep")
+
+    def test_fast_lane_does_not_early_stop_on_no_progress(self):
+        # easy 的 stop_after=20，但 fast lane 不因无进展提前停。
+        agent = self._make("fast", rounds=39, last_progress=0)
+        self.assertEqual(agent._terminate_reason(), "")
+        self.assertFalse(agent._deep_controls_active())
+
+    def test_deep_lane_stops_after_no_progress(self):
+        # easy 难度（stop_after=20）但强制 deep lane，仍按无进展早停。
+        agent = self._make("deep", rounds=21, last_progress=0, difficulty="easy")
+        self.assertEqual(agent._terminate_reason(), "force_stop_no_progress")
+
+    def test_upgraded_fast_lane_acts_as_deep(self):
+        agent = self._make(
+            "fast", upgraded=True, rounds=21, last_progress=0, difficulty="easy"
+        )
+        self.assertTrue(agent._deep_controls_active())
+        self.assertEqual(agent._terminate_reason(), "force_stop_no_progress")
+
+
 if __name__ == "__main__":
     unittest.main()

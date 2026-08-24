@@ -162,6 +162,14 @@ class SolverAgent:
         self.max_rounds = self._control_policy.max_rounds
         self._switch_after_rounds = self._control_policy.switch_after
         self._stop_after_rounds = self._control_policy.stop_after
+        # Fast Lane / Deep Lane：简单题（easy + 简单 medium）走直接执行路径，
+        # 不承担完整控制面成本；复杂题（hard/difficult/pentest/ctype）走 Deep Lane。
+        # fast lane 不因“暂时无新证据”提前停，只用 max_rounds 兜底。
+        self._lane = self._classify_lane(difficulty, is_pentest, is_ctype)
+        self._fast_lane = self._lane == "fast"
+        self._lane_upgraded = False
+        # fast lane 运行到该轮次仍未解，升级到 deep lane 启用完整控制。
+        self._upgrade_after = {"easy": 15, "medium": 20}.get(difficulty, 0)
         # hint 严格门：低于该轮次禁止看提示（提示会扣分，先自己跑 loop）。
         # 难题更早允许看 hint：hard/difficult 解不出风险高，hint 价值/成本比更高；
         # 显式配置 hint_min_round 时以配置为准。
@@ -234,7 +242,8 @@ class SolverAgent:
         else:
             inject_easy = bool(raw_inject_easy)
         self._inject_strategy_switch = (
-            difficulty in ("medium", "hard", "difficult") or inject_easy
+            not self._fast_lane
+            and (difficulty in ("medium", "hard", "difficult") or inject_easy)
         )
         self._material_progress_count = 0
         try:
@@ -331,8 +340,16 @@ class SolverAgent:
         )
         # ✅ 使用统一控制策略的 Observer 频率
         observer_every = self._control_policy.observer_every_rounds
+        # fast lane 默认关闭 Observer，避免简单题被旁路强干预带偏；
+        # 升级到 deep lane 后再动态启用。
+        observer_enabled = bool(
+            settings.get("solver", {}).get("observer_enabled", True)
+        ) and not self._fast_lane
         self.observer = ObserverLoop(
-            settings={**settings, "solver": {**settings.get("solver", {}), "observer_every_rounds": observer_every}},
+            settings={**settings, "solver": {**settings.get("solver", {}),
+                "observer_every_rounds": observer_every,
+                "observer_enabled": observer_enabled,
+            }},
             on_correction=self.inject_message,
         )
         # 注册 approach 循环触发 Observer 的回调
@@ -375,42 +392,58 @@ class SolverAgent:
                 _emit("agent_end", {"rounds": self.round, "reason": "multi_solver_other_won"})
                 return
 
-            # ━━ 硬约束：deadline/无进展强制停止（代码层，不靠 Observer） ━━
+            # ━━ Fast Lane → Deep Lane 升级：简单题跑了 upgrade_after 轮仍未解，
+            # 说明复杂度被低估，启用完整策略控制（Observer + 方向切换 + 无进展早停）。━━
+            if (
+                self._fast_lane
+                and not self._lane_upgraded
+                and self._upgrade_after
+                and self.round >= self._upgrade_after
+            ):
+                self._lane_upgraded = True
+                self._inject_strategy_switch = True
+                if not self.observer.enabled:
+                    self.observer.enabled = True
+                _emit("lane_upgrade", {
+                    "round": self.round,
+                    "difficulty": self._difficulty,
+                })
+                self._queue_injection(
+                    "[复杂度升级] 本题比预期更复杂，已启用完整策略控制。"
+                    "请审视已尝试方向，避免同一路线低效重复；"
+                    "但若当前已接近答案，先完成验证再换方向。"
+                )
+
+            # ━━ 硬约束：deadline（所有 lane 生效） ━━
             if self._deadline_exceeded():
                 self.observer.stop()
                 self._finish_execution("deadline_exceeded")
                 _emit("agent_end", {"rounds": self.round, "reason": "deadline_exceeded"})
                 return
-            if self._should_force_stop():
+
+            # ━━ 单一终态决策：无进展早停只对 Deep Lane 生效。
+            # fast lane 不因“无新证据”提前停，只用 max_rounds 兜底。━━
+            terminate_reason = self._terminate_reason()
+            if terminate_reason:
                 self.observer.stop()
-                self._finish_execution("force_stop_no_progress")
-                _emit("agent_end", {"rounds": self.round, "reason": "force_stop_no_progress"})
-                return
-            if self._hint_focus_exhausted():
-                self.observer.stop()
-                self._finish_execution("hint_exhausted_no_progress")
+                self._finish_execution(terminate_reason)
                 _emit("agent_end", {
                     "rounds": self.round,
-                    "reason": "hint_exhausted_no_progress",
-                    "hint_focus_rounds": self.round - self._hint_focus_start_round,
+                    "reason": terminate_reason,
                 })
                 return
 
-            # ━━ 及时刹停（分级）：先换方向，换方向后仍无进展才停 ━━
-            # 关键：区分“这条思路死”和“题无解”——先切方向，不要一停到底。
-            stuck_rounds = self.round - self._last_progress_round
-            if stuck_rounds > self._switch_after_rounds and not self._stuck_switched:
-                self._stuck_switched = True
-                self._queue_injection(
-                    "[方向切换] 已连续多轮无新进展，当前这条思路很可能已死，但不代表题无解。"
-                    "请立即：1) idea_list 看未探索方向；2) 用 skill_load 加载一个不同的章节；"
-                    "3) 换完全不同的攻击面（认证→文件读取/SSRF/反序列化/中间件 CVE 等）。"
-                )
-            if stuck_rounds > self._stop_after_rounds:
-                self.observer.stop()
-                self._finish_execution("stuck_no_progress")
-                _emit("agent_end", {"rounds": self.round, "reason": "stuck_no_progress"})
-                return
+            # ━━ 方向切换（仅 Deep Lane）：先换方向，换方向后仍无进展才由
+            # 上面的 _terminate_reason 停。区分“思路死”和“题无解”。━━
+            if self._deep_controls_active():
+                stuck_rounds = self.round - self._last_progress_round
+                if stuck_rounds > self._switch_after_rounds and not self._stuck_switched:
+                    self._stuck_switched = True
+                    self._queue_injection(
+                        "[方向切换] 已连续多轮无新进展，当前这条思路很可能已死，但不代表题无解。"
+                        "请立即：1) idea_list 看未探索方向；2) 用 skill_load 加载一个不同的章节；"
+                        "3) 换完全不同的攻击面（认证→文件读取/SSRF/反序列化/中间件 CVE 等）。"
+                    )
 
             _emit("round_start", {"round": self.round})
             self.observer.on_round_start(self.round)
@@ -1500,20 +1533,48 @@ class SolverAgent:
             and self.round - start > self._hint_focus_limit
         )
 
-    def _should_force_stop(self) -> bool:
-        """统一控制面上的无进展停止判断。
+    @staticmethod
+    def _classify_lane(difficulty: str, pentest: bool, ctype: bool) -> str:
+        """Fast Lane 只给简单题：easy + 简单 medium；其余走 Deep Lane。"""
+        if difficulty in ("hard", "difficult"):
+            return "deep"
+        if pentest or ctype:
+            return "deep"
+        return "fast"
 
+    def _current_lane(self) -> str:
+        """升级后的 fast lane 视为 deep lane。"""
+        return "deep" if self._lane_upgraded else self._lane
+
+    def _deep_controls_active(self) -> bool:
+        return self._current_lane() == "deep"
+
+    def _terminate_reason(self) -> str:
+        """单一终态决策：返回停止原因或空串。
+
+        终止层级（从轻到重）：
+        - 某次操作失败（连接超时/404/payload 被拒）：不终止，换参数/入口重试或记录边界
+        - 当前策略失败（同一方向连续无新证据）：Deep Lane 注入方向切换，仍不终止
+        - 长期无新证据：Deep Lane 触发无进展早停（force_stop / hint_exhausted）
+        - 预算耗尽/截止：max_rounds / deadline 兜底终止（所有 lane）
+
+        fast lane 只保留最后一层，简单题不因“暂时无新证据”被提前终止。
         ``_last_progress_round`` 只在新证据/新增记忆/首次正确提交时更新，
         因此重复请求和重复提交不会把停机计数清零。
         """
+        if not self._deep_controls_active():
+            return ""
         reason = self._control_policy.stop_reason(
             self.round, self._last_progress_round
         )
-        if not reason:
-            return False
-        _emit("force_stop", {
-            "round": self.round,
-            "reason": reason,
-            "difficulty": self._difficulty,
-        })
-        return True
+        if reason:
+            _emit("force_stop", {
+                "round": self.round,
+                "reason": reason,
+                "difficulty": self._difficulty,
+                "lane": self._current_lane(),
+            })
+            return "force_stop_no_progress"
+        if self._hint_focus_exhausted():
+            return "hint_exhausted_no_progress"
+        return ""
