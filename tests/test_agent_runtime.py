@@ -457,5 +457,49 @@ class FlagEvidenceGateTests(unittest.TestCase):
         self.assertTrue(agent._flag_has_evidence("flag{old_flag_9}"))
 
 
+class ApproachBudgetTests(unittest.TestCase):
+    """分题型防爆破：只 block 当前目标 host，内网 host（横向移动）豁免。"""
+
+    def _bind(self, target_url):
+        base = tempfile.mkdtemp(prefix="approach-budget-")
+        context = RunContext.create(base, "case", target_url=target_url)
+        return ctx.bind(context)
+
+    def test_target_host_is_strict(self):
+        from solver.tools import bash_tool
+
+        with self._bind("http://10.0.0.1:80"):
+            self.assertTrue(bash_tool._url_targets_current_target("curl http://10.0.0.1/"))
+            self.assertTrue(
+                bash_tool._url_targets_current_target("curl http://10.0.0.1:80/api?aid=1")
+            )
+
+    def test_internal_host_is_exempt(self):
+        from solver.tools import bash_tool
+
+        with self._bind("http://10.0.0.1:80"):
+            # 横向移动：访问内网其他 IP，不受防爆破 block
+            self.assertFalse(
+                bash_tool._url_targets_current_target("curl http://10.0.1.2:80/")
+            )
+            # shell 循环变量做 host（for ip in ...）也豁免
+            self.assertFalse(
+                bash_tool._url_targets_current_target(
+                    "for ip in 10.0.1.2 10.0.1.3; do curl http://$ip:80/; done"
+                )
+            )
+
+    def test_ssrf_probe_still_targets_host(self):
+        from solver.tools import bash_tool
+
+        with self._bind("http://10.0.0.1:80"):
+            # SSRF 请求发往目标 host，仍受预算约束（防扫内网端口）
+            self.assertTrue(
+                bash_tool._url_targets_current_target(
+                    "curl http://10.0.0.1/fetch?url=http://127.0.0.1:8080"
+                )
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

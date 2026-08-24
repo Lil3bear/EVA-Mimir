@@ -115,6 +115,24 @@ def _target_hostname(target_url: str | None = None) -> str:
         return ""
 
 
+def _url_targets_current_target(cmd: str) -> bool:
+    """Whether the HTTP request is aimed at the current challenge target.
+
+    The 3-times budget only protects the *current* target host from brute
+    force (same URL structure with different action ids / paths / passwords).
+    Requests to *other* hosts — pentest lateral movement, SSRF internal
+    probing — are legitimate information gathering and must not be blocked.
+    """
+    host = _extract_host(cmd)
+    if not host:
+        return True  # 无法解析时保守按目标处理
+    hostname = host.split(":", 1)[0]
+    target = _target_hostname()
+    if not target:
+        return True
+    return hostname == target
+
+
 def _inline_http_variant_count(cmd: str) -> int:
     """Count values in a shell ``for ... in ...`` loop that drives HTTP calls."""
     if "curl" not in cmd.lower() or not re.search(r'https?://', cmd, re.IGNORECASE):
@@ -236,7 +254,10 @@ def execute(args: dict) -> str:
         variant_count = _inline_http_variant_count(cmd)
         previous_count = _ctx.approach_counter[url_pattern]
         approach_count = previous_count + variant_count
-        if approach_count > _APPROACH_BLOCK_THRESHOLD:
+        # 分题型防爆破：只对“当前目标 host”的请求严格 block；内网其他 host
+        # （pentest 横向移动 / SSRF 内网探测）只警告不 block。
+        targets_current = _url_targets_current_target(cmd)
+        if targets_current and approach_count > _APPROACH_BLOCK_THRESHOLD:
             _ctx.approach_counter[url_pattern] = _APPROACH_BLOCK_THRESHOLD + 1
             if previous_count <= _APPROACH_BLOCK_THRESHOLD and _ctx.observer_trigger_callback:
                 _ctx.observer_trigger_callback(reason=f"approach_blocked:{url_pattern[:60]}")
