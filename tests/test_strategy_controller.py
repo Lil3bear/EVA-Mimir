@@ -316,7 +316,7 @@ class LaneTerminationTests(unittest.TestCase):
     def test_easy_fast_lane_upgrades_instead_of_stopping(self):
         from solver.runtime.control import ControlAction
 
-        agent = self._make("fast", rounds=20, last_progress=0)
+        agent = self._make("fast", rounds=30, last_progress=0)
         decision = agent._runtime_control_decision()
         self.assertEqual(decision.action, ControlAction.UPGRADE_LANE.value)
         self.assertFalse(decision.terminal)
@@ -326,7 +326,7 @@ class LaneTerminationTests(unittest.TestCase):
 
         agent = self._make(
             "fast", upgraded=True, rounds=39, last_progress=0,
-            difficulty="easy", lane_entered=20, strategy_failures=9,
+            difficulty="easy", lane_entered=30, strategy_failures=9,
         )
         self.assertTrue(agent._deep_controls_active())
         decision = agent._runtime_control_decision()
@@ -337,8 +337,8 @@ class LaneTerminationTests(unittest.TestCase):
         from solver.runtime.control import ControlAction
 
         agent = self._make(
-            "fast", upgraded=True, rounds=21, last_progress=0,
-            difficulty="medium", lane_entered=20,
+            "fast", upgraded=True, rounds=31, last_progress=0,
+            difficulty="medium", lane_entered=30,
         )
         decision = agent._runtime_control_decision()
         self.assertEqual(decision.action, ControlAction.CONTINUE.value)

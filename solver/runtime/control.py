@@ -28,7 +28,7 @@ _DEFAULT_SWITCH_AFTER = {"easy": 10, "medium": 12, "hard": 12, "difficult": 12}
 _DEFAULT_STOP_AFTER = {"easy": 20, "medium": 30, "hard": 48, "difficult": 48}
 _STOP_PENTEST_EXTRA = 24
 _STOP_CTYPE_EXTRA = 12
-_FAST_LANE_ROUNDS = {"easy": 20, "medium": 20}
+_FAST_LANE_ROUNDS = {"easy": 30, "medium": 30}
 
 
 class LaneMode(str, Enum):
