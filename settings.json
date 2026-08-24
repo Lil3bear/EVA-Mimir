@@ -26,7 +26,8 @@
     "decision_control": {
       "enabled": true,
       "action_repeat_threshold": 4,
-      "vector_repeat_threshold": 4
+      "vector_repeat_threshold": 4,
+      "inject_switch_for_easy": false
     }
   }
 }

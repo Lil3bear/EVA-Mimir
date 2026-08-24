@@ -226,6 +226,16 @@ class SolverAgent:
             if challenge_dir and challenge_dir != "/workspace"
             else None
         )
+        # 策略切换注入的难度门槛：easy 题默认不注入（要稳定执行而非策略多样性），
+        # 避免简单题被“切换思考模式”带偏；medium/hard/difficult 保留注入。
+        raw_inject_easy = decision_cfg.get("inject_switch_for_easy", False)
+        if isinstance(raw_inject_easy, str):
+            inject_easy = raw_inject_easy.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            inject_easy = bool(raw_inject_easy)
+        self._inject_strategy_switch = (
+            difficulty in ("medium", "hard", "difficult") or inject_easy
+        )
         self._material_progress_count = 0
         try:
             cached_hints = self._ledger.cached_hints() if self._ledger else []
@@ -1197,6 +1207,16 @@ class SolverAgent:
                 return
             _emit("strategy_advice", advice.to_dict())
             if advice.action == "switch_strategy":
+                if not getattr(self, "_inject_strategy_switch", True):
+                    # easy 题不注入策略切换，保留旧的方向切换逻辑兜底，
+                    # 避免简单题被“切换思考模式”带偏。
+                    _emit("strategy_switch_suppressed", {
+                        "round": round_num,
+                        "difficulty": self._difficulty,
+                        "mode": advice.mode,
+                        "reason": advice.reason,
+                    })
+                    return
                 # Suppress the older one-shot switch injection; the durable
                 # controller has already accounted for this challenge across
                 # aggressive/steady attempts.

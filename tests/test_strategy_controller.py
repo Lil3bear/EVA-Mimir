@@ -2,6 +2,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock
 
 from solver.runtime.decision_state import (
     ActionOutcomeKind,
@@ -11,7 +12,7 @@ from solver.runtime.decision_state import (
 )
 from solver.runtime.observer_advice import ObserverAdvice
 from solver.runtime.portfolio import PortfolioBudget
-from solver.runtime.strategy_controller import StrategyController
+from solver.runtime.strategy_controller import ControlAdvice, StrategyController
 
 
 class DecisionStateClassificationTests(unittest.TestCase):
@@ -208,6 +209,51 @@ class PortfolioBudgetTests(unittest.TestCase):
         self.assertTrue(budget.claim_round("primary"))
         budget.release_round("primary")
         self.assertTrue(budget.claim_round("primary"))
+
+
+class StrategySwitchInjectionTests(unittest.TestCase):
+    """难度门槛：easy 题不注入策略切换，medium/hard 保留。"""
+
+    def _make_agent(self, inject_switch: bool):
+        from solver.agent import SolverAgent
+
+        agent = SolverAgent.__new__(SolverAgent)
+        agent._inject_strategy_switch = inject_switch
+        agent._stuck_switched = False
+        agent._pending_injections = []
+        agent._injection_lock = threading.Lock()
+        agent._difficulty = "hard" if inject_switch else "easy"
+        controller = MagicMock()
+        controller.observe.return_value = ControlAdvice(
+            action="switch_strategy",
+            mode="ALTERNATE",
+            reason="same_action_without_novel_evidence",
+            state_version=1,
+            round_num=5,
+        )
+        controller.summary.return_value = {"state_version": 1}
+        agent._strategy_controller = controller
+        return agent
+
+    def test_easy_does_not_inject_switch_and_keeps_legacy_fallback(self):
+        agent = self._make_agent(inject_switch=False)
+
+        agent._record_strategy_observation(
+            "bash", {"cmd": "curl http://target/"}, "HTTP/1.1 200 OK", 5
+        )
+
+        self.assertEqual(agent._pending_injections, [])
+        self.assertFalse(agent._stuck_switched)
+
+    def test_hard_injects_switch_and_suppresses_legacy_switch(self):
+        agent = self._make_agent(inject_switch=True)
+
+        agent._record_strategy_observation(
+            "bash", {"cmd": "curl http://target/"}, "HTTP/1.1 200 OK", 5
+        )
+
+        self.assertEqual(len(agent._pending_injections), 1)
+        self.assertTrue(agent._stuck_switched)
 
 
 if __name__ == "__main__":
