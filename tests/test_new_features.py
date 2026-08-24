@@ -223,7 +223,7 @@ class DifficultyMaxRoundsTests(unittest.TestCase):
             settings = {"llm": {"base_url": "http://x", "api_key": "k"}}
             return SolverAgent(task=task, settings=settings, skills_dir="/skills")
 
-        self.assertEqual(make("easy")._hint_min_round, 12)
+        self.assertEqual(make("easy")._hint_min_round, 8)
         self.assertEqual(make("medium")._hint_min_round, 8)
         self.assertEqual(make("hard")._hint_min_round, 6)
         self.assertEqual(make("difficult")._hint_min_round, 6)

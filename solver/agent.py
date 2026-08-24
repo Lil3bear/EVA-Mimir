@@ -184,7 +184,7 @@ class SolverAgent:
         # 显式配置 hint_min_round 时以配置为准。
         configured_hint_min = int(settings.get("solver", {}).get("hint_min_round", 0))
         self._hint_min_round = configured_hint_min or {
-            "easy": 12,
+            "easy": 8,
             "medium": 8,
             "hard": 6,
             "difficult": 6,
@@ -363,6 +363,10 @@ class SolverAgent:
             settings={**settings, "solver": {**settings.get("solver", {}),
                 "observer_every_rounds": observer_every,
                 "observer_enabled": observer_enabled,
+                # easy 不因无进展被强干预（看板维护仍保留）。
+                "observer_strong_intervention": (
+                    self._control_policy.allows_no_progress_intervention
+                ),
             }},
             on_correction=self.inject_message,
         )
@@ -885,10 +889,10 @@ class SolverAgent:
                 # 看 hint（扣 10%）远好过 0 分。
                 since_disc = self.round - self._last_discovery_round
                 stuck = (
-                    since_disc >= 12
+                    since_disc >= 8
                     or self._submission_wrong_count() >= 3
                     or (
-                        self.round > int(self.max_rounds * 0.5)
+                        self.round > int(self.max_rounds * 0.4)
                         and self._submitted_flag_count == 0
                     )
                 )
@@ -899,7 +903,7 @@ class SolverAgent:
                     )
             since_discovery = self.round - self._last_discovery_round
             stuck_limit = {
-                "easy": 12,
+                "easy": 8,
                 "medium": 10,
                 "hard": 6,
                 "difficult": 6,

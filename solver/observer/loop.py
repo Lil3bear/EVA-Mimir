@@ -81,6 +81,10 @@ class ObserverLoop:
         self.settings = settings
         self.on_correction = on_correction
         self.enabled = settings.get("solver", {}).get("observer_enabled", True)
+        # easy 题不发无进展/向量循环强干预，只保留看板维护 review。
+        self._allow_strong_intervention = bool(
+            settings.get("solver", {}).get("observer_strong_intervention", True)
+        )
         self._round_logs: list[dict] = []
         self._current_round: dict | None = None
         self._lock = threading.Lock()
@@ -185,6 +189,8 @@ class ObserverLoop:
         检测是否连续 N 轮都在同一攻击向量上。
         触发时立即调起 Observer 审查，并附上向量循环上下文。
         """
+        if not self._allow_strong_intervention:
+            return
         threshold = self._VECTOR_CYCLE_THRESHOLD
         if len(self._recent_vectors) < threshold:
             return
@@ -306,6 +312,8 @@ class ObserverLoop:
         - 若所有 ideas 均为 failed 且 Memory 无新 evidence，立即触发强干预（不等周期）
         - 若连续 NO_PROGRESS_THRESHOLD 个周期没有任何 idea 推进到 testing/verified，触发强干预
         """
+        if not self._allow_strong_intervention:
+            return
         try:
             from shared.data import ideas as idea_store, memory as mem_store
             all_ideas = idea_store.list_ideas(challenge_dir)
