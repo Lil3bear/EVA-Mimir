@@ -64,11 +64,18 @@ def _type_cost(code: str) -> float:
 _DEFERRED_PREFIXES = ("b-", "e1", "e2", "e3", "f1", "f2")
 _DIFFICULTY_RANK = {"easy": 0, "medium": 1, "hard": 2, "difficult": 2}
 
+# 能力瓶颈题：历史多次 run 从未解出。放开头攻坚（解出就赚分），连续失败后
+# 由 retry ledger 自动 abandon，不再长期占 worker slot。
+_BOTTLENECK_CODES = {"a-18", "c-03", "c-06", "c-08", "f2-05"}
+
 
 def _tier(challenge: Challenge) -> int:
-    """Lower tier runs first.  Difficulty gates within a family; the whole
-    pentest/pwn/reverse family is pushed behind web/misc of the same difficulty.
+    """Lower tier runs first.  Bottleneck challenges run even before web/misc
+    so a hard problem gets the freshest budget, then is abandoned and the
+    remaining 58 challenges run uninterrupted.
     """
+    if challenge.unique_code.lower() in _BOTTLENECK_CODES:
+        return -1
     rank = _DIFFICULTY_RANK.get(challenge.difficulty.lower(), 1)
     if challenge.unique_code.lower().startswith(_DEFERRED_PREFIXES):
         rank += 3

@@ -324,8 +324,7 @@ class ObserverLoop:
         # 快速路径：所有 idea 均 failed → 立即触发，不等周期计数
         non_failed = [i for i in all_ideas if i.status != "failed"]
         if all_ideas and not non_failed:
-            evidence = [m for m in all_memories if m.kind == "evidence"]
-            self._send_no_progress_intervention(all_ideas, current_round, fast_path=True)
+            self._send_no_progress_intervention(all_ideas, all_memories, current_round, fast_path=True)
             return
 
         # 常规路径：tracking testing/verified 推进
@@ -342,32 +341,58 @@ class ObserverLoop:
 
         if self._no_progress_periods >= self.NO_PROGRESS_THRESHOLD:
             self._no_progress_periods = 0
-            self._send_no_progress_intervention(all_ideas, current_round)
+            self._send_no_progress_intervention(all_ideas, all_memories, current_round)
 
-    def _send_no_progress_intervention(self, all_ideas, current_round: int, fast_path: bool = False) -> None:
-        """连续无进展时发送强干预：列出所有 failed 路线，要求从未尝试方向出发。"""
+    def _send_no_progress_intervention(self, all_ideas, all_memories, current_round: int, fast_path: bool = False) -> None:
+        """连续无进展时发送卡点摘要强干预。
+
+        不只是列 failed/pending，而是把“已验证事实 + 失败边界 + 关键约定
+        + 未尝试方向”结构化地重新摆到 Solver 面前，打破它对失败方向的锚定。
+        """
         failed = [i for i in all_ideas if i.status == "failed"]
         pending = [i for i in all_ideas if i.status == "pending"]
+        evidence = [m for m in all_memories if m.kind == "evidence"]
+        facts = [m for m in all_memories if m.kind == "fact"]
+        failures = [m for m in all_memories if m.kind == "failure"]
 
         trigger_reason = "所有攻击方向均已失败" if fast_path else "已连续多个周期没有新进展"
         lines = [
-            f"[OBSERVER][强干预] {trigger_reason}。",
+            f"[OBSERVER][卡点刷新] {trigger_reason}，重新梳理当前题目的完整卡点：",
             "",
         ]
-        if failed:
-            lines.append("以下方向已确认失败，不要再尝试：")
+        if evidence or facts:
+            lines.append("## 已验证事实（禁止丢失，直接复用，不要再重新探测）")
+            for m in evidence[-6:]:
+                lines.append(f"  - [evidence] {m.content}")
+            for m in facts[-6:]:
+                lines.append(f"  - [fact] {m.content}")
+            lines.append("")
+        if failures or failed:
+            lines.append("## 失败边界（禁止重复，再试即浪费轮次）")
+            for m in failures[-5:]:
+                lines.append(f"  - {m.content}")
             for i in failed:
                 result_str = f"（{i.result}）" if i.result else ""
                 lines.append(f"  - {i.content}{result_str}")
             lines.append("")
+        lines.append("## 关键约定（满足条件立即执行，不要继续当前循环）")
+        lines.append(
+            "  - 本平台 flag 都在 `/challenge/flag*.txt`：一旦拿到任意文件读取/LFI/路径穿越/RCE，"
+            "第一时间 `cat /challenge/flag1.txt`（或 flag.txt/flag2.txt），把内容带回工具输出；"
+            "禁止只读 `ls`、禁止把内容写到远程 /tmp 后去读别的文件。"
+        )
+        lines.append(
+            "  - 已拿到凭据/webshell 时，直接复用它们推进，不要回头重新枚举入口。"
+        )
+        lines.append("")
         if pending:
-            lines.append("以下是尚未探索的方向，请从中选一个开始：")
+            lines.append("## 未尝试方向（从中选一个全新的开始）")
             for i in pending:
                 lines.append(f"  - {i.content}")
             lines.append("")
         lines.append(
-            "必须立即切换到一个未尝试过的全新方向。"
-            "如果 idea 列表已空，调用 security_search 搜索该题目类型的其他常见漏洞或 writeup。"
+            "必须立即停止当前循环，从「未尝试方向」选一个，或执行「关键约定」。"
+            "若方向已空，用 security_search 搜该题型其他漏洞。"
         )
 
         message = "\n".join(lines)

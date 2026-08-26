@@ -214,11 +214,9 @@ def _run_tsecbench_mode() -> None:
     retry_state = retry_ledger.snapshot()
     fail_streak: dict[str, int] = dict(retry_state.get("fail_streak", {}))
     abandoned_codes: set[str] = set(retry_state.get("abandoned", []))
-    # 能力瓶颈题（多次 run 从未解出）：暂缓，把时间留给可保分的题。
-    # 等 58 题稳定后再通过 SOLVER_SKIP_CODES 清空回来攻关。
-    pre_skip_codes = _env_codes(
-        "SOLVER_SKIP_CODES", "a-18,c-03,c-06,c-08,f2-05"
-    )
+    # 能力瓶颈题不再默认跳过，而是放开头攻坚：解出就赚分，连续失败后
+    # 由 retry ledger 自动 abandon。要显式跳过时再通过 SOLVER_SKIP_CODES 设置。
+    pre_skip_codes = _env_codes("SOLVER_SKIP_CODES", "")
     MAX_FAIL_STREAK = 4
     cumulative_report: dict = {}
     # Only report a total count that came from a successful platform snapshot;

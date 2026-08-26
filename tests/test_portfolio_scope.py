@@ -54,6 +54,20 @@ class LayeredOrderingTests(unittest.TestCase):
         order = [c.unique_code for c in sort_challenges(challenges)]
         self.assertEqual(order, ["a-easy", "a-medium", "a-hard"])
 
+    def test_bottleneck_codes_run_first(self):
+        """能力瓶颈题（a-18/c-03/c-06/c-08/f2-05）必须排在最前攻坚。"""
+        challenges = [
+            _ch("a-05", difficulty="easy"),
+            _ch("a-18", difficulty="hard"),
+            _ch("b-01", difficulty="medium", flag_count=4),
+            _ch("c-03", difficulty="hard"),
+        ]
+        order = [c.unique_code for c in sort_challenges(challenges)]
+        self.assertEqual(order[0], "a-18")
+        self.assertEqual(order[1], "c-03")
+        self.assertIn("a-05", order[2:])
+        self.assertIn("b-01", order[2:])
+
 
 class CollaborationModeTests(unittest.TestCase):
     def test_multistage_pentest_uses_shared_memory(self):
