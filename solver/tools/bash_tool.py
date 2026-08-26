@@ -13,8 +13,60 @@ from solver.tools import knowledge_router
 _DEDUP_WINDOW = 10
 _DEDUP_WARN_THRESHOLD = 3
 _APPROACH_WARN_THRESHOLD = 3
-_APPROACH_BLOCK_THRESHOLD = 3
+# 跨轮累计的同结构请求硬阈值。3 太紧——正经简单题也可能需要 4~5 次同结构
+# 探测（不同 Content-Type / header / 状态码），无法可靠归入“迭代利用”豁免。
+# 放宽到 12：给合法多探留空间，仍对失控 grind 兜底；真正的爆破向量（把
+# wordlist 塞进一条 shell 循环）由 _INLINE_LOOP_BLOCK 独立即时拦截。
+_APPROACH_BLOCK_THRESHOLD = 12
+# 单条命令内联循环的变体数上限。超过（≥ 4）即判定为“把字典塞进循环”
+# 的爆破，无论跨轮累计多少都立即拦截。这才是原护栏真正要防的东西。
+_INLINE_LOOP_BLOCK = 3
 _HOST_FAIL_WARN_THRESHOLD = 3
+# 检测对抗（e3）题与打分/提交型端点：反复提交代码给评分器迭代改进就是解法本身，
+# 不能按暴力破解在第 3 次封锁；给一个宽裕预算，只防真正的失控循环。
+_ITERATIVE_SUBMIT_BUDGET = 60
+_ITERATIVE_SUBMIT_WARN_EVERY = 10
+_SCORING_ENDPOINT_RE = re.compile(
+    r"/(check|submit|score|scoring|eval|evaluate|verify|judge|grade|run"
+    r"|import|fetch|proxy|preview|render|webhook|callback|redirect|ssrf)\b",
+    re.IGNORECASE,
+)
+# oracle 驱动的利用（盲注 / LFI / SSTI / 命令注入 / 上下文提取）天生需要对同一
+# 端点发几十上百次自适应请求，不能按登录爆破在第 3 次封死。这些签名只
+# 抬高验证预算，不影响内联循环变体计数（把 wordlist 藏进 shell 循环仍会被拦）。
+_EXPLOIT_PAYLOAD_RE = re.compile(
+    r"union\s+select|select\s.+\sfrom\s|information_schema|order\s+by\s+\d"
+    r"|sleep\s*\(|benchmark\s*\(|waitfor\s+delay|pg_sleep"
+    r"|substr(?:ing)?\s*\(|\bascii\s*\(|updatexml|extractvalue"
+    r"|\bor\s+1\s*=\s*1|\band\s+1\s*=\s*1|\band\s+\d+\s*=\s*\d+"
+    # LFI / 路径穿越（含 `....//` 等绕过变体）+ PHP 包装器 + 敏感读取目标。
+    # 多阶段题靠 LFI 读多个文件（源码/配置/多个 flag），属于迭代利用。
+    r"|\.\./|\.\.%2f|\.\.\\|\.{3,}[\\/]|%2e%2e"
+    r"|php://|data://|file://|phar://|zip://|expect://|filter/|convert\.base64"
+    r"|/etc/(?:passwd|shadow|hosts)|/proc/(?:self|\d)|/var/www|/var/log"
+    r"|/root/|/home/\w|/app/|\.env\b|wp-config|config\.php|/flag|\.ssh/"
+    r"|\{\{.+\}\}|\$\{.+\}|<%.+%>"
+    r"|\$\(|%0a|\|\s*id\b|;\s*id\b"
+    # SSRF 内网枚举：内网 IP / localhost / 危险 scheme
+    r"|127\.0\.0\.1|localhost|169\.254\.|0\.0\.0\.0"
+    r"|10\.\d+\.\d+\.\d+|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\."
+    r"|gopher://|dict://|file://|ftp://",
+    re.IGNORECASE,
+)
+
+
+def _is_iterative_submission(url_pattern: str, cmd: str = "") -> bool:
+    """迭代利用场景：检测对抗题 / 打分提交端点 / oracle 驱动的利用 payload。
+
+    这类交互的核心就是对同一端点反复发自适应请求（每次根据上次响应
+    调整），属于有效迭代而非盲目爆破，必须豁免 3 次硬预算。
+    """
+    code = (getattr(_ctx, "unique_code", "") or "").lower()
+    if code.startswith("e3"):
+        return True
+    if _SCORING_ENDPOINT_RE.search(url_pattern or ""):
+        return True
+    return bool(cmd and _EXPLOIT_PAYLOAD_RE.search(cmd))
 
 
 def register_observer_trigger(callback) -> None:
@@ -148,6 +200,27 @@ def _inline_http_variant_count(cmd: str) -> int:
         return 1
 
 
+def _loop_is_endpoint_recon(cmd: str) -> bool:
+    """Whether a ``for`` loop varies the *endpoint* (path/port) rather than a value.
+
+    Fetching several distinct pages or ports in one loop is legitimate
+    reconnaissance (`for p in about.php news.php ...`, `for port in 8080 8000`),
+    not a wordlist attack against a fixed endpoint.  A loop that injects the
+    variable into a query value (`?id=$x`) or POST body is value brute-force.
+    """
+    m = re.search(r'\bfor\s+([A-Za-z_]\w*)\s+in\s+', cmd)
+    if not m:
+        return False
+    var = re.escape(m.group(1))
+    # 值爆破：变量注入查询值或 POST body → 不是侦察。
+    if re.search(rf'=\s*["\']?\$\{{?{var}\b', cmd):
+        return False
+    # 端点侦察：变量在路径（/$var）或端口（:$var）位。
+    if re.search(rf'[/:]\$\{{?{var}\b', cmd):
+        return True
+    return False
+
+
 def _is_connection_refused(output: str) -> bool:
     """判断 bash 输出是否表明目标不可达（Connection Refused / timeout）。"""
     patterns = [
@@ -256,18 +329,50 @@ def execute(args: dict) -> str:
         approach_count = previous_count + variant_count
         # 分题型防爆破：只对“当前目标 host”的请求严格 block；内网其他 host
         # （pentest 横向移动 / SSRF 内网探测）只警告不 block。
+        # 检测对抗题 / 打分端点走宽裕的迭代预算，不在第 3 次封死核心反馈回路。
         targets_current = _url_targets_current_target(cmd)
-        if targets_current and approach_count > _APPROACH_BLOCK_THRESHOLD:
-            _ctx.approach_counter[url_pattern] = _APPROACH_BLOCK_THRESHOLD + 1
-            if previous_count <= _APPROACH_BLOCK_THRESHOLD and _ctx.observer_trigger_callback:
+        iterative = _is_iterative_submission(url_pattern, cmd)
+        block_threshold = _ITERATIVE_SUBMIT_BUDGET if iterative else _APPROACH_BLOCK_THRESHOLD
+        # 单条命令把一大批变体塞进 shell 循环 = 爆破向量，独立于跨轮累计即时拦截。
+        # 但多端点侦察循环（打不同页面/端口）不是对固定端点的值爆破，放行
+        # 交给跨轮累计（12）兼底；只拦“对同一端点试不同值”的字典循环。
+        # 迭代利用（注入/SSRF/提取）应改用本地脚本远端一次完成。
+        if (
+            targets_current
+            and not iterative
+            and variant_count > _INLINE_LOOP_BLOCK
+            and not _loop_is_endpoint_recon(cmd)
+        ):
+            if _ctx.observer_trigger_callback:
+                _ctx.observer_trigger_callback(reason=f"inline_loop_bruteforce:{url_pattern[:60]}")
+            return (
+                f"[阻止] 单条命令把 {variant_count} 个变体塞进 shell 循环，判定为爆破。"
+                "请改成精确单发（一次一个有依据的 payload），或把循环放进本地脚本远端一次完成；"
+                "这不代表该端点不可利用，切勿记为失败边界。"
+            )
+        if targets_current and approach_count > block_threshold:
+            _ctx.approach_counter[url_pattern] = block_threshold + 1
+            if previous_count <= block_threshold and _ctx.observer_trigger_callback:
                 _ctx.observer_trigger_callback(reason=f"approach_blocked:{url_pattern[:60]}")
             return (
                 f"[阻止] 同一 HTTP 请求结构本次包含 {variant_count} 个变体，"
-                f"累计将达到 {approach_count} 个，超过 {_APPROACH_BLOCK_THRESHOLD} 个的验证预算。"
-                "请记录失败边界并切换方向；不要把更多猜测藏进 shell 循环。"
+                f"累计将达到 {approach_count} 个，超过 {block_threshold} 个限速阀值。"
+                "这是工具层限速，不是证明该端点不可利用——切勿把它记为“该结构不可再试”的失败边界（那会毒化重试）。"
+                "若仍需迭代（盲注 / SSRF 内网枚举 / SECRET_KEY 伪造 / 逐字符提取），请改用一个本地脚本"
+                "把循环放到远端一次完成（如 flask-unsign / 一段 python requests 提取），或换一个真正不同的精确 payload。"
             )
         _ctx.approach_counter[url_pattern] = approach_count
-        if approach_count >= _APPROACH_WARN_THRESHOLD:
+        if iterative:
+            # 迭代提交：鼓励继续投递，但每隔若干次提醒确保代码有实质变化。
+            if (
+                approach_count >= _ITERATIVE_SUBMIT_WARN_EVERY
+                and approach_count % _ITERATIVE_SUBMIT_WARN_EVERY == 0
+            ):
+                approach_warn = (
+                    f"\nℹ️ [迭代提交] 已向评分端点提交 {approach_count} 次（{url_pattern[:80]}）。"
+                    f"继续迭代没问题，但请确保每次提交的实现有实质差异，并对照上次评分调整。\n"
+                )
+        elif approach_count >= _APPROACH_WARN_THRESHOLD:
             approach_warn = (
                 f"\n⚠️ [方向循环警告] 同一请求结构已尝试 {approach_count} 次（{url_pattern[:80]}），"
                 f"换传参方式或换攻击方向，不要再用相同结构重试。\n"

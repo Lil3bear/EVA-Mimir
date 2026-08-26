@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 from solver.tools.bash_tool import _extract_url_pattern, _inline_http_variant_count
 from solver.runtime.control import ControlPolicy
+from solver.runtime.context import RunContext, ctx
 
 
 class ObserverControlPlaneTests(unittest.TestCase):
@@ -157,6 +158,32 @@ class ControlPolicyTests(unittest.TestCase):
             (policy.max_rounds, policy.switch_after, policy.stop_after, policy.observer_every_rounds),
             (7, 3, 5, 2),
         )
+
+    def test_same_action_deadloop_stops_deep_lane(self):
+        policy = ControlPolicy.from_settings({"solver": {}}, "hard")
+        # deep lane、同一条命令连续重复 6 次 → 立即判停，不等 idle
+        d = policy.decide(
+            round_num=100, last_progress_round=98, lane="deep",
+            same_action_streak=6,
+        )
+        self.assertEqual(d.action, "stop")
+        self.assertEqual(d.reason, "same_action_deadloop")
+
+    def test_same_action_deadloop_does_not_stop_easy(self):
+        policy = ControlPolicy.from_settings({"solver": {}}, "easy")
+        d = policy.decide(
+            round_num=100, last_progress_round=0, lane="deep",
+            same_action_streak=11,
+        )
+        self.assertEqual(d.action, "continue")
+
+    def test_low_same_action_streak_continues(self):
+        policy = ControlPolicy.from_settings({"solver": {}}, "hard")
+        d = policy.decide(
+            round_num=100, last_progress_round=98, lane="deep",
+            same_action_streak=5,
+        )
+        self.assertEqual(d.action, "continue")
 
 
 class DifficultyMaxRoundsTests(unittest.TestCase):
@@ -314,7 +341,8 @@ class BashAttemptBudgetTests(unittest.TestCase):
 
         base = tempfile.mkdtemp(prefix="bash-budget-")
         context = RunContext.create(base, "case")
-        cmd = "for value in one two three four; do curl -s http://example.invalid/$value; done"
+        # 值爆破：循环变量注入固定端点的查询值 = wordlist 攻击，拦。
+        cmd = "for v in one two three four; do curl -s 'http://example.invalid/x?id=$v'; done"
         with ctx.bind(context):
             result = execute({"cmd": cmd})
 
@@ -322,7 +350,22 @@ class BashAttemptBudgetTests(unittest.TestCase):
         run.assert_not_called()
 
     @patch("solver.tools.bash_tool.subprocess.run")
-    def test_blocks_fourth_matching_request(self, run):
+    def test_recon_loop_over_distinct_pages_allowed(self, run):
+        """侦察循环（打不同页面/端口）不是值爆破，不应被当作 wordlist 拦截（b-02/b-03 根因）。"""
+        run.return_value = MagicMock(stdout="ok", stderr="", returncode=0)
+        base = tempfile.mkdtemp(prefix="bash-budget-")
+        context = RunContext.create(base, "b-03")
+        with ctx.bind(context):
+            from solver.tools.bash_tool import execute
+            result = execute({"cmd": (
+                "for p in robots.txt about.php news.php contact.php admin/login.php; "
+                "do curl -s http://target/$p; done"
+            )})
+        self.assertNotIn("[阻止]", result)
+
+    @patch("solver.tools.bash_tool.subprocess.run")
+    def test_cross_turn_single_requests_allowed_until_threshold(self, run):
+        """跨轮单发的自适应探测放宽到 12（正经简单题也可能需 4~5 次同结构探测）。"""
         from solver.tools.bash_tool import execute
         from solver.worker_context import RunContext, ctx
 
@@ -330,14 +373,143 @@ class BashAttemptBudgetTests(unittest.TestCase):
         base = tempfile.mkdtemp(prefix="bash-budget-")
         context = RunContext.create(base, "case")
         with ctx.bind(context):
-            for value in ("one", "two", "three"):
+            # 前 12 次单发（含第 4~5 次）都不被硬封，只会在第 3 次起软提醒。
+            for value in range(12):
                 self.assertNotIn(
-                    "[阻止]", execute({"cmd": f"curl -s http://example.invalid/check?v={value}"})
+                    "[阻止]",
+                    execute({"cmd": f"curl -s http://example.invalid/item?id={value}"}),
                 )
-            result = execute({"cmd": "curl -s http://example.invalid/check?v=four"})
-
+            # 第 13 次超过兜底阈值才硬封。
+            result = execute({"cmd": "curl -s http://example.invalid/item?id=13"})
         self.assertIn("[阻止]", result)
-        self.assertEqual(run.call_count, 3)
+        self.assertEqual(run.call_count, 12)
+
+    @patch("solver.tools.bash_tool.subprocess.run")
+    def test_inline_loop_wordlist_blocked_immediately(self, run):
+        """把字典塞进一条 shell 循环（≥ 4 变体）= 爆破向量，第一条就拦。"""
+        from solver.tools.bash_tool import execute
+        from solver.worker_context import RunContext, ctx
+
+        run.return_value = MagicMock(stdout="ok", stderr="", returncode=0)
+        base = tempfile.mkdtemp(prefix="bash-budget-")
+        context = RunContext.create(base, "case")
+        with ctx.bind(context):
+            result = execute({"cmd": (
+                "for p in a b c d e; do curl -s http://target/login?p=$p; done"
+            )})
+        self.assertIn("[阻止]", result)
+        run.assert_not_called()
+
+    @patch("solver.tools.bash_tool.subprocess.run")
+    def test_scoring_endpoint_is_not_blocked_at_fourth(self, run):
+        """打分/提交型端点（/check /submit …）的迭代提交不能在第 3 次封死。"""
+        from solver.tools.bash_tool import execute
+        from solver.worker_context import RunContext, ctx
+
+        run.return_value = MagicMock(stdout="ok", stderr="", returncode=0)
+        base = tempfile.mkdtemp(prefix="bash-budget-")
+        context = RunContext.create(base, "case")
+        with ctx.bind(context):
+            for value in range(6):
+                self.assertNotIn(
+                    "[阻止]",
+                    execute({"cmd": f"curl -s http://example.invalid/check?v={value}"}),
+                )
+        self.assertEqual(run.call_count, 6)
+
+    @patch("solver.tools.bash_tool.subprocess.run")
+    def test_evasion_challenge_exempts_repeated_submissions(self, run):
+        """e3 检测对抗题：反复提交代码给评分器是解法本身，不按暴力破解封锁。"""
+        from solver.tools.bash_tool import execute
+        from solver.worker_context import RunContext, ctx
+
+        run.return_value = MagicMock(stdout="ok", stderr="", returncode=0)
+        base = tempfile.mkdtemp(prefix="bash-budget-")
+        context = RunContext.create(base, "e3-04")
+        with ctx.bind(context):
+            for value in range(6):
+                self.assertNotIn(
+                    "[阻止]",
+                    execute({"cmd": f"curl -s http://target/anything?v={value}"}),
+                )
+        self.assertEqual(run.call_count, 6)
+
+    @patch("solver.tools.bash_tool.subprocess.run")
+    def test_blind_injection_extraction_is_not_blocked(self, run):
+        """盲注 / LFI 需要对同一端点发多次自适应请求，不能在第 3 次封死。"""
+        from solver.tools.bash_tool import execute
+        from solver.worker_context import RunContext, ctx
+
+        run.return_value = MagicMock(stdout="ok", stderr="", returncode=0)
+        base = tempfile.mkdtemp(prefix="bash-budget-")
+        context = RunContext.create(base, "a-14")
+        with ctx.bind(context):
+            for i in range(1, 7):
+                self.assertNotIn(
+                    "[阻止]",
+                    execute({"cmd": (
+                        "curl -s 'http://target/news.php?id=1 AND "
+                        f"SUBSTRING(user(),{i},1)=0x61'"
+                    )}),
+                )
+        self.assertEqual(run.call_count, 6)
+
+    @patch("solver.tools.bash_tool.subprocess.run")
+    def test_lfi_reading_many_files_is_not_blocked(self, run):
+        """多阶段题靠 LFI 读源码/配置/多个 flag，读第 4+ 个文件不能被封（b-01 根因）。"""
+        from solver.tools.bash_tool import execute
+        from solver.worker_context import RunContext, ctx
+
+        run.return_value = MagicMock(stdout="root:x:0:0", stderr="", returncode=0)
+        base = tempfile.mkdtemp(prefix="bash-budget-")
+        context = RunContext.create(base, "b-01")
+        files = [
+            "etc/passwd", "proc/self/cmdline", "var/www/html/config.php",
+            "app/flag1.txt", "app/flag2.txt", "var/www/html/db.php",
+        ]
+        with ctx.bind(context):
+            for path in files:
+                cmd = f"curl -s 'http://target/services.php?lang=....//....//{path}'"
+                self.assertNotIn("[阻止]", execute({"cmd": cmd}), path)
+        self.assertEqual(run.call_count, len(files))
+
+    @patch("solver.tools.bash_tool.subprocess.run")
+    def test_ssrf_internal_enumeration_is_not_blocked(self, run):
+        """SSRF 端点（/api/import 等）的内网枚举不能在第 3 次封死（a-14 根因）。"""
+        from solver.tools.bash_tool import execute
+        from solver.worker_context import RunContext, ctx
+
+        run.return_value = MagicMock(stdout="ok", stderr="", returncode=0)
+        base = tempfile.mkdtemp(prefix="bash-budget-")
+        context = RunContext.create(base, "a-14")
+        internal = ["10.0.255.53", "127.0.0.1:5000", "192.168.0.1", "169.254.169.254"]
+        with ctx.bind(context):
+            for i, host in enumerate(internal + internal):
+                self.assertNotIn(
+                    "[阻止]",
+                    execute({"cmd": (
+                        "curl -s http://target/api/import "
+                        f"-d '{{\"url\":\"http://{host}/\"}}'"
+                    )}),
+                )
+        self.assertEqual(run.call_count, 8)
+
+    @patch("solver.tools.bash_tool.subprocess.run")
+    def test_login_bruteforce_loop_still_blocked(self, run):
+        """登录爆破的真正向量是字典循环，仍被即时拦截。"""
+        from solver.tools.bash_tool import execute
+        from solver.worker_context import RunContext, ctx
+
+        run.return_value = MagicMock(stdout="ok", stderr="", returncode=0)
+        base = tempfile.mkdtemp(prefix="bash-budget-")
+        context = RunContext.create(base, "a-01")
+        with ctx.bind(context):
+            result = execute({"cmd": (
+                "for p in 111111 222222 333333 444444; do "
+                "curl -s \"http://target/login?u=admin&p=$p\"; done"
+            )})
+        self.assertIn("[阻止]", result)
+        run.assert_not_called()
 
 
 class ExtractDifficultyTests(unittest.TestCase):

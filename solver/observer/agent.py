@@ -8,7 +8,8 @@ from solver.observer.tools import (
     build_tool_registry,
 )
 from solver.runtime.llm import assistant_message_dict, completion_kwargs, create_with_retry
-from shared.data import memory as mem_store, ideas as idea_store
+from solver.runtime.claims import ClaimStore
+from solver.runtime.scoped_state import observer_ideas, observer_memories, list_memory_proposals
 from shared.jsonl import write_line
 from solver.worker_context import ctx as _ctx
 
@@ -16,10 +17,10 @@ from solver.worker_context import ctx as _ctx
 OBSERVER_SYSTEM_PROMPT = """你是 CTF 解题 Agent 的 Observer（旁路审查员）。
 
 ## 职责边界
-你只审查 Solver 最近的工具行为，维护当前题目的 Memory/Ideas，并在确有必要时发送一条方向性纠偏。
+你只审查当前题目各 Solver attempt 的工具行为，维护当前题目的共享 Memory/Ideas，并在确有必要时发送一条方向性纠偏。Solver 的私有记忆默认不可直接注入其他 Solver；只有验证通过的 evidence proposal 才能 promote 到共享层。
 你不执行目标请求、不提交 flag、不编造工具名，也不替 Solver 做未经验证的技术判断。
 纠偏只能指示 Solver 使用它已有的工具：bash、read_file、write_file、grep、skill_list、skill_load、
-memory_add、memory_list、idea_list、security_search、challenge_submit_flag、challenge_get_state、
+memory_add、memory_list、memory_promote、artifact_list、artifact_approve、command_publish、idea_list、security_search、challenge_submit_flag、challenge_get_state、
 challenge_get_hint；不要提及 restart 或其它不存在的接口。
 
 ## 单一审查循环
@@ -27,7 +28,7 @@ challenge_get_hint；不要提及 restart 或其它不存在的接口。
 2. 以当前运行的实测证据为准。evidence（凭据/有效 flag）不可删除；合并重复的 fact/failure，
    删除已经被新证据替代或明显过时的记录。不要把旧实例 IP、旧凭据、题号经验或历史攻击链当作答案。
 3. 检查已有 idea 是否应更新为 testing/verified/failed。一次 payload 失败只记录边界，不要轻易关闭整条路线。
-4. 只有确认 Solver 遗忘了当前 Memory 中与主线直接相关的事实，或同一请求/方向重复且无新证据，才纠偏。
+4. 只有确认当前 attempt 遗忘了与主线直接相关的已验证事实，或同一请求/方向重复且无新证据，才纠偏。不要因为另一个 attempt 的私有路线不同就强行覆盖当前 Solver。
 5. 没有明确改动时返回 NO_CHANGE；需要纠偏时必须调用 `send_correction`，填写当前 `state_version`、动作、模式、优先级和失效轮数。message 保持 1--3 句话，说明已尝试方向、证据边界和一个新的大方向，
    不给未经验证的具体 payload、固定路径或凭据。
 
@@ -60,8 +61,11 @@ def _excerpt(text: str, limit: int) -> str:
 def _build_observer_prompt(
     recent_rounds: list[dict], challenge_dir: Path, attempt_dir: Path | None = None
 ) -> str:
-    memories = mem_store.list_memory(challenge_dir, limit=12)
-    ideas = idea_store.list_ideas(challenge_dir, limit=8)
+    memories = observer_memories(challenge_dir)[-12:]
+    ideas = observer_ideas(challenge_dir)[-8:]
+    proposals = list_memory_proposals(challenge_dir)
+    claims = ClaimStore(challenge_dir).list_active()
+    approved_artifacts = __import__("solver.runtime.artifacts", fromlist=["ArtifactBus"]).ArtifactBus(challenge_dir).list(status="approved", limit=20)
 
     lines = ["## 当前看板状态"]
 
@@ -70,7 +74,7 @@ def _build_observer_prompt(
     # from a truncated six-round window alone.
     try:
         from solver.runtime.strategy_controller import load_decision_summary
-        decision = load_decision_summary(challenge_dir)
+        decision = load_decision_summary(attempt_dir or challenge_dir)
     except Exception:
         decision = {}
     if decision:
@@ -95,6 +99,30 @@ def _build_observer_prompt(
             lines.append(f"- [{m.kind}] {m.id}: {_excerpt(m.content, 700)}")
     else:
         lines.append("### Memory（空）")
+
+    if approved_artifacts:
+        lines.append("### 已批准 Artifacts")
+        for artifact in approved_artifacts:
+            lines.append(
+                f"- {artifact.get('artifact_type')}: {_excerpt(artifact.get('value', ''), 500)} "
+                f"(owner={artifact.get('producer_attempt')}, confidence={artifact.get('confidence')})"
+            )
+
+    if claims:
+        lines.append("### 当前 Hypothesis Claims")
+        for claim in claims:
+            lines.append(
+                f"- {claim.get('owner', '?')}: {_excerpt(claim.get('description', ''), 500)} "
+                f"(lease_until={claim.get('lease_until', 0)})"
+            )
+
+    if proposals:
+        lines.append("### 待审核共享提案")
+        for proposal in proposals[-8:]:
+            lines.append(
+                f"- {proposal.get('id')} ({proposal.get('source_attempt', '')}): "
+                f"{_excerpt(proposal.get('content', ''), 500)}"
+            )
 
     if ideas:
         lines.append("### Ideas")
@@ -230,6 +258,7 @@ class ObserverAgent:
                 args,
                 on_correction,
                 challenge_dir=challenge_dir,
+                attempt_dir=attempt_dir,
                 reviewed_round=recent_rounds[-1].get("round", 0) if recent_rounds else 0,
             )
         )
@@ -313,12 +342,13 @@ def _handle_correction(
     on_correction: callable,
     *,
     challenge_dir: Path | None = None,
+    attempt_dir: Path | None = None,
     reviewed_round: int = 0,
 ) -> str:
     from solver.runtime.observer_advice import ObserverAdvice
     from solver.runtime.strategy_controller import load_decision_summary
 
-    summary = load_decision_summary(challenge_dir) if challenge_dir else {}
+    summary = load_decision_summary(attempt_dir or challenge_dir) if (attempt_dir or challenge_dir) else {}
     current_version = int(summary.get("state_version", 0) or 0)
     advice = ObserverAdvice.from_mapping(
         args,

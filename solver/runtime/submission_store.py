@@ -94,6 +94,8 @@ def prepare_challenge_state(challenge_dir: str | Path) -> bool:
         for stale_dir in (
             challenge_path / "attempts",
             challenge_path / ".tool-results",
+            # Layered solver state: shared evidence/proposals are task-scoped.
+            challenge_path / "shared",
         ):
             if stale_dir.exists():
                 shutil.rmtree(stale_dir)
@@ -177,6 +179,22 @@ class SubmissionStore:
                 persist("completed", lambda: self._write_text(self.completed_path, "1"))
             persist("submissions", lambda: self._write_json(self.submissions_path, submissions))
 
+            try:
+                from solver.runtime.state_events import StateEventLog
+                StateEventLog(self.challenge_dir).append(
+                    "submission_recorded",
+                    {
+                        "status": status,
+                        "correct": status == "correct",
+                        "cumulative_score": response.get("cumulative_score"),
+                        "correct_flags": response.get("correct_flag_count"),
+                        "total_flags": response.get("total_flag_count"),
+                        "matched_index": response.get("matched_flag_index"),
+                    },
+                    run_id=self.run_id,
+                )
+            except Exception:
+                pass
             return SubmissionOutcome(
                 status=status,
                 response=response,

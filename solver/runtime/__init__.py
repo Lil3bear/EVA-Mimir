@@ -19,7 +19,13 @@ from solver.runtime.decision_state import (
 )
 from solver.runtime.journal import ExecutionJournal, SAFE_REPLAY_TOOLS
 from solver.runtime.observer_advice import ObserverAdvice
-from solver.runtime.portfolio import AttemptSpec, PortfolioBudget, build_portfolio
+from solver.runtime.portfolio import (
+    AttemptSpec,
+    PortfolioBudget,
+    build_portfolio,
+    challenge_memory_scope,
+    challenge_plan,
+)
 from solver.runtime.strategy_controller import (
     ControlAdvice,
     DecisionStateStore,
@@ -49,5 +55,7 @@ __all__ = [
     "StrategyController",
     "StrategyMode",
     "build_portfolio",
+    "challenge_memory_scope",
+    "challenge_plan",
     "ctx",
 ]

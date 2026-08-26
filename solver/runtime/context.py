@@ -31,6 +31,12 @@ class RunContext:
     # Stable identifier shared by retries in one process.  It is deliberately
     # not the benchmark token, so it is safe to persist in local state files.
     run_id: str = ""
+    # Memory collaboration scope for this attempt:
+    #   "private"  - own private board + observer-approved shared (default);
+    #   "isolated" - own private board only (independent parallel racers);
+    #   "shared"   - a single challenge-wide pool every attempt reads/writes
+    #                directly (collaborative multi-stage pentest).
+    memory_scope: str = "private"
 
     def __post_init__(self) -> None:
         challenge_dir = str(Path(self.challenge_dir))
@@ -85,11 +91,14 @@ class RunContext:
             run_id=os.environ.get("CTF_RUN_ID", ""),
         )
 
-    def for_attempt(self, attempt_id: str) -> "RunContext":
+    def for_attempt(
+        self, attempt_id: str, *, memory_scope: str | None = None
+    ) -> "RunContext":
         return replace(
             self,
             attempt_id=attempt_id,
             attempt_dir=str(Path(self.challenge_dir) / "attempts" / attempt_id),
+            memory_scope=memory_scope if memory_scope is not None else self.memory_scope,
         )
 
 
@@ -110,8 +119,10 @@ class WorkerContext(threading.local):
         self.target_url = run.target_url
         self.attempt_id = run.attempt_id
         self.attempt_dir = run.attempt_dir
+        self.memory_scope = getattr(run, "memory_scope", "private")
         self.deadline = run.deadline
         self.run_id = run.run_id
+        self.current_round = 0
         self.workspace = str(Path(run.challenge_dir).parent)
         self.client = client
 
@@ -144,8 +155,10 @@ class WorkerContext(threading.local):
         self.challenge_dir = "/workspace"
         self.attempt_id = "primary"
         self.attempt_dir = "/workspace"
+        self.memory_scope = "private"
         self.deadline = 0.0
         self.run_id = ""
+        self.current_round = 0
         self.recent_fingerprints: list[str] = []
         self.approach_counter: Counter = Counter()
         self.host_fail_counter: Counter = Counter()

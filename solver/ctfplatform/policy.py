@@ -39,32 +39,62 @@ class ChallengeProfile:
     product_hint: str = ""
 
 
+def _type_cost(code: str) -> float:
+    code = code.lower()
+    if code.startswith(("a-", "c-", "g-")):
+        return 1.0
+    if code.startswith("d-"):
+        return 1.4
+    if code.startswith("b-"):
+        return 1.8
+    if code.startswith(("e2", "e3")):
+        return 2.2
+    if code.startswith("e1"):
+        return 2.5
+    if code.startswith(("f1", "f2")):
+        return 2.8
+    return 1.5
+
+
+# Whole families that reliably burn a worker slot for a long time.  They are
+# tiered *behind* every web/misc challenge so the fast, high-yield points are
+# banked first and the global deadline only ever truncates this deferred tail
+# (proven by run-12717: b-* held all 3 slots for 41 min while a 500-pt a-10
+# waited in queue).
+_DEFERRED_PREFIXES = ("b-", "e1", "e2", "e3", "f1", "f2")
+_DIFFICULTY_RANK = {"easy": 0, "medium": 1, "hard": 2, "difficult": 2}
+
+
+def _tier(challenge: Challenge) -> int:
+    """Lower tier runs first.  Difficulty gates within a family; the whole
+    pentest/pwn/reverse family is pushed behind web/misc of the same difficulty.
+    """
+    rank = _DIFFICULTY_RANK.get(challenge.difficulty.lower(), 1)
+    if challenge.unique_code.lower().startswith(_DEFERRED_PREFIXES):
+        rank += 3
+    return rank
+
+
+def _roi(challenge: Challenge) -> float:
+    remaining = max(1, challenge.flag_count - challenge.correct_flag_count)
+    expected = challenge.total_score * (remaining / max(1, challenge.flag_count))
+    if challenge.correct_flag_count > 0:
+        expected += min(30.0, challenge.total_score * 0.2)
+    cost = _DIFFICULTY_COST.get(challenge.difficulty.lower(), 2.0)
+    return expected / (cost * _type_cost(challenge.unique_code))
+
+
 def sort_challenges(challenges: list[Challenge]) -> list[Challenge]:
-    def type_cost(code: str) -> float:
-        code = code.lower()
-        if code.startswith(("a-", "c-", "g-")):
-            return 1.0
-        if code.startswith("d-"):
-            return 1.4
-        if code.startswith("b-"):
-            return 1.8
-        if code.startswith(("e2", "e3")):
-            return 2.2
-        if code.startswith("e1"):
-            return 2.5
-        if code.startswith(("f1", "f2")):
-            return 2.8
-        return 1.5
+    """Front-load fast, high-yield points; defer slot-hogging families to the tail.
 
-    def score(challenge: Challenge) -> float:
-        remaining = max(1, challenge.flag_count - challenge.correct_flag_count)
-        expected = challenge.total_score * (remaining / max(1, challenge.flag_count))
-        if challenge.correct_flag_count > 0:
-            expected += min(30.0, challenge.total_score * 0.2)
-        cost = _DIFFICULTY_COST.get(challenge.difficulty.lower(), 2.0)
-        return expected / (cost * type_cost(challenge.unique_code))
-
-    return sorted(challenges, key=score, reverse=True)
+    Ordering key is ``(tier, -roi, code)``: tier front-loads easy/web wins,
+    ROI ranks value within a tier, and the code is a deterministic final
+    tiebreak.
+    """
+    return sorted(
+        challenges,
+        key=lambda c: (_tier(c), -_roi(c), c.unique_code.lower()),
+    )
 
 
 def infer_challenge_type(

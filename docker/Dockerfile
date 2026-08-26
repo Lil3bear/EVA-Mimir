@@ -46,8 +46,8 @@ ENV PYTHONPATH=/opt/ctf-agent
 
 # LLM 网关配置（走 *.tsecbench.gw 时由 apply_llm_gateway 把 host 改写为
 # <host>.tsecbench.gw，key 由网关透传）。
-ENV LLM_BASE_URL=https://tokenhub.tencentmaas.com/v1 \
-    LLM_API_KEY=sk-0RpIFAcmhuYIIdLKhePbHUVJ3Xy2Dgzd9ijSU7DqojoTBEog \
+ENV LLM_BASE_URL=https://api.deepseek.com/v1 \
+    LLM_API_KEY=YOUR_LLM_API_KEY \
     LLM_MODEL=deepseek-v4-flash \
     LLM_GATEWAY=1
 

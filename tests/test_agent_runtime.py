@@ -118,7 +118,9 @@ class DeepSeekTransportTests(unittest.TestCase):
         self.assertNotIn("tool_choice", kwargs)
         self.assertEqual(kwargs["max_tokens"], 65536)
         self.assertEqual(kwargs["extra_body"]["thinking"], {"type": "enabled"})
-        self.assertEqual(kwargs["extra_body"]["reasoning_effort"], "high")
+        # reasoning_effort 必须是顶层字段（extra_body 传法 tokenhub 不生效）
+        self.assertEqual(kwargs["reasoning_effort"], "high")
+        self.assertNotIn("reasoning_effort", kwargs["extra_body"])
 
     def test_generic_request_keeps_tool_choice(self):
         kwargs = completion_kwargs(

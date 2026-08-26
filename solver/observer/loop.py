@@ -315,9 +315,9 @@ class ObserverLoop:
         if not self._allow_strong_intervention:
             return
         try:
-            from shared.data import ideas as idea_store, memory as mem_store
-            all_ideas = idea_store.list_ideas(challenge_dir)
-            all_memories = mem_store.list_memory(challenge_dir)
+            from solver.runtime.scoped_state import observer_ideas, observer_memories
+            all_ideas = observer_ideas(challenge_dir)
+            all_memories = observer_memories(challenge_dir)
         except Exception:
             return
 

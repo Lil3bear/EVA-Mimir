@@ -29,6 +29,10 @@ _DEFAULT_STOP_AFTER = {"easy": 20, "medium": 30, "hard": 48, "difficult": 48}
 _STOP_PENTEST_EXTRA = 24
 _STOP_CTYPE_EXTRA = 12
 _FAST_LANE_ROUNDS = {"easy": 30, "medium": 30}
+# 同一条命令（空白归一后）连续重复达到该次数，判定为确定的死循环。
+# run-12388 中 VERIFY 模式实例把同一个 no-op heredoc 重复 11 次仍不停，
+# 因为 decide() 只数 strategy_failures/idle，从不看 same_action_streak。
+_ACTION_DEADLOOP_THRESHOLD = 6
 
 
 class LaneMode(str, Enum):
@@ -141,6 +145,7 @@ class ControlPolicy:
         strategy_failures: int = 0,
         switch_already_requested: bool = False,
         hint_focus_exhausted: bool = False,
+        same_action_streak: int = 0,
     ) -> ControlDecision:
         """Return the sole policy decision for lane/switch/no-progress stop.
 
@@ -174,6 +179,17 @@ class ControlPolicy:
 
         if lane != LaneMode.DEEP.value:
             return ControlDecision(idle_rounds=idle_rounds)
+
+        # 同一条命令连续重复 = 最确定的死循环信号，与 idle 正交。
+        # 达到阈值直接判停，不等到 stop_after 的 idle 计数，避免继续
+        # 空转吃掉共享 portfolio 预算（run-12388 going-in-circles 根因）。
+        if int(same_action_streak) >= _ACTION_DEADLOOP_THRESHOLD:
+            return ControlDecision(
+                action=ControlAction.STOP.value,
+                reason="same_action_deadloop",
+                failure_scope=FailureScope.TASK.value,
+                idle_rounds=idle_rounds,
+            )
 
         enough_failed_strategies = (
             int(strategy_failures) >= self.min_strategy_failures_before_stop

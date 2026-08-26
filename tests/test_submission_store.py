@@ -82,6 +82,8 @@ class SubmissionStoreTests(unittest.TestCase):
         (root / "attempts" / "primary" / ".solver-history.jsonl").write_text("old")
         (root / ".execution-journal.jsonl").write_text("old")
         (root / ".challenge-ledger.json").write_text("{}")
+        (root / "shared" / "proposals").mkdir(parents=True)
+        (root / "shared" / "proposals" / "proposal_old.json").write_text("{}")
 
         with patch.dict(
             "os.environ",
@@ -94,6 +96,7 @@ class SubmissionStoreTests(unittest.TestCase):
             self.assertFalse((root / "attempts").exists())
             self.assertFalse((root / ".execution-journal.jsonl").exists())
             self.assertFalse((root / ".challenge-ledger.json").exists())
+            self.assertFalse((root / "shared").exists())
             self.assertTrue(score_belongs_to_current_task(root))
             self.assertFalse(prepare_challenge_state(root))
 

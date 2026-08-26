@@ -4,6 +4,18 @@ from pathlib import Path
 from shared.data import memory as mem_store, ideas as idea_store
 from solver.tools.registry import ToolRegistry, ToolSpec
 from solver.worker_context import ctx as _ctx
+from solver.runtime.claims import ClaimStore
+from solver.runtime.commands import COMMAND_ACTIONS, CommandBus
+from solver.runtime.state_events import StateEventLog
+from solver.runtime.artifacts import ArtifactBus
+from solver.runtime.scoped_state import (
+    find_idea_root,
+    list_memory_proposals,
+    observer_ideas,
+    observer_memories,
+    promote_memory_proposal,
+    shared_root,
+)
 
 
 def _challenge_dir() -> Path:
@@ -79,6 +91,63 @@ MEMORY_DELETE_TOOL_DEF = {
                 "memory_id": {"type": "string", "description": "Memory 记录的 id 或 id 前缀"},
             },
             "required": ["memory_id"],
+        },
+    },
+}
+
+ARTIFACT_APPROVE_TOOL_DEF = {
+    "type": "function",
+    "function": {
+        "name": "artifact_approve",
+        "description": "批准一条 Solver 结构化证据，使其成为可供其他 Solver 消费的共享 artifact。",
+        "parameters": {
+            "type": "object",
+            "properties": {"artifact_id": {"type": "string"}},
+            "required": ["artifact_id"],
+        },
+    },
+}
+
+COMMAND_PUBLISH_TOOL_DEF = {
+    "type": "function",
+    "function": {
+        "name": "command_publish",
+        "description": "发布持久化、可确认、可过期的 Observer 调度命令。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": sorted(COMMAND_ACTIONS)},
+                "target_attempt": {"type": "string"},
+                "payload": {"type": "object"},
+                "state_version": {"type": "integer"},
+                "expires_after_rounds": {"type": "integer", "minimum": 1, "maximum": 24},
+            },
+            "required": ["action", "payload"],
+        },
+    },
+}
+
+ARTIFACT_LIST_TOOL_DEF = {
+    "type": "function",
+    "function": {
+        "name": "artifact_list",
+        "description": "列出当前题目待审核或已批准的结构化证据。",
+        "parameters": {
+            "type": "object",
+            "properties": {"status": {"type": "string"}},
+        },
+    },
+}
+
+MEMORY_PROMOTE_TOOL_DEF = {
+    "type": "function",
+    "function": {
+        "name": "memory_promote",
+        "description": "批准一个 Solver 提交的证据提案，使其成为本题所有 Solver 可见的共享事实。",
+        "parameters": {
+            "type": "object",
+            "properties": {"proposal_id": {"type": "string"}},
+            "required": ["proposal_id"],
         },
     },
 }
@@ -193,6 +262,10 @@ OBSERVER_TOOL_DEFS = [
     MEMORY_ADD_TOOL_DEF,
     MEMORY_DELETE_TOOL_DEF,
     MEMORY_UPDATE_TOOL_DEF,
+    MEMORY_PROMOTE_TOOL_DEF,
+    ARTIFACT_APPROVE_TOOL_DEF,
+    ARTIFACT_LIST_TOOL_DEF,
+    COMMAND_PUBLISH_TOOL_DEF,
     IDEA_LIST_TOOL_DEF,
     IDEA_ADD_TOOL_DEF,
     IDEA_UPDATE_TOOL_DEF,
@@ -207,6 +280,10 @@ def build_tool_registry(send_correction) -> ToolRegistry:
         ToolSpec(MEMORY_ADD_TOOL_DEF, memory_add),
         ToolSpec(MEMORY_DELETE_TOOL_DEF, memory_delete),
         ToolSpec(MEMORY_UPDATE_TOOL_DEF, memory_update),
+        ToolSpec(MEMORY_PROMOTE_TOOL_DEF, memory_promote),
+        ToolSpec(ARTIFACT_APPROVE_TOOL_DEF, artifact_approve),
+        ToolSpec(ARTIFACT_LIST_TOOL_DEF, artifact_list),
+        ToolSpec(COMMAND_PUBLISH_TOOL_DEF, command_publish),
         ToolSpec(IDEA_LIST_TOOL_DEF, idea_list),
         ToolSpec(IDEA_ADD_TOOL_DEF, idea_add),
         ToolSpec(IDEA_UPDATE_TOOL_DEF, idea_update),
@@ -238,12 +315,20 @@ def read_file(args: dict) -> str:
 
 
 def memory_list(args: dict) -> str:
-    entries = mem_store.list_memory(_challenge_dir())
-    if not entries:
+    entries = observer_memories(_challenge_dir())
+    proposals = list_memory_proposals(_challenge_dir())
+    if not entries and not proposals:
         return "[Memory] 暂无记录"
     lines = ["[Memory 看板]"]
     for e in entries:
         lines.append(f"- [{e.kind}] {e.id} ({e.attempt_id}): {_excerpt(e.content, 700)}")
+    if proposals:
+        lines.append("[待审核共享提案]")
+        for proposal in proposals[-8:]:
+            lines.append(
+                f"- {proposal.get('id')} ({proposal.get('source_attempt', '')}): "
+                f"{_excerpt(proposal.get('content', ''), 700)}"
+            )
     return "\n".join(lines)
 
 
@@ -253,7 +338,7 @@ def memory_add(args: dict) -> str:
     if not content:
         return "[错误] content 不能为空"
     entry, created = mem_store.add_memory_with_status(
-        _challenge_dir(), kind=kind, content=content, source="observer",
+        shared_root(_challenge_dir()), kind=kind, content=content, source="observer-approved",
         attempt_id=_ctx.attempt_id,
     )
     if not created:
@@ -263,7 +348,7 @@ def memory_add(args: dict) -> str:
 
 def memory_delete(args: dict) -> str:
     memory_id = args.get("memory_id", "")
-    ok = mem_store.delete_memory(_challenge_dir(), memory_id)
+    ok = mem_store.delete_memory(shared_root(_challenge_dir()), memory_id)
     return f"[Memory] {'已删除' if ok else '未找到'} {memory_id}"
 
 
@@ -272,12 +357,12 @@ def memory_update(args: dict) -> str:
     content = args.get("content", "").strip()
     if not content:
         return "[错误] content 不能为空"
-    ok = mem_store.update_memory(_challenge_dir(), memory_id, content=content)
+    ok = mem_store.update_memory(shared_root(_challenge_dir()), memory_id, content=content)
     return f"[Memory] {'已更新' if ok else '未找到'} {memory_id}"
 
 
 def idea_list(args: dict) -> str:
-    ideas = idea_store.list_ideas(_challenge_dir())
+    ideas = observer_ideas(_challenge_dir())
     if not ideas:
         return "[Ideas] 暂无攻击方向"
     lines = ["[Ideas 看板]"]
@@ -295,15 +380,89 @@ def idea_add(args: dict) -> str:
     if not content:
         return "[错误] content 不能为空"
     idea = idea_store.add_idea(
-        _challenge_dir(), content=content, source="observer",
+        shared_root(_challenge_dir()), content=content, source="observer",
         owner_attempt_id=_ctx.attempt_id,
     )
     return f"[Ideas] 已添加 [{idea.status}] {idea.id}: {content}"
+
+
+def command_publish(args: dict) -> str:
+    from solver.runtime.strategy_controller import load_decision_summary
+    summary = load_decision_summary(_challenge_dir())
+    try:
+        command = CommandBus(_challenge_dir()).publish(
+            action=str(args.get("action", "")),
+            target_attempt=str(args.get("target_attempt", "*")),
+            payload=args.get("payload") if isinstance(args.get("payload"), dict) else {},
+            state_version=int(args.get("state_version", summary.get("state_version", 0)) or 0),
+            expires_after_rounds=int(args.get("expires_after_rounds", 8) or 8),
+            round_num=int(summary.get("last_round", 0) or 0),
+        )
+    except ValueError as exc:
+        return f"[错误] {exc}"
+    try:
+        StateEventLog(_challenge_dir()).append(
+            "observer_command_published",
+            {"command_id": command["command_id"], "action": command["action"], "target": command["target_attempt"]},
+            attempt_id=_ctx.attempt_id,
+            run_id=getattr(_ctx, "run_id", ""),
+        )
+    except Exception:
+        pass
+    return f"[Command] 已发布 {command['command_id']} → {command['action']}，target={command['target_attempt']}"
+
+
+def artifact_list(args: dict) -> str:
+    status = str(args.get("status", "pending"))
+    items = ArtifactBus(_challenge_dir()).list(status=status, limit=50)
+    if not items:
+        return f"[Artifact] 没有 status={status} 的记录"
+    return "\n".join(
+        f"- {item.get('artifact_id')} [{item.get('status')}] "
+        f"{item.get('artifact_type')}: {item.get('value')} "
+        f"(owner={item.get('producer_attempt')}, confidence={item.get('confidence')})"
+        for item in items
+    )
+
+
+def artifact_approve(args: dict) -> str:
+    artifact_id = str(args.get("artifact_id", "")).strip()
+    if not artifact_id:
+        return "[错误] artifact_id 不能为空"
+    result = ArtifactBus(_challenge_dir()).approve(artifact_id, reviewer="observer")
+    if result:
+        try:
+            StateEventLog(_challenge_dir()).append(
+                "artifact_approved",
+                {"artifact_id": artifact_id},
+                attempt_id=_ctx.attempt_id,
+                run_id=getattr(_ctx, "run_id", ""),
+            )
+        except Exception:
+            pass
+    return f"[Artifact] {'已批准' if result else '未找到'} {artifact_id}"
+
+
+def memory_promote(args: dict) -> str:
+    proposal_id = str(args.get("proposal_id", "")).strip()
+    if not proposal_id:
+        return "[错误] proposal_id 不能为空"
+    return promote_memory_proposal(_challenge_dir(), proposal_id)
 
 
 def idea_update(args: dict) -> str:
     idea_id = args.get("idea_id", "")
     status = args.get("status", "")
     result = args.get("result", None)
-    ok = idea_store.update_idea(_challenge_dir(), idea_id, status=status, result=result)
+    root = find_idea_root(_challenge_dir(), idea_id)
+    target = next(
+        (idea for idea in observer_ideas(_challenge_dir())
+         if idea.id == idea_id or idea.id.startswith(idea_id)),
+        None,
+    )
+    ok = bool(root and idea_store.update_idea(root, idea_id, status=status, result=result))
+    if ok and target is not None and status in {"failed", "verified"}:
+        ClaimStore(_challenge_dir()).release(
+            target.content, owner=target.owner_attempt_id, status=status
+        )
     return f"[Ideas] {'已更新' if ok else '未找到'} {idea_id} → {status}"

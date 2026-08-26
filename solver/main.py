@@ -14,7 +14,8 @@ from solver.runtime.settings import (
     load_settings as _load_settings_from_env,
 )
 from solver.tools import bridge_tools
-from solver.runtime.submission_store import score_belongs_to_current_task
+from solver.runtime.submission_store import benchmark_task_id, score_belongs_to_current_task
+from solver.runtime.retry_ledger import RetryLedger
 
 
 def _emit(event_type: str, data=None) -> None:
@@ -209,8 +210,10 @@ def _run_tsecbench_mode() -> None:
     # 旧版（run-11649 基线）语义：连续 MAX_FAIL_STREAK 轮 0 correct 才放弃，
     # 部分解出（correct>0）重置计数。不用 made_progress / 无增量收敛，
     # 避免 hard 多阶段题在拿不到新增 flag 时被提前暂停。
-    fail_streak: dict[str, int] = {}
-    abandoned_codes: set[str] = set()
+    retry_ledger = RetryLedger(workspace_dir, benchmark_task_id())
+    retry_state = retry_ledger.snapshot()
+    fail_streak: dict[str, int] = dict(retry_state.get("fail_streak", {}))
+    abandoned_codes: set[str] = set(retry_state.get("abandoned", []))
     # 能力瓶颈题（多次 run 从未解出）：暂缓，把时间留给可保分的题。
     # 等 58 题稳定后再通过 SOLVER_SKIP_CODES 清空回来攻关。
     pre_skip_codes = _env_codes(
@@ -276,6 +279,17 @@ def _run_tsecbench_mode() -> None:
             round_settings = copy.deepcopy(settings)
             round_settings.setdefault("solver", {})["baseline_mode"] = True
 
+        retry_state = retry_ledger.snapshot()
+        retry_cooldown = {
+            code for code, until in retry_state.get("cooldown_until_round", {}).items()
+            if int(until or 0) > round_idx and code not in abandoned_codes
+        }
+        if retry_cooldown:
+            _emit("retry_cooldown", {
+                "round": round_idx,
+                "codes": sorted(retry_cooldown),
+            })
+
         scheduler = Scheduler(
             client=client,
             settings=round_settings,
@@ -284,7 +298,7 @@ def _run_tsecbench_mode() -> None:
             max_parallel=max_parallel,
             deadline=deadline,
             skip_completed=True,
-            skip_codes=pre_skip_codes | abandoned_codes | skip_hard_new,
+            skip_codes=pre_skip_codes | abandoned_codes | skip_hard_new | retry_cooldown,
             prefix_filter=prefix_filter,
         )
 
@@ -330,23 +344,26 @@ def _run_tsecbench_mode() -> None:
             "failed": len(this_round_failed),
         })
 
-        # 更新连续失败计数
-        for code in this_round_failed:
-            fail_streak[code] = fail_streak.get(code, 0) + 1
+        # 持久化连续失败、attempt 次数、cooldown 和 abandoned；重启后不丢。
+        retry_state = retry_ledger.record_round(
+            round_num=round_idx,
+            failed_codes=this_round_failed,
+            partial_codes={r.unique_code for r in report.results if not r.success and r.correct_flag_count > 0},
+            solved_codes={r.unique_code for r in report.results if r.success},
+            max_fail_streak=MAX_FAIL_STREAK,
+        )
+        fail_streak = dict(retry_state.get("fail_streak", {}))
+        previous_abandoned = set(abandoned_codes)
+        abandoned_codes = set(retry_state.get("abandoned", []))
 
         # 连续 MAX_FAIL_STREAK 轮失败（0 correct）→ 放弃
-        newly_abandoned = {
-            code for code, streak in fail_streak.items()
-            if streak >= MAX_FAIL_STREAK
-        }
-        abandoned_codes |= newly_abandoned
-        for code in newly_abandoned:
-            fail_streak.pop(code, None)
+        newly_abandoned = abandoned_codes - previous_abandoned
         if newly_abandoned:
             _emit("retry_abandoned", {
                 "codes": sorted(newly_abandoned),
                 "reason": "consecutive_zero_correct_rounds",
                 "total_abandoned": len(abandoned_codes),
+                "persisted": True,
             })
 
         # 检查是否还有未完成的题

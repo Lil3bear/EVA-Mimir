@@ -13,7 +13,7 @@ class RunContextTests(unittest.TestCase):
     def tearDown(self):
         ctx.reset()
 
-    def test_attempts_share_blackboard_but_isolate_files(self):
+    def test_attempts_isolate_private_memory_and_files(self):
         root = tempfile.mkdtemp(prefix="runtime-context-")
         base = RunContext.create(root, "hard-01")
         aggressive = base.for_attempt("aggressive")
@@ -21,24 +21,47 @@ class RunContextTests(unittest.TestCase):
 
         with ctx.bind(aggressive):
             file_tools.write_file({"path": "exploit.py", "content": "aggressive"})
-            memory.add_memory(
-                Path(ctx.challenge_dir), "fact", "service is nginx",
-                attempt_id=ctx.attempt_id,
-            )
+            memory_tools.memory_add({
+                "kind": "fact", "content": "service is nginx",
+            })
             ideas.add_idea(
-                Path(ctx.challenge_dir), "test request smuggling",
+                Path(ctx.attempt_dir), "test request smuggling",
                 owner_attempt_id=ctx.attempt_id,
             )
 
         with ctx.bind(steady):
             file_tools.write_file({"path": "exploit.py", "content": "steady"})
-            memories = memory.list_memory(Path(ctx.challenge_dir))
-            shared_ideas = ideas.list_ideas(Path(ctx.challenge_dir))
+            memories = memory_tools.memory_list({})
+            private_ideas = ideas.list_ideas(Path(ctx.attempt_dir))
 
         self.assertEqual((Path(aggressive.attempt_dir) / "exploit.py").read_text(), "aggressive")
         self.assertEqual((Path(steady.attempt_dir) / "exploit.py").read_text(), "steady")
-        self.assertEqual(memories[0].attempt_id, "aggressive")
-        self.assertEqual(shared_ideas[0].owner_attempt_id, "aggressive")
+        self.assertIn("暂无记录", memories)
+        self.assertEqual(private_ideas, [])
+
+    def test_memory_share_is_proposal_until_promoted(self):
+        from solver.runtime.scoped_state import list_memory_proposals, promote_memory_proposal
+
+        root = tempfile.mkdtemp(prefix="runtime-share-")
+        base = RunContext.create(root, "hard-share")
+        with ctx.bind(base.for_attempt("aggressive")):
+            result = memory_tools.memory_share({
+                "kind": "evidence",
+                "content": "confirmed service is reachable",
+            })
+            self.assertIn("共享提案", result)
+            self.assertIn("暂无记录", memory_tools.memory_list({}))
+
+        with ctx.bind(base.for_attempt("steady")):
+            self.assertIn("暂无记录", memory_tools.memory_list({}))
+
+        proposals = list_memory_proposals(Path(base.challenge_dir))
+        self.assertEqual(len(proposals), 1)
+        promoted = promote_memory_proposal(Path(base.challenge_dir), proposals[0]["id"])
+        self.assertIn("共享证据", promoted)
+
+        with ctx.bind(base.for_attempt("steady")):
+            self.assertIn("confirmed service", memory_tools.memory_list({}))
 
     def test_thread_contexts_do_not_leak(self):
         root = tempfile.mkdtemp(prefix="runtime-threads-")

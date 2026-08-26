@@ -40,12 +40,17 @@ from solver.ctfplatform.tsecbench_client import (
 )
 from solver.tools import bridge_tools
 from solver.runtime.challenge_ledger import ChallengeLedger
+from solver.runtime.contracts import SubtaskContract, write_contract
 from solver.runtime.submission_store import (
     prepare_challenge_state,
     score_belongs_to_current_task,
 )
 from solver.worker_context import RunContext, ctx as _ctx
-from solver.runtime.portfolio import PortfolioBudget, build_portfolio
+from solver.runtime.portfolio import (
+    PortfolioBudget,
+    build_portfolio,
+    challenge_memory_scope,
+)
 
 DEFAULT_MAX_PARALLEL = 3
 
@@ -470,13 +475,21 @@ class Scheduler:
         )
 
         portfolio = build_portfolio(challenge)
+        memory_scope = challenge_memory_scope(challenge)
         observer_leader = portfolio[0].name
         portfolio_budget = PortfolioBudget(expected_attempts=len(portfolio))
+        _emit("multi_solver_memory_scope", {
+            "unique_code": code,
+            "memory_scope": memory_scope,
+            "attempts": [spec.name for spec in portfolio],
+        })
 
         def _run_one(spec):
             """运行一个 Solver 实例。"""
             try:
-                attempt_context = base_context.for_attempt(spec.name)
+                attempt_context = base_context.for_attempt(
+                    spec.name, memory_scope=memory_scope
+                )
                 with _ctx.bind(attempt_context, self.client):
                     return _run_bound_attempt(spec, attempt_context)
             except (TaskNotFound, InvalidState) as e:
@@ -511,6 +524,22 @@ class Scheduler:
         ) -> None:
             bridge_tools.configure_tsecbench(self.client, code)
 
+            contract = SubtaskContract(
+                task_id=attempt_context.run_id,
+                challenge_id=code,
+                attempt_id=spec.name,
+                objective=spec.objective,
+                hypothesis=spec.hypothesis,
+                allowed_scope=spec.allowed_scope,
+                success_condition=spec.success_condition,
+                stop_condition=spec.stop_condition,
+            )
+            write_contract(attempt_context.attempt_dir, contract)
+            _emit("subtask_assigned", {
+                "unique_code": code,
+                "attempt_id": spec.name,
+                "contract": contract.to_dict(),
+            })
             task = self._build_agent_task(
                 challenge,
                 container_addr,
@@ -521,7 +550,7 @@ class Scheduler:
                 objective=spec.objective,
                 success_condition=spec.success_condition,
                 attempt_context=attempt_context,
-            )
+            ) + "\n\n" + contract.prompt_text()
 
             strategy_settings = dict(self.settings)
             solver_cfg = dict(strategy_settings.get("solver", {}))
@@ -831,11 +860,27 @@ class Scheduler:
             _ctx.reset()
             return result
 
+        contract = SubtaskContract(
+            task_id=run_context.run_id,
+            challenge_id=code,
+            attempt_id="primary",
+            objective="完成当前题目并验证提交结果",
+            hypothesis="选择一个有证据支持的最短解法并验证提交",
+            success_condition="获得可重复验证的 flag 或明确记录终止边界",
+            stop_condition="无新证据时停止重复并记录失败边界",
+        )
+        write_contract(run_context.attempt_dir, contract)
+        _emit("subtask_assigned", {
+            "unique_code": code,
+            "attempt_id": "primary",
+            "contract": contract.to_dict(),
+        })
         task = self._build_agent_task(
             challenge,
             container_addr,
             challenge_workspace,
-        )
+            attempt_context=run_context,
+        ) + "\n\n" + contract.prompt_text()
 
         try:
             agent = self._agent_factory(

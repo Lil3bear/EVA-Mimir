@@ -12,6 +12,8 @@ from solver.ctfplatform.tsecbench_client import (
     TsecbenchClient,
 )
 from solver.runtime.challenge_ledger import ChallengeLedger
+from solver.runtime.stage_ledger import StageLedger
+from solver.runtime.state_events import StateEventLog
 from solver.runtime.submission_store import SubmissionOutcome, SubmissionStore
 from solver.worker_context import ctx as _ctx
 
@@ -297,6 +299,25 @@ def submit_flag(args: dict) -> str:
         )
 
     data = outcome.response or {}
+    if challenge_dir and data:
+        try:
+            stage_state = StageLedger(challenge_dir).record_submission(
+                data, attempt_id=getattr(_ctx, "attempt_id", "primary")
+            )
+            StateEventLog(challenge_dir).append(
+                "flag_progressed",
+                {
+                    "correct": bool(data.get("correct")),
+                    "correct_flags": stage_state.get("correct_flags", 0),
+                    "total_flags": stage_state.get("total_flags", 0),
+                    "matched_index": data.get("matched_flag_index"),
+                },
+                attempt_id=getattr(_ctx, "attempt_id", "primary"),
+                run_id=getattr(_ctx, "run_id", ""),
+            )
+        except Exception as exc:
+            # Submission remains authoritative; ledger is a coordination aid.
+            data.setdefault("stage_ledger_warning", str(exc))
     if data.get("duplicate"):
         correct = data.get("correct_flag_count", "?")
         total = data.get("total_flag_count", "?")
@@ -331,7 +352,13 @@ def submit_flag(args: dict) -> str:
 
 def get_state(args: dict) -> str:
     data = _request_backend("challenge_get_state", args)
-    if data.get("challenges"):
+    challenge_dir = _challenge_dir()
+    if challenge_dir and not data.get("challenges"):
+        try:
+            StageLedger(challenge_dir).reconcile_state(data)
+        except Exception:
+            pass
+    if data.get("challenges"): 
         return "[题目列表]\n" + "\n".join(
             f"- {item.get('unique_code')}: {item.get('correct_flag_count', 0)}/{item.get('flag_count', 0)}，"
             f"状态={item.get('container_status')}，完成={item.get('is_completed')}"
@@ -340,12 +367,24 @@ def get_state(args: dict) -> str:
     correct = int(data.get("correct_flag_count", 0))
     total = int(data.get("flag_count", 0))
     remaining = max(0, total - correct)
+    stage_line = ""
+    if challenge_dir:
+        try:
+            stage = StageLedger(challenge_dir).snapshot()
+            stage_line = (
+                f"阶段账本：{stage.get('current_stage', 'stage_1')}，"
+                f"已提交索引 {stage.get('correct_flags', 0)}/{stage.get('total_flags', total)}"
+            )
+        except Exception:
+            stage_line = ""
     lines = [
         f"题目：{data.get('name')} ({data.get('category')} / {data.get('difficulty')})",
         f"URL：{data.get('url')}",
         f"描述：{data.get('description')}",
         f"Flag 进度：已找到 {correct}/{total} 个",
     ]
+    if stage_line:
+        lines.append(stage_line)
     if data.get("is_completed"):
         lines.append("状态：✅ 已完成（全部 Flag 已提交）")
     else:

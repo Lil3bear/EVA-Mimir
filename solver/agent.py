@@ -7,7 +7,7 @@ from typing import Any
 
 from openai import BadRequestError, OpenAI
 
-from solver.tools import bash_tool, file_tools, memory_tools, idea_tools, bridge_tools, search_tool, skill_tool
+from solver.tools import bash_tool, file_tools, memory_tools, idea_tools, artifact_tools, bridge_tools, search_tool, skill_tool
 from solver.observer.loop import ObserverLoop
 from solver.runtime.llm import (
     DEEPSEEK_V4_COMPACTION_RESERVE_TOKENS,
@@ -29,8 +29,12 @@ from solver.runtime.control import (
     LaneMode,
 )
 from solver.runtime.journal import ExecutionJournal
+from solver.runtime.commands import CommandBus
+from solver.runtime.claims import ClaimStore
+from solver.runtime.lineage import SessionLineage
 from solver.runtime.recovery import recover_execution
 from solver.runtime.strategy_controller import StrategyController
+from solver.runtime.scoped_state import solver_ideas, solver_memories
 from solver.runtime.tool_runner import ToolRunner, parse_tool_args
 from solver.tools.registry import ToolRegistry, ToolSpec, load_plugin_tools
 from solver.worker_context import RunContext, ctx as _ctx
@@ -44,6 +48,9 @@ _BUILTIN_TOOLS = (
     ToolSpec(file_tools.GREP_TOOL_DEF, file_tools.grep),
     ToolSpec(memory_tools.MEMORY_ADD_TOOL_DEF, memory_tools.memory_add),
     ToolSpec(memory_tools.MEMORY_LIST_TOOL_DEF, memory_tools.memory_list),
+    ToolSpec(memory_tools.MEMORY_SHARE_TOOL_DEF, memory_tools.memory_share),
+    ToolSpec(artifact_tools.ARTIFACT_LIST_TOOL_DEF, artifact_tools.artifact_list),
+    ToolSpec(artifact_tools.ARTIFACT_PUBLISH_TOOL_DEF, artifact_tools.artifact_publish),
     ToolSpec(idea_tools.IDEA_LIST_TOOL_DEF, idea_tools.idea_list),
     ToolSpec(search_tool.TOOL_DEF, search_tool.search),
     ToolSpec(skill_tool.TOOL_DEFS[0], skill_tool.skill_list),
@@ -234,9 +241,14 @@ class SolverAgent:
                 value = default
             return max(2, value)
 
+        strategy_state_dir = (
+            Path(getattr(_ctx, "attempt_dir", challenge_dir)) / "control"
+            if challenge_dir and challenge_dir != "/workspace"
+            else Path(challenge_dir or "/workspace")
+        )
         self._strategy_controller = (
             StrategyController(
-                challenge_dir,
+                strategy_state_dir,
                 attempt_id=getattr(_ctx, "attempt_id", "primary"),
                 difficulty=difficulty,
                 switch_after=self._switch_after_rounds,
@@ -342,6 +354,7 @@ class SolverAgent:
         self._pending_injections: list[str] = []  # 缓冲 observer 注入，下一轮开始时注入
         self._injection_lock = threading.Lock()
         self.round = 0
+        self._command_stop = False
         self.solved = False  # 是否已解出全部 flag
         self._stop_event = None  # Multi-Solver 用：另一个 Solver 解出时置位
         # 纠偏不服从检测
@@ -352,7 +365,16 @@ class SolverAgent:
         attempt_dir = _ctx.attempt_dir or _ctx.challenge_dir or "/root/workspace"
         self._history_path = os.path.join(attempt_dir, ".solver-history.jsonl")
         self._journal = ExecutionJournal(os.path.join(attempt_dir, ".execution-journal.jsonl"))
+        self._lineage = SessionLineage(
+            os.path.join(attempt_dir, ".session-lineage.jsonl"),
+            scope={
+                "run_id": str(getattr(_ctx, "run_id", "")),
+                "challenge_id": str(getattr(_ctx, "challenge_id", "")),
+                "attempt_id": str(getattr(_ctx, "attempt_id", "primary")),
+            },
+        )
         self._recovery_state = self._journal.start()
+        self._lineage.start({"difficulty": difficulty})
         self._tool_registry = _build_tool_registry(settings)
         self._tool_defs = self._tool_registry.definitions
         self._tool_executors = self._tool_registry.executors
@@ -411,6 +433,13 @@ class SolverAgent:
                 })
                 return
             self.round += 1
+            _ctx.current_round = self.round
+            self._consume_observer_commands()
+            if self._command_stop:
+                self.observer.stop()
+                self._finish_execution("observer_command_stop")
+                _emit("agent_end", {"rounds": self.round, "reason": "observer_command_stop"})
+                return
 
             # ━━ Multi-Solver：另一个 Solver 已解出，本实例停止 ━━
             if self._stop_event is not None and self._stop_event.is_set():
@@ -716,6 +745,35 @@ class SolverAgent:
             getattr(self, "_tool_executors", TOOL_EXECUTORS),
         )
 
+    def _consume_observer_commands(self) -> None:
+        if not getattr(_ctx, "challenge_dir", "") or _ctx.challenge_dir == "/workspace":
+            return
+        try:
+            bus = CommandBus(_ctx.challenge_dir)
+            commands = bus.pending(attempt_id=_ctx.attempt_id, round_num=self.round)
+            for command in commands:
+                action = command.get("action", "")
+                payload = command.get("payload") or {}
+                self._queue_injection(
+                    f"[Observer Command] action={action}; "
+                    f"payload={json.dumps(payload, ensure_ascii=False)}; "
+                    "该命令只适用于当前 attempt，请根据当前证据执行。"
+                )
+                if action in {"pause_attempt", "close_attempt"}:
+                    self._command_stop = True
+                bus.acknowledge(
+                    command.get("command_id", ""),
+                    attempt_id=_ctx.attempt_id,
+                    result="stop_requested" if self._command_stop else "queued",
+                )
+                _emit("observer_command_consumed", {
+                    "command_id": command.get("command_id", ""),
+                    "action": action,
+                    "attempt_id": _ctx.attempt_id,
+                })
+        except Exception as exc:
+            _emit("observer_command_error", {"error": str(exc)})
+
     def _claim_portfolio_round(self) -> bool:
         budget = getattr(self, "_portfolio_budget", None)
         if budget is None:
@@ -750,6 +808,22 @@ class SolverAgent:
             })
 
     def _finish_execution(self, reason: str) -> None:
+        try:
+            if getattr(_ctx, "challenge_dir", "") and _ctx.challenge_dir != "/workspace":
+                released = ClaimStore(_ctx.challenge_dir).release_owner(
+                    _ctx.attempt_id, status="released"
+                )
+                if released:
+                    _emit("hypothesis_claims_released", {
+                        "attempt_id": _ctx.attempt_id,
+                        "count": released,
+                    })
+        except Exception as exc:
+            _emit("claim_release_error", {"error": str(exc)})
+        try:
+            self._lineage.finish(reason)
+        except Exception as exc:
+            _emit("lineage_error", {"phase": "finish", "error": str(exc)})
         try:
             self._journal.finish(reason)
         except Exception as exc:
@@ -1002,11 +1076,12 @@ class SolverAgent:
 
     def _write_history(self) -> None:
         try:
-            # 只保留最近 20 条，跳过 system prompt
+            # 保留旧 history 文件供 Observer 兼容读取；完整 session 追加到 lineage。
             recent = [m for m in self.messages if m.get("role") != "system"][-20:]
             with open(self._history_path, "w", encoding="utf-8") as f:
                 for m in recent:
                     f.write(json.dumps(m, ensure_ascii=False) + "\n")
+            self._lineage.checkpoint(round_num=self.round, messages=recent)
         except Exception:
             pass
 
@@ -1016,6 +1091,13 @@ class SolverAgent:
         ).compact(self.messages, self._generate_summary)
         if compacted.changed:
             self._compaction_summary = compacted.summary
+            try:
+                self._lineage.compact(
+                    compacted.summary,
+                    round_num=self.round,
+                )
+            except Exception as exc:
+                _emit("lineage_error", {"phase": "compaction", "error": str(exc)})
         return compacted.messages
 
     def _generate_summary(self, discarded: list[dict]) -> str:
@@ -1093,8 +1175,15 @@ class SolverAgent:
                 challenge_id = os.environ.get("CTF_CHALLENGE_ID", "")
                 challenge_dir = Path(challenge_dir_str) / challenge_id if challenge_id else Path(challenge_dir_str)
 
-            memories = mem_store.list_memory(challenge_dir)
-            ideas = idea_store.list_ideas(challenge_dir, limit=8)
+            scope = getattr(_ctx, "memory_scope", "private") or "private"
+            memories = solver_memories(
+                challenge_dir, getattr(_ctx, "attempt_dir", challenge_dir),
+                scope=scope,
+            )
+            ideas = solver_ideas(
+                challenge_dir, getattr(_ctx, "attempt_dir", challenge_dir),
+                limit=8, scope=scope,
+            )
         except Exception:
             return ""
 
@@ -1605,6 +1694,13 @@ class SolverAgent:
                 action=ControlAction.CONTINUE.value,
                 idle_rounds=0,
             )
+        same_action_streak = 0
+        controller = getattr(self, "_strategy_controller", None)
+        if controller is not None:
+            try:
+                same_action_streak = int(controller.snapshot().same_action_streak)
+            except Exception:
+                same_action_streak = 0
         return self._control_policy.decide(
             round_num=self.round,
             last_progress_round=self._last_progress_round,
@@ -1613,6 +1709,7 @@ class SolverAgent:
             strategy_failures=getattr(self, "_strategy_failure_count", 0),
             switch_already_requested=getattr(self, "_stuck_switched", False),
             hint_focus_exhausted=self._hint_focus_exhausted(),
+            same_action_streak=same_action_streak,
         )
 
     def _upgrade_to_deep_lane(self, decision: ControlDecision) -> None:

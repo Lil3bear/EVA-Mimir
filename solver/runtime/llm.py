@@ -65,15 +65,14 @@ def completion_kwargs(
         kwargs["max_tokens"] = max_tokens
 
     if is_deepseek_v4(model):
-        if thinking_enabled and reasoning_effort not in {"high", "max"}:
-            raise ValueError("DeepSeek V4 reasoning_effort must be high or max")
-        # DeepSeek V4 thinking rejects tool_choice. extra_body also works with
-        # older OpenAI SDK releases that do not expose reasoning_effort yet.
+        # DeepSeek V4 thinking rejects tool_choice. reasoning_effort 必须是
+        # 顶层字段（放进 extra_body 时 tokenhub 不生效，导致每轮都按
+        # 默认 high 读满 reasoning）。
         kwargs["extra_body"] = {
             "thinking": {"type": "enabled" if thinking_enabled else "disabled"},
         }
         if thinking_enabled:
-            kwargs["extra_body"]["reasoning_effort"] = reasoning_effort
+            kwargs["reasoning_effort"] = reasoning_effort
     elif tool_choice is not None:
         kwargs["tool_choice"] = tool_choice
     return kwargs

@@ -272,7 +272,8 @@ class SchedulerTests(unittest.TestCase):
         ).run_all()
 
         self.assertEqual(report.solved, 1)
-        mock_agent.run.assert_called_once()
+        # c-前缀属于前排 web/misc 家族，现在走隔离多解（两个策略各跑一次）。
+        mock_agent.run.assert_called()
         self.assertIn("10.0.0.2:23", mock_factory.call_args.kwargs["task"])
 
     def test_handles_start_invalid_state(self):

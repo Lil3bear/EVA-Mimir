@@ -32,3 +32,4 @@ nul
 
 # Local run logs (never package benchmark traces)
 run_log_*.log
+.DS_Store
