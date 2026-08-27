@@ -1,15 +1,33 @@
 #!/bin/bash
 # EVA-Mimir 一键启动脚本
-# 用法：./run.sh <BENCHMARK_TOKEN> [PREFIX_FILTER]
-# 示例：./run.sh 6f395a9a-bd2b-4f54-8516-b12fcf31b6f7
-#       ./run.sh 6f395a9a-bd2b-4f54-8516-b12fcf31b6f7 b-   # 只跑多阶段渗透
+# 用法：BENCHMARK_TOKEN=... ./run.sh [PREFIX_FILTER]
 
-set -e
+set -euo pipefail
 
-TOKEN="${1:?请提供 BENCHMARK_TOKEN，用法：./run.sh <TOKEN> [PREFIX_FILTER]}"
-PREFIX_FILTER="${2:-}"
-BASE_URL="https://tsecbench.zc.tencent.com"
+PREFIX_FILTER="${1:-}"
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# 从项目内 .env 读取 Tsecbench 配置（不提交到版本库）
+if [ -f "$PROJECT_DIR/.env" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$PROJECT_DIR/.env"
+    set +a
+fi
+
+TOKEN="${BENCHMARK_TOKEN:-}"
+BASE_URL="${BENCHMARK_BASE_URL:-https://tsecbench.zc.tencent.com}"
+SOLVER_IMAGE="${SOLVER_IMAGE:-eva-mimir-solver:latest}"
+SOLVER_PLATFORM="${SOLVER_PLATFORM:-linux/amd64}"
+
+if [ -z "$TOKEN" ]; then
+    echo "请先设置 BENCHMARK_TOKEN（可在项目根目录 .env 中配置）。" >&2
+    exit 1
+fi
+
+if [ ! -f "$PROJECT_DIR/settings.local.json" ] && [ ! -f "$PROJECT_DIR/settings.json" ]; then
+    echo "未找到 settings.local.json/settings.json，将仅使用运行时环境变量。"
+fi
 
 echo "============================================"
 echo "  EVA-Mimir 一键启动"
@@ -23,11 +41,16 @@ echo "============================================"
 # ---- 检查 VPN ----
 echo ""
 echo "[1/4] 检查 VPN..."
-VPN_RESP=$(curl -s --connect-timeout 5 http://10.0.100.58 2>&1 || true)
+# VPN 以 --network host 运行在 docker 的 Linux VM 网络命名空间中，
+# 因此不能直接用宿主机 macOS 的 curl 检测，需在 host 网络命名空间内检测。
+VPN_RESP=""
+if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^tsec-vpn$'; then
+    VPN_RESP=$(docker exec tsec-vpn sh -c "curl -s --connect-timeout 5 http://10.0.100.58" 2>/dev/null || true)
+fi
 if echo "$VPN_RESP" | grep -q '"status":"ok"'; then
     echo "  ✅ VPN 已连接"
 else
-    echo "  ❌ VPN 不通，请先连接 OpenVPN"
+    echo "  ❌ VPN 不通，请先运行 ./vpn.sh 连接 OpenVPN"
     echo "     响应: $VPN_RESP"
     exit 1
 fi
@@ -40,15 +63,18 @@ if ! docker ps &>/dev/null; then
 fi
 echo "  ✅ Docker 运行中"
 
-# ---- 构建镜像（仅当镜像不存在或强制构建时） ----
+# ---- 每次走 Docker 缓存构建，确保依赖和镜像内代码不漂移 ----
 echo "[3/4] 构建镜像..."
 cd "$PROJECT_DIR"
-if [ "${FORCE_BUILD:-0}" = "1" ] || ! docker inspect eva-mimir-solver:latest &>/dev/null; then
-    docker build -t eva-mimir-solver:latest -f docker/Dockerfile . 2>&1 | tail -3
-    echo "  ✅ 镜像构建完成"
-else
-    echo "  ✅ 镜像已存在，跳过构建（FORCE_BUILD=1 可强制重建）"
+BUILD_ARGS=(--platform "$SOLVER_PLATFORM")
+case "$SOLVER_PLATFORM" in
+    *arm64*|*aarch64*) BUILD_ARGS+=(--build-arg APT_MIRROR=http://ports.ubuntu.com/ubuntu-ports/) ;;
+esac
+if [ "${FORCE_BUILD:-0}" = "1" ]; then
+    BUILD_ARGS+=(--no-cache)
 fi
+docker build "${BUILD_ARGS[@]}" -t "$SOLVER_IMAGE" -f docker/Dockerfile . 2>&1 | tail -3
+echo "  ✅ 镜像已同步（$SOLVER_PLATFORM）"
 
 # ---- 清理旧容器 ----
 docker rm -f eva-mimir-run 2>/dev/null || true
@@ -56,10 +82,24 @@ docker rm -f eva-mimir-run 2>/dev/null || true
 # ---- 启动 ----
 echo "[4/4] 启动解题..."
 echo ""
-PREFIX_ENV=""
+PREFIX_ENV=()
 if [ -n "$PREFIX_FILTER" ]; then
-    PREFIX_ENV="-e SOLVER_PREFIX_FILTER=$PREFIX_FILTER"
+    PREFIX_ENV=(-e "SOLVER_PREFIX_FILTER=$PREFIX_FILTER")
 fi
+SETTINGS_MOUNT=()
+if [ -f "$PROJECT_DIR/settings.local.json" ]; then
+    SETTINGS_MOUNT=(-v "$PROJECT_DIR/settings.local.json:/workspace/settings.local.json:ro")
+elif [ -f "$PROJECT_DIR/settings.json" ]; then
+    SETTINGS_MOUNT=(-v "$PROJECT_DIR/settings.json:/workspace/settings.json:ro")
+fi
+
+# LLM 环境变量：仅在显式设置时覆盖镜像 ENV 默认；否则用镜像内置配置。
+LLM_ENV_ARGS=()
+if [ -n "${LLM_BASE_URL:-}" ]; then LLM_ENV_ARGS+=(-e "LLM_BASE_URL=${LLM_BASE_URL}"); fi
+if [ -n "${LLM_API_KEY:-}" ]; then LLM_ENV_ARGS+=(-e "LLM_API_KEY=${LLM_API_KEY}"); fi
+if [ -n "${LLM_MODEL:-}" ]; then LLM_ENV_ARGS+=(-e "LLM_MODEL=${LLM_MODEL}"); fi
+if [ -n "${LLM_PRO_MODEL:-}" ]; then LLM_ENV_ARGS+=(-e "LLM_PRO_MODEL=${LLM_PRO_MODEL}"); fi
+if [ -n "${LLM_GATEWAY:-}" ]; then LLM_ENV_ARGS+=(-e "LLM_GATEWAY=${LLM_GATEWAY}"); fi
 
 docker run --rm --network host \
   --name eva-mimir-run \
@@ -67,17 +107,19 @@ docker run --rm --network host \
   -e BENCHMARK_TOKEN="$TOKEN" \
   -e CTF_WORKSPACE=/workspace \
   -e CTF_SKILLS_DIR=/skills \
-  -e SOLVER_MAX_PARALLEL=3 \
-  -e SOLVER_MAX_RETRY_ROUNDS=5 \
-  -e SOLVER_TOTAL_TIMEOUT=350 \
-  $PREFIX_ENV \
-  -v "$PROJECT_DIR/settings.local.json:/workspace/settings.local.json:ro" \
+  -e SOLVER_MAX_PARALLEL="${SOLVER_MAX_PARALLEL:-3}" \
+  -e SOLVER_MAX_RETRY_ROUNDS="${SOLVER_MAX_RETRY_ROUNDS:-5}" \
+  -e SOLVER_TOTAL_TIMEOUT="${SOLVER_TOTAL_TIMEOUT:-350}" \
+  -e LLM_MAX_CONCURRENCY="${LLM_MAX_CONCURRENCY:-4}" \
+  "${LLM_ENV_ARGS[@]}" \
+  "${PREFIX_ENV[@]}" \
+  "${SETTINGS_MOUNT[@]}" \
   -v "$PROJECT_DIR/workspace:/workspace" \
   -v "$PROJECT_DIR/skills:/opt/ctf-agent/skills:ro" \
   -v "$PROJECT_DIR/prompts:/opt/ctf-agent/prompts:ro" \
   -v "$PROJECT_DIR/solver:/opt/ctf-agent/solver:ro" \
   -v "$PROJECT_DIR/shared:/opt/ctf-agent/shared:ro" \
-  eva-mimir-solver:latest
+  "$SOLVER_IMAGE"
 
 echo ""
 echo "============================================"

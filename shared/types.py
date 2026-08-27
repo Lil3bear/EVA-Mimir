@@ -49,6 +49,7 @@ class MemoryEntry:
     created_at: float
     refs: list[str] = field(default_factory=list)
     source: str = "solver"
+    attempt_id: str = "primary"
 
 
 @dataclass
@@ -60,6 +61,7 @@ class IdeaRecord:
     updated_at: float
     result: str = ""
     source: str = "solver"
+    owner_attempt_id: str = "primary"
 
 
 @dataclass

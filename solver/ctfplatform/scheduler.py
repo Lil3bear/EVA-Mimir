@@ -14,70 +14,75 @@
 
 import json
 import os
-import sys
+import random
 import time
 import threading
-import queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import logging
-
-logger = logging.getLogger(__name__)
-
+from solver.ctfplatform.policy import sort_challenges as _sort_challenges
+from solver.ctfplatform.scoreboard import Scoreboard
+from solver.ctfplatform.task_builder import (
+    TaskBuilder,
+    build_task_from_challenge as _build_task_from_challenge,
+)
 from solver.ctfplatform.tsecbench_client import (
     Challenge,
-    ChallengeNotFound,
-    DuplicateSubmit,
     InvalidState,
     ResourceUnavailable,
+    TaskNotFound,
     TsecbenchClient,
     TsecbenchConnectionError,
     TsecbenchError,
     VpnCheckError,
 )
 from solver.tools import bridge_tools
-from solver.worker_context import ctx as _ctx
-from solver.ctfplatform.scoreboard import Scoreboard
-
-
-DIFFICULTY_ORDER = {
-    "easy": 0,
-    "medium": 1,
-    "hard": 2,
-    "difficult": 2,
-}
+from solver.runtime.challenge_ledger import ChallengeLedger
+from solver.runtime.contracts import SubtaskContract, write_contract
+from solver.runtime.submission_store import (
+    prepare_challenge_state,
+    score_belongs_to_current_task,
+)
+from solver.worker_context import RunContext, ctx as _ctx
+from solver.runtime.portfolio import (
+    PortfolioBudget,
+    build_portfolio,
+    challenge_memory_scope,
+)
 
 DEFAULT_MAX_PARALLEL = 3
 
 # start_challenge 失败后的重试参数
 _START_RETRY_MAX = 5
-_START_RETRY_INTERVAL = 30  # 秒
+_START_RETRY_INTERVAL = 5  # 秒；指数退避后封顶 60 秒
 
 # close_challenge 失败后的重试参数
 _CLOSE_RETRY_MAX = 3
 _CLOSE_RETRY_INTERVAL = 5  # 秒
 
-# 靶场健康检查参数
-_HEALTH_CHECK_MAX = 3       # 最多检查次数（从 5 降到 3，减少等待）
-_HEALTH_CHECK_INTERVAL = 5   # 每次间隔（秒，从 10 降到 5）
-_HEALTH_CHECK_TIMEOUT = 8    # 单次连接超时（秒，从 10 降到 8）
-
-# 环境不可用的重试参数
-_ENV_RETRY_INTERVAL = 300  # 5 分钟后重试
-
 
 @dataclass
 class SchedulerResult:
-    """单题解题结果"""
+    """单题解题结果及本次 attempt 的实际增量。"""
     unique_code: str
     success: bool
     correct_flag_count: int = 0
     total_flag_count: int = 0
     error: str = ""
     rounds: int = 0
+    initial_correct_flag_count: int = 0
+    material_progress_count: int = 0
+    difficulty: str = ""
+
+    @property
+    def new_flag_count(self) -> int:
+        return max(0, self.correct_flag_count - self.initial_correct_flag_count)
+
+    @property
+    def made_progress(self) -> bool:
+        return bool(self.success or self.new_flag_count > 0 or self.material_progress_count > 0)
 
 
 @dataclass
@@ -93,315 +98,82 @@ class SchedulerReport:
     results: list[SchedulerResult] = field(default_factory=list)
 
 
-_emit_lock = threading.Lock()
-
-
 def _emit(event_type: str, data: Any = None) -> None:
-    from shared.jsonl import serialize
-    msg = {"type": event_type, "data": data}
-    with _emit_lock:
-        sys.stdout.write(serialize(msg))
-        sys.stdout.flush()
+    from shared.jsonl import write_line
+    write_line({"type": event_type, "data": data})
 
 
-def _sort_challenges(challenges: list[Challenge]) -> list[Challenge]:
-    """
-    按优先级评分降序排列。
-    考虑：难度权重 + 题目类型权重 + 部分进展加分 + 未尝试加分。
-    """
-    def _score(c: Challenge) -> float:
-        score = 0.0
+def _deadline_reached(deadline: float) -> bool:
+    return bool(deadline and time.time() >= deadline)
 
-        # 难度权重（easy 先做）
-        score += {"easy": 30, "medium": 20, "hard": 10, "difficult": 10}.get(
-            c.difficulty.lower(), 10
+
+def _sleep_retry(seconds: float, deadline: float = 0.0) -> None:
+    """Sleep for a retry interval without crossing the run deadline."""
+    seconds = max(0.0, float(seconds or 0.0))
+    if not seconds:
+        return
+    if deadline:
+        seconds = min(seconds, max(0.0, deadline - time.time()))
+    if seconds:
+        time.sleep(seconds)
+
+
+def _retry_delay(base: float, attempt: int, *, cap: float = 60.0) -> float:
+    """Exponential retry delay with jitter to avoid synchronized workers."""
+    base = max(0.0, float(base or 0.0))
+    if not base:
+        return 0.0
+    delay = min(float(cap), base * (2 ** max(0, attempt - 1)))
+    return delay * random.uniform(0.85, 1.15)
+
+
+def _is_capacity_invalid_state(error: InvalidState) -> bool:
+    """Only the platform's max-active variant is retryable."""
+    text = " ".join(
+        str(value).lower()
+        for value in (
+            error,
+            getattr(error, "message", ""),
+            getattr(error, "detail", ""),
         )
-
-        # 题目类型权重（Agent 擅长的优先做）
-        code_lower = c.unique_code.lower()
-        if code_lower.startswith('a-') or code_lower.startswith('c-'):
-            score += 15   # Web/杂项，LLM 最擅长
-        elif code_lower.startswith('d-'):
-            score += 12   # 漏洞利用
-        elif code_lower.startswith('f1'):
-            score += 12   # 对抗规避-1，正确率高
-        elif code_lower.startswith('e2') or code_lower.startswith('e3'):
-            score += 8    # 二进制 2/3，正确率较高
-        elif code_lower.startswith('e1'):
-            score += 5    # 二进制-1
-        elif code_lower.startswith('f2'):
-            score += 0    # 对抗规避-2，最难
-        elif code_lower.startswith('b-'):
-            score += 5    # 多阶段渗透，难但分值高
-
-        # 部分进展加分（已经有 flag 的优先继续）
-        if c.correct_flag_count > 0:
-            score += 20
-
-        return score
-
-    return sorted(challenges, key=_score, reverse=True)
-
-
-def _ensure_target_ready(url: str) -> bool:
-    """
-    靶场健康检查：start_challenge 成功后探测目标是否可达。
-    最多重试 _HEALTH_CHECK_MAX 次，每次间隔 _HEALTH_CHECK_INTERVAL 秒。
-    返回 True 可达，False 不可达。
-    """
-    import subprocess
-    import time as _time
-    for attempt in range(1, _HEALTH_CHECK_MAX + 1):
-        _t_curl = _time.time()
-        try:
-            result = subprocess.run(
-                ["curl", "-sf", "--max-time", str(_HEALTH_CHECK_TIMEOUT),
-                 "-o", "/dev/null", "-w", "%{http_code}", url],
-                capture_output=True, text=True, timeout=_HEALTH_CHECK_TIMEOUT + 5,
-            )
-            status = result.stdout.strip()
-            if status and int(status) < 500:
-                _emit("health_check_ok", {"url": url, "attempt": attempt, "status": status, "curl_elapsed_s": round(_time.time() - _t_curl, 2)})
-                return True
-        except Exception:
-            pass
-
-        if attempt < _HEALTH_CHECK_MAX:
-            _emit("health_check_retry", {
-                "url": url, "attempt": attempt,
-                "wait": _HEALTH_CHECK_INTERVAL,
-                "curl_elapsed_s": round(_time.time() - _t_curl, 2),
-            })
-            time.sleep(_HEALTH_CHECK_INTERVAL)
-
-    _emit("health_check_failed", {"url": url, "attempts": _HEALTH_CHECK_MAX})
-    return False
-
-
-# 题目编号前缀 → 类型推断
-_CODE_PREFIX_TO_TYPE = {
-    'a-': ('→ Web 漏洞', '/skills/web/SKILL.md'),
-    'b-': ('→ 多阶段渗透（多 flag）', '/skills/pentest/SKILL.md'),
-    'c-': ('→ 综合/杂项', '/skills/web/SKILL.md'),
-    'd-': ('→ 漏洞利用', '/skills/pwn/SKILL.md'),
-    'e1': ('→ 二进制/逆向-1', '/skills/reverse/SKILL.md'),
-    'e2': ('→ 二进制/逆向-2', '/skills/reverse/SKILL.md'),
-    'e3': ('→ 二进制/逆向-3', '/skills/reverse/SKILL.md'),
-    'f1': ('→ 对抗规避-1', '/skills/evasion/SKILL.md'),
-    'f2': ('→ 对抗规避-2（深度逆向/patch）', '/skills/evasion/SKILL.md'),
-}
-
-
-def _infer_challenge_type(unique_code: str) -> tuple[str, str]:
-    """根据 unique_code 前缀推断题目类型和建议读取的 SKILL 文件。"""
-    code_lower = unique_code.lower()
-    for prefix, (type_name, skill_path) in _CODE_PREFIX_TO_TYPE.items():
-        if code_lower.startswith(prefix):
-            return type_name, skill_path
-    return '→ 未知类型', '/skills/web/SKILL.md'
-
-
-_ATTACK_PLAN_PROMPT = (
-    "你是一名顶尖 CTF 安全专家。根据以下题目信息，生成 3-5 条按优先级排序的攻击步骤。"
-    "每条步骤 1-2 句话，简洁可执行。考虑题目类型（Web题 vs 多阶段渗透题计划完全不同）。"
-    "输出格式：每行一条，以 '1. ' '2. ' 开头，不要多余解释。"
-)
-
-
-def _generate_attack_plan(challenge, container_addr: tuple[str, ...], settings: dict) -> str:
-    """生成题目专属攻击计划。一次 LLM 调用，不参与运行时循环。"""
-    if not container_addr:
-        return ""
-    addr = container_addr[0]
-    url = addr if addr.startswith("http") else f"http://{addr}"
-
-    type_name, _ = _infer_challenge_type(challenge.unique_code)
-
-    prompt = (
-        f"题目编号：{challenge.unique_code}\n"
-        f"类型：{type_name}\n"
-        f"难度：{challenge.difficulty}\n"
-        f"Flag 数量：{challenge.flag_count}\n"
-        f"目标地址：{url}\n"
-        f"描述：{challenge.description or '无'}\n"
-        f"\n生成 3-5 条攻击步骤："
+    )
+    return (
+        "max active" in text
+        or "maximum active" in text
+        or "上限" in text
+        or "最大活跃" in text
+        or ("同时" in text and "容器" in text)
+        or ("active" in text and "limit" in text)
     )
 
-    try:
-        from openai import OpenAI
-        import httpx2 as httpx
-        llm_cfg = settings.get("llm", {})
-        client = OpenAI(
-            base_url=llm_cfg.get("base_url") or os.environ.get("LLM_BASE_URL", ""),
-            api_key=llm_cfg.get("api_key") or os.environ.get("LLM_API_KEY", ""),
-            timeout=httpx.Timeout(15.0, connect=10.0),
-        )
-        model = llm_cfg.get("default_model") or os.environ.get("LLM_MODEL", "deepseek-chat")
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": _ATTACK_PLAN_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=300,
-            temperature=0.3,
-        )
-        msg = resp.choices[0].message
-        plan = getattr(msg, "content", None) or getattr(msg, "model_extra", {}).get("reasoning_content", "") or ""
-        return plan.strip()
-    except Exception:
-        return ""
 
-
-# ━━ 跨题经验注入：攻击链存储与匹配 ━━
-_CHAIN_STORE_FILE = ".attack-chains.json"
-
-
-def _save_attack_chain(challenge_workspace: str, unique_code: str, success: bool) -> None:
-    """解完一道题后，保存攻击链摘要到共享存储，供同类题注入。"""
-    if not success:
-        return
-    ws = Path(challenge_workspace)
-    chain = _extract_chain_from_workspace(ws)
-    if not chain:
-        return
-
-    # 类型前缀
-    prefix = unique_code.split("-")[0] + "-" if "-" in unique_code else unique_code[:2]
-
-    chain_entry = {
-        "code": unique_code,
-        "prefix": prefix,
-        "summary": chain,
-        "time": __import__("time").time(),
-    }
-
-    # 读取/更新共享存储
-    store_path = Path(os.environ.get("CTF_WORKSPACE", "/workspace")) / _CHAIN_STORE_FILE
-    store = {}
-    if store_path.exists():
+def _actual_cumulative_score(challenges: list[Challenge], workspace_dir: str) -> int:
+    """
+    优先用 submit 回传落盘的 cumulative_score（含 hint 扣分后的实际累计分）；
+    找不到记录时回退到题目满分（未看过 hint 的题等价于满分）。
+    """
+    total = 0
+    for c in challenges:
+        challenge_dir = os.path.join(workspace_dir, c.unique_code)
+        score_file = os.path.join(challenge_dir, ".cumulative_score")
         try:
-            store = json.loads(store_path.read_text(encoding="utf-8"))
-        except Exception:
-            store = {}
-
-    chains = store.setdefault("chains", {})
-    prefix_chains = chains.setdefault(prefix, [])
-    # 避免重复
-    if not any(c.get("code") == unique_code for c in prefix_chains):
-        prefix_chains.append(chain_entry)
-        # 每个类型只保留最近 3 条
-        prefix_chains[:] = prefix_chains[-3:]
-
-    try:
-        store_path.parent.mkdir(parents=True, exist_ok=True)
-        store_path.write_text(json.dumps(store, ensure_ascii=False, indent=2))
-    except Exception:
-        pass
+            # 部分完成题也可能已经获得分数，不能只统计 is_completed。
+            if not score_belongs_to_current_task(challenge_dir):
+                continue
+            with open(score_file, "r", encoding="utf-8") as f:
+                total += max(0, int(f.read().strip()))
+        except (OSError, ValueError):
+            # 只有 API 明确报告通关时才可安全回退到满分；未通关题
+            # 的本地 score 文件缺失只能按 0 处理。
+            if c.is_completed:
+                total += c.total_score
+    return total
 
 
-def _extract_chain_from_workspace(ws: Path) -> str:
-    """从题目工作目录的 Ideas/Memory 中提取攻击链摘要。"""
-    parts = []
-
-    # 从 verified ideas 提取
-    ideas_file = ws / "ideas" / "index.json"
-    if ideas_file.exists():
-        try:
-            ideas = json.loads(ideas_file.read_text(encoding="utf-8"))
-            verified = [i["content"] for i in ideas if i.get("status") == "verified"]
-            if verified:
-                # 取最长的（通常包含完整攻击链）
-                best = max(verified, key=len)
-                parts.append(best[:200])
-        except Exception:
-            pass
-
-    # 从 evidence memories 提取关键步骤
-    mem_dir = ws / "memory" / "entries"
-    if mem_dir.exists():
-        try:
-            import json as _json
-            evidences = []
-            for f in sorted(mem_dir.glob("*.json")):
-                data = _json.loads(f.read_text(encoding="utf-8"))
-                if data.get("kind") == "evidence":
-                    c = data.get("content", "")
-                    if len(c) > 30:  # 只取有实质内容的
-                        evidences.append(c[:150])
-            if evidences:
-                parts.append(" | ".join(evidences[:2]))
-        except Exception:
-            pass
-
-    return " → ".join(parts) if parts else ""
-
-
-def _load_recent_chain(unique_code: str) -> str:
-    """加载最近一道同类题的攻击链，用于注入到新题 task。"""
-    prefix = unique_code.split("-")[0] + "-" if "-" in unique_code else unique_code[:2]
-
-    store_path = Path(os.environ.get("CTF_WORKSPACE", "/workspace")) / _CHAIN_STORE_FILE
-    if not store_path.exists():
-        return ""
-
-    try:
-        store = json.loads(store_path.read_text(encoding="utf-8"))
-        chains = store.get("chains", {})
-        prefix_chains = chains.get(prefix, [])
-        if prefix_chains:
-            # 返回最近一条（排除自身）
-            others = [c for c in prefix_chains if c.get("code") != unique_code]
-            if others:
-                latest = others[-1]
-                return (
-                    f"\n\n## 同类题经验（来自 {latest['code']} 的解法）\n"
-                    f"最近解出的同类题攻击链：{latest['summary']}\n"
-                    f"参考此攻击链，优先尝试类似路径。"
-                )
-    except Exception:
-        pass
-
+# 历史题目攻击链注入已按评测合规要求移除。只允许把抽象原则写入
+# skills/experiences/references/case-notes.md；TaskBuilder 保留兼容回调。
+def _load_recent_chain(unique_code: str, skills_dir: str = "") -> str:
     return ""
-
-
-def _build_task_from_challenge(challenge: Challenge, container_addr: tuple[str, ...]) -> str:
-    """从平台 Challenge 数据构建 SolverAgent 的 task 文本。"""
-    if container_addr:
-        addr = container_addr[0]
-        url = addr if addr.startswith("http") else f"http://{addr}"
-    else:
-        url = "（未返回靶场地址）"
-
-    type_name, skill_path = _infer_challenge_type(challenge.unique_code)
-
-    lines = [
-        f"# CTF 题目：{challenge.unique_code}",
-        f"- 类型：{type_name}",
-        f"- 建议先读：`read_file(\"{skill_path}\")`",
-        f"- 难度：{challenge.difficulty}",
-        f"- 目标地址：{url}",
-        f"- Flag 格式：flag{{...}}",
-    ]
-
-    if challenge.description:
-        lines.append(f"- 描述：{challenge.description}")
-
-    if challenge.flag_count > 1:
-        remaining = challenge.flag_count - challenge.correct_flag_count
-        lines.append(f"- ⚠️ 本题包含 {challenge.flag_count} 个 Flag（多阶段渗透题），已找到 {challenge.correct_flag_count} 个，还剩 {remaining} 个")
-        lines.append(f"- ❗ 每找到一个 flag 就立即提交，然后继续渗透下一阶段（提权/横向移动/内网），直到全部找到")
-
-    if challenge.correct_flag_count > 0:
-        lines.append(f"\n## 已找到 {challenge.correct_flag_count} 个 Flag（继续寻找剩余的）")
-        lines.append(f"\n⚠️ **这是重跑轮次**。上一轮发现的内网 IP 和端口可能已变化，必须重新扫描确认。")
-        lines.append(f"不要直接使用 memory 中的旧 IP 地址，先重新执行 `ip addr` + `cat /proc/net/arp` + 端口探测。")
-        lines.append(f"\n💡 **优先重建已有解法**：如果 memory 中已记录了完整的攻击链（如「error.log 投毒 RCE」「admin/Admin@123 登录」），")
-        lines.append(f"直接按记忆中的步骤快速重建立足点，不要从零重新探测。重建优先级：先重建 RCE → 再验证内网拓扑 → 再用新 IP 执行横向移动。")
-
-    lines.append(f"\n请开始解题，找到 flag 后调用 challenge_submit_flag 工具提交。")
-
-    return "\n".join(lines)
 
 
 def _default_agent_factory(task: str, settings: dict, skills_dir: str):
@@ -418,38 +190,48 @@ class Scheduler:
         *,
         skills_dir: str = "/skills",
         workspace_dir: str = "/workspace",
-        max_retries_per_challenge: int = 1,
         skip_completed: bool = True,
         skip_codes: set[str] | None = None,
         prefix_filter: str | None = None,
+        only_codes: set[str] | None = None,
         max_parallel: int = DEFAULT_MAX_PARALLEL,
         agent_factory=None,
         start_retry_max: int = _START_RETRY_MAX,
         start_retry_interval: float = _START_RETRY_INTERVAL,
         close_retry_max: int = _CLOSE_RETRY_MAX,
         close_retry_interval: float = _CLOSE_RETRY_INTERVAL,
+        deadline: float | None = None,
     ) -> None:
         self.client = client
         self.settings = settings
         self.skills_dir = skills_dir
         self.workspace_dir = workspace_dir
-        self.max_retries = max_retries_per_challenge
         self.skip_completed = skip_completed
         self.skip_codes = skip_codes or set()
         self.prefix_filter = prefix_filter.strip() if prefix_filter else None
-        self.max_parallel = max(1, max_parallel)
+        self.only_codes = only_codes or set()
+        # 平台最多同时运行 3 个容器；额外的 worker 只会制造
+        # max-active 重试和 LLM 争抢，因此在调度器边界强制限幅。
+        self.max_parallel = min(3, max(1, int(max_parallel)))
         self._agent_factory = agent_factory or _default_agent_factory
         self._active_codes: set[str] = set()
         self._active_lock = threading.Lock()
+        self._platform_state_lock = threading.RLock()
         self._scoreboard = Scoreboard(workspace_dir)
         self.start_retry_max = start_retry_max
         self.start_retry_interval = start_retry_interval
         self.close_retry_max = close_retry_max
         self.close_retry_interval = close_retry_interval
+        self.deadline = float(deadline or 0.0)
+        self._terminal_error: Exception | None = None
+        self._abort_event = threading.Event()
 
     def run_all(self) -> SchedulerReport:
         """主调度循环：VPN 检测 -> 列题 -> 并行攻破。"""
         report = SchedulerReport()
+        if _deadline_reached(self.deadline):
+            _emit("scheduler_done", {"reason": "deadline_exceeded"})
+            return report
         import time as _time
         _t_total_start = _time.time()
 
@@ -466,8 +248,17 @@ class Scheduler:
         _emit("scheduler_phase", {"phase": "list_challenges"})
         _t0 = _time.time()
         try:
-            all_challenges = self.client.list_challenges()
+            all_challenges = self._list_challenges()
             _emit("timing_list_challenges", {"elapsed_s": round(_time.time() - _t0, 2)})
+        except (TaskNotFound, InvalidState) as e:
+            # token 无效或任务已结束不是普通题目失败，必须立即终止
+            # 整个跑分流程，不能进入下一轮重试。
+            _emit("scheduler_terminal_error", {
+                "phase": "list_challenges",
+                "code": getattr(e, "code", ""),
+                "error": str(e),
+            })
+            raise
         except TsecbenchError as e:
             _emit("scheduler_error", {"phase": "list_challenges", "error": str(e), "elapsed_s": round(_time.time() - _t0, 2)})
             return report
@@ -491,7 +282,12 @@ class Scheduler:
             todo = [c for c in todo if c.unique_code.lower().startswith(self.prefix_filter.lower())]
             _emit("prefix_filter", {"prefix": self.prefix_filter, "matched": len(todo)})
 
-        # 跳过被放弃的题目（多轮重跑时连续两轮失败的题）
+        # 精确题号过滤：只跑指定题号（用于专项研究能力瓶颈题）
+        if self.only_codes:
+            todo = [c for c in todo if c.unique_code in self.only_codes]
+            _emit("only_codes", {"codes": sorted(self.only_codes), "matched": len(todo)})
+
+        # 跳过被暂停的题目（跨重跑连续无新增 flag/实质证据）
         if self.skip_codes:
             todo = [c for c in todo if c.unique_code not in self.skip_codes]
 
@@ -504,6 +300,9 @@ class Scheduler:
 
         if not todo:
             _emit("scheduler_done", {"reason": "all_completed"})
+            return report
+        if _deadline_reached(self.deadline):
+            _emit("scheduler_done", {"reason": "deadline_exceeded"})
             return report
 
         if self.max_parallel <= 1:
@@ -522,12 +321,23 @@ class Scheduler:
                 report.failed += 1
 
         try:
-            final_challenges = self.client.list_challenges()
-            report.cumulative_score = sum(
-                c.total_score for c in final_challenges if c.is_completed
+            final_challenges = self._list_challenges()
+            report.cumulative_score = _actual_cumulative_score(
+                final_challenges, self.workspace_dir
             )
+        except (TaskNotFound, InvalidState) as e:
+            _emit("scheduler_terminal_error", {
+                "phase": "final_list_challenges",
+                "code": getattr(e, "code", ""),
+                "error": str(e),
+            })
+            raise
         except Exception:
-            pass
+            # A transient final snapshot failure does not erase per-submit
+            # scores already persisted in the workspace.
+            report.cumulative_score = _actual_cumulative_score(
+                all_challenges, self.workspace_dir
+            )
 
         _emit("scheduler_done", {
             "attempted": report.attempted,
@@ -552,18 +362,17 @@ class Scheduler:
                 "success": result.success,
                 "correct": result.correct_flag_count,
                 "total": result.total_flag_count,
+                "new_flags": result.new_flag_count,
+                "material_progress": result.material_progress_count,
                 "rounds": result.rounds,
                 "error": result.error,
             })
         return results
 
     def _run_parallel(self, todo: list[Challenge]) -> list[SchedulerResult]:
-        """生产者-消费者队列模式：N 个 worker 从队列取题，
-        每个 worker close 当前题后才取下一题，
-        保证平台活跃实例数永远 ≤ max_parallel。
-        环境不可用的题放入重试队列，5 分钟后重新尝试。"""
+        """并行运行题目；每个 attempt 返回前都会关闭容器。"""
         results: list[SchedulerResult] = []
-        results_lock = threading.Lock()
+        self._abort_event.clear()
 
         _emit("scheduler_phase", {
             "phase": "parallel_start",
@@ -571,123 +380,77 @@ class Scheduler:
             "total_todo": len(todo),
         })
 
-        work_queue: queue.Queue[Challenge | None] = queue.Queue()
-        for c in todo:
-            work_queue.put(c)
-
-        # 环境不可用重试队列：(retry_after_time, challenge)
-        env_retry_queue: list[tuple[float, Challenge]] = []
-        env_retry_lock = threading.Lock()
-        # 停止标志
-        stop_event = threading.Event()
-
-        def _env_retry_feeder() -> None:
-            """守护线程：定期检查环境不可用的题，到期后放回工作队列。"""
-            while not stop_event.is_set():
-                now = time.time()
-                with env_retry_lock:
-                    ready = [item for item in env_retry_queue if now >= item[0]]
-                    for item in ready:
-                        env_retry_queue.remove(item)
-                for _, challenge in ready:
-                    _emit("env_retry_requeue", {"unique_code": challenge.unique_code})
-                    work_queue.put(challenge)
-                stop_event.wait(timeout=30)  # 每 30s 检查一次
-
-        feeder_thread = threading.Thread(target=_env_retry_feeder, daemon=True)
-        feeder_thread.start()
-
-        # 用计数器跟踪“未完成的任务数”，而不是固定毒丸
-        pending_count = len(todo)
-        pending_lock = threading.Lock()
-
-        def _worker() -> None:
-            nonlocal pending_count
-            while True:
+        with ThreadPoolExecutor(
+            max_workers=self.max_parallel, thread_name_prefix="solver"
+        ) as executor:
+            futures = {
+                executor.submit(self._attempt_challenge, challenge): challenge
+                for challenge in todo
+            }
+            for future in as_completed(futures):
+                challenge = futures[future]
                 try:
-                    item = work_queue.get(timeout=60)
-                except queue.Empty:
-                    # 检查是否还有待重试的题
-                    with env_retry_lock:
-                        has_retry = len(env_retry_queue) > 0
-                    with pending_lock:
-                        has_pending = pending_count > 0
-                    if not has_retry and not has_pending:
-                        break
-                    continue
-
-                if item is None:
-                    break
-                challenge = item
-                try:
-                    result = self._attempt_challenge(challenge)
+                    result = future.result()
+                except (TaskNotFound, InvalidState) as e:
+                    self._terminal_error = e
+                    self._abort_event.set()
+                    self.close_all_active()
+                    raise
                 except Exception as e:
                     result = SchedulerResult(
                         unique_code=challenge.unique_code,
                         success=False,
                         error=f"Worker exception: {e}",
+                        correct_flag_count=challenge.correct_flag_count,
                         total_flag_count=challenge.flag_count,
+                        initial_correct_flag_count=challenge.correct_flag_count,
+                        difficulty=challenge.difficulty,
                     )
-
-                # 检查是否是环境不可用，如果是则放入重试队列而非直接失败
-                if result.error and "environment_issue" in result.error:
-                    with env_retry_lock:
-                        retry_at = time.time() + _ENV_RETRY_INTERVAL
-                        env_retry_queue.append((retry_at, challenge))
-                    _emit("env_retry_scheduled", {
-                        "unique_code": challenge.unique_code,
-                        "retry_in_sec": _ENV_RETRY_INTERVAL,
-                    })
-                    continue  # 不记录结果，等重试
-
-                with pending_lock:
-                    pending_count -= 1
-
-                with results_lock:
-                    results.append(result)
-
+                results.append(result)
                 _emit("challenge_result", {
                     "unique_code": result.unique_code,
                     "success": result.success,
                     "correct": result.correct_flag_count,
                     "total": result.total_flag_count,
+                    "new_flags": result.new_flag_count,
+                    "material_progress": result.material_progress_count,
                     "rounds": result.rounds,
                     "error": result.error,
                 })
-
-        threads = []
-        for i in range(self.max_parallel):
-            t = threading.Thread(target=_worker, name=f"solver-{i}", daemon=True)
-            t.start()
-            threads.append(t)
-
-        # 等待所有普通任务完成后放毒丸
-        # 先等待 pending_count 归 0 和 env_retry_queue 清空
-        while True:
-            with pending_lock:
-                done = pending_count <= 0
-            with env_retry_lock:
-                no_retry = len(env_retry_queue) == 0
-            if done and no_retry:
-                break
-            time.sleep(5)
-
-        # 放毒丸让 worker 退出
-        for _ in range(self.max_parallel):
-            work_queue.put(None)
-        stop_event.set()
-
-        for t in threads:
-            t.join(timeout=30)
 
         return results
 
     @staticmethod
     def _should_multi_solve(challenge) -> bool:
         """判断是否对该题启用 Multi-Solver（并行两个不同策略的 Solver）。"""
-        return (
-            challenge.flag_count >= 4
-            or challenge.difficulty.lower() in ("hard", "difficult")
+        return len(build_portfolio(challenge)) > 1
+
+    def _build_agent_task(
+        self,
+        challenge: Challenge,
+        container_addr: tuple[str, ...],
+        challenge_workspace: str,
+        *,
+        strategy_name: str = "",
+        strategy_hint: str = "",
+        role: str = "executor",
+        objective: str = "完成当前题目并验证提交结果",
+        success_condition: str = "获得可重复验证的 flag 或明确记录终止边界",
+        attempt_context: RunContext | None = None,
+    ) -> str:
+        return TaskBuilder(
+            skills_dir=self.skills_dir,
+            load_experience=_load_recent_chain,
+        ).build(
+            challenge,
+            container_addr,
+            challenge_workspace,
+            strategy_name=strategy_name,
+            strategy_hint=strategy_hint,
+            role=role,
+            objective=objective,
+            success_condition=success_condition,
+            attempt_context=attempt_context,
         )
 
     def _attempt_multi_solver(
@@ -699,98 +462,240 @@ class Scheduler:
 
         stop_event = threading.Event()
         result_lock = threading.Lock()
+        terminal_error: list[Exception] = []
         best_result = SchedulerResult(
             unique_code=code,
             success=False,
             total_flag_count=challenge.flag_count,
             correct_flag_count=challenge.correct_flag_count,
+            initial_correct_flag_count=challenge.correct_flag_count,
+            difficulty=challenge.difficulty,
         )
 
-        def _run_one(strategy_name: str, extra_rounds: int, observer_every: int):
+        base_context = RunContext(
+            unique_code=code,
+            challenge_id=code,
+            challenge_dir=challenge_workspace,
+            target_url=url,
+            deadline=self.deadline,
+            run_id=os.environ.get("CTF_RUN_ID", ""),
+        )
+
+        portfolio = build_portfolio(challenge)
+        memory_scope = challenge_memory_scope(challenge)
+        observer_leader = portfolio[0].name
+        portfolio_budget = PortfolioBudget(expected_attempts=len(portfolio))
+        _emit("multi_solver_memory_scope", {
+            "unique_code": code,
+            "memory_scope": memory_scope,
+            "attempts": [spec.name for spec in portfolio],
+        })
+
+        def _run_one(spec):
             """运行一个 Solver 实例。"""
             try:
-                # 线程内重新配置 Tsecbench 客户端（thread-local 不继承主线程）
-                bridge_tools.configure_tsecbench(self.client, code)
-
-                # 构建独立 task（含策略提示）
-                task = _build_task_from_challenge(challenge, container_addr)
-                task += f"\n\n## 策略：{strategy_name}（本策略为 Multi-Solver 并行模式，另一策略也在同时解题）"
-
-                # 注入跨题经验
-                recent_chain = _load_recent_chain(challenge.unique_code)
-                if recent_chain:
-                    task += recent_chain
-
-                # 生成攻击计划
-                attack_plan = _generate_attack_plan(challenge, container_addr, self.settings)
-                if attack_plan:
-                    task += f"\n\n## 本题攻击计划（自动生成，按优先级执行）\n{attack_plan}"
-                    plan_path = os.path.join(challenge_workspace, f".attack-plan-{strategy_name}.json")
-                    try:
-                        import json
-                        plan_steps = [
-                            s.strip() for s in attack_plan.split("\n")
-                            if s.strip() and (s.strip()[0].isdigit() or s.strip().startswith("-"))
-                        ]
-                        with open(plan_path, "w", encoding="utf-8") as f:
-                            json.dump({"steps": plan_steps, "raw": attack_plan}, f, ensure_ascii=False)
-                    except Exception:
-                        pass
-
-                # 策略差异化：max_rounds 和 observer 频率
-                strategy_settings = dict(self.settings)
-                solver_cfg = dict(strategy_settings.get("solver", {}))
-                solver_cfg["observer_every_rounds"] = observer_every
-                strategy_settings["solver"] = solver_cfg
-
-                from solver.agent import SolverAgent
-                agent = SolverAgent(
-                    task=task,
-                    settings=strategy_settings,
-                    skills_dir=self.skills_dir,
+                attempt_context = base_context.for_attempt(
+                    spec.name, memory_scope=memory_scope
                 )
-                if extra_rounds > 0:
-                    agent.max_rounds += extra_rounds
-                agent._stop_event = stop_event
-
-                agent.run()
-
-                # 记录结果
+                with _ctx.bind(attempt_context, self.client):
+                    return _run_bound_attempt(spec, attempt_context)
+            except (TaskNotFound, InvalidState) as e:
+                # A benchmark task ending is process-wide, not a failed
+                # strategy.  Preserve it so the outer scheduler can stop
+                # instead of silently starting another Solver.
                 with result_lock:
-                    if agent.solved:
-                        stop_event.set()  # 通知另一个停止
-                        best_result.success = True
-                        best_result.rounds = agent.round
-                        best_result.correct_flag_count = challenge.flag_count
+                    if not terminal_error:
+                        terminal_error.append(e)
+                    stop_event.set()
+                    self._abort_event.set()
+                _emit("scheduler_terminal_error", {
+                    "unique_code": code,
+                    "strategy": spec.name,
+                    "code": getattr(e, "code", ""),
+                    "error": str(e),
+                })
             except Exception as e:
                 import traceback
                 _emit("solver_error", {
                     "unique_code": code,
-                    "strategy": strategy_name,
+                    "strategy": spec.name,
                     "error": str(e),
                     "traceback": traceback.format_exc(),
                 })
+            finally:
+                portfolio_budget.mark_done(spec.name)
 
-        # 启动两个 Solver 线程
-        # 策略 A：激进型 — 更多轮次，更频繁 Observer
-        # 策略 B：稳健型 — 默认配置
-        t1 = threading.Thread(
-            target=_run_one, args=("aggressive", 30, 4),
-            name=f"multi-{code}-aggressive", daemon=True
-        )
-        t2 = threading.Thread(
-            target=_run_one, args=("steady", 0, 8),
-            name=f"multi-{code}-steady", daemon=True
-        )
+        def _run_bound_attempt(
+            spec,
+            attempt_context: RunContext,
+        ) -> None:
+            bridge_tools.configure_tsecbench(self.client, code)
 
-        t1.start()
-        t2.start()
-        t1.join()
-        t2.join()
+            contract = SubtaskContract(
+                task_id=attempt_context.run_id,
+                challenge_id=code,
+                attempt_id=spec.name,
+                objective=spec.objective,
+                hypothesis=spec.hypothesis,
+                allowed_scope=spec.allowed_scope,
+                success_condition=spec.success_condition,
+                stop_condition=spec.stop_condition,
+            )
+            write_contract(attempt_context.attempt_dir, contract)
+            _emit("subtask_assigned", {
+                "unique_code": code,
+                "attempt_id": spec.name,
+                "contract": contract.to_dict(),
+            })
+            task = self._build_agent_task(
+                challenge,
+                container_addr,
+                challenge_workspace,
+                strategy_name=spec.name,
+                strategy_hint=spec.strategy_hint,
+                role=spec.role,
+                objective=spec.objective,
+                success_condition=spec.success_condition,
+                attempt_context=attempt_context,
+            ) + "\n\n" + contract.prompt_text()
 
+            strategy_settings = dict(self.settings)
+            solver_cfg = dict(strategy_settings.get("solver", {}))
+            # One challenge gets one control plane. Multiple Observers racing on
+            # the shared Memory/Ideas board produced stale and conflicting edits.
+            solver_cfg["observer_enabled"] = spec.name == observer_leader
+            strategy_settings["solver"] = solver_cfg
+
+            # 每个 attempt 可指定独立模型：spec.model="pro" → llm.pro_model
+            # （默认 deepseek-v4-pro，用于 hard 竞争假设攻坚）。
+            # solver.pro_enabled=false 或 LLM_PRO_MODEL 可覆盖全局开关/模型名，
+            # 避免重跑时误烧 pro 额度或指向不存在的模型。
+            llm_cfg = dict(strategy_settings.get("llm", {}))
+            if spec.model:
+                pro_enabled = str(solver_cfg.get("pro_enabled", True)).strip().lower() not in {
+                    "0", "false", "no", "off",
+                }
+                if spec.model == "pro" and pro_enabled:
+                    llm_cfg["default_model"] = (
+                        llm_cfg.get("pro_model")
+                        or os.environ.get("LLM_PRO_MODEL", "").strip()
+                        or "deepseek-v4-pro"
+                    )
+                elif spec.model != "pro":
+                    llm_cfg["default_model"] = spec.model
+            strategy_settings["llm"] = llm_cfg
+            _emit("attempt_model", {
+                "unique_code": code,
+                "attempt_id": spec.name,
+                "model": llm_cfg.get("default_model", ""),
+                "spec_model": spec.model or "",
+            })
+
+            agent = self._agent_factory(
+                task=task,
+                settings=strategy_settings,
+                skills_dir=self.skills_dir,
+            )
+            # Register before run so all parallel attempts share one aggregate
+            # budget.  A peer that exits early releases its unused quota.
+            try:
+                quota = int(agent.max_rounds)
+            except (TypeError, ValueError):
+                quota = 100
+            quota = quota if quota > 0 else 100
+            portfolio_budget.register(spec.name, quota)
+            portfolio_budget.wait_until_ready(timeout=2.0)
+            try:
+                agent.max_rounds = max(quota, portfolio_budget.total_quota)
+            except Exception:
+                pass
+            agent._portfolio_budget = portfolio_budget
+            agent._portfolio_attempt_id = spec.name
+            agent._stop_event = stop_event
+
+            agent.run()
+
+            # 记录结果。rounds 使用两个策略的总消耗，使题目级预算看到
+            # Multi-Solver 的真实成本，而不是只记录获胜策略。
+            with result_lock:
+                best_result.rounds += agent.round
+                best_result.material_progress_count += int(
+                    getattr(agent, "_material_progress_count", 0) or 0
+                )
+                if agent.solved:
+                    stop_event.set()  # 通知另一个停止
+                    best_result.success = True
+                    best_result.correct_flag_count = challenge.flag_count
+
+        # 两个 Solver 只用 prompt 区分策略，共用同一套预算与一个 Observer。
+        threads = [
+            threading.Thread(
+                target=_run_one,
+                args=(spec,),
+                name=f"multi-{code}-{spec.name}",
+                daemon=True,
+            )
+            for spec in portfolio
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            if self.deadline:
+                remaining = max(0.0, self.deadline - time.time())
+                # 给正在收尾的 Solver 少量宽限时间；bash 层会把新命令
+                # 的 timeout 截到同一个 deadline，不会无限挂住调度器。
+                thread.join(timeout=remaining + 5.0)
+            else:
+                thread.join()
+            if thread.is_alive():
+                stop_event.set()
+                _emit("multi_solver_timeout", {
+                    "unique_code": code,
+                    "strategy": thread.name,
+                })
+
+        if terminal_error:
+            raise terminal_error[0]
+        _emit("multi_solver_budget", {
+            "unique_code": code,
+            **portfolio_budget.snapshot(),
+        })
         return best_result
 
     def _attempt_challenge(self, challenge: Challenge) -> SchedulerResult:
+        """Run one challenge and close any resource left by an unexpected exit."""
+        code = challenge.unique_code
+        try:
+            return self._attempt_challenge_inner(challenge)
+        finally:
+            with self._active_lock:
+                still_active = code in self._active_codes
+            if still_active:
+                for attempt in range(1, self.close_retry_max + 1):
+                    try:
+                        closed = self.client.close_challenge(code)
+                        if hasattr(closed, "closed") and not closed.closed:
+                            raise RuntimeError("平台未确认容器已关闭")
+                        with self._active_lock:
+                            self._active_codes.discard(code)
+                        _emit("challenge_closed", {
+                            "unique_code": code,
+                            "recovered_by": "attempt_finally",
+                        })
+                        break
+                    except Exception as e:
+                        _emit("challenge_close_retry", {
+                            "unique_code": code,
+                            "attempt": attempt,
+                            "error": str(e),
+                            "recovered_by": "attempt_finally",
+                        })
+                        if attempt < self.close_retry_max:
+                            _sleep_retry(self.close_retry_interval, self.deadline)
+            bridge_tools.clear_tsecbench()
+            _ctx.reset()
+
+    def _attempt_challenge_inner(self, challenge: Challenge) -> SchedulerResult:
         code = challenge.unique_code
         _emit("challenge_start", {"unique_code": code, "difficulty": challenge.difficulty})
         self._scoreboard.mark_running(code)
@@ -800,13 +705,27 @@ class Scheduler:
             success=False,
             total_flag_count=challenge.flag_count,
             correct_flag_count=challenge.correct_flag_count,
+            initial_correct_flag_count=challenge.correct_flag_count,
+            difficulty=challenge.difficulty,
         )
+
+        # A terminal platform error in another worker aborts queued work too;
+        # otherwise ThreadPoolExecutor would start every remaining challenge
+        # before the outer loop gets a chance to propagate the error.
+        if self._abort_event.is_set():
+            result.error = "scheduler_aborted"
+            self._scoreboard.mark_skipped(code, result.error)
+            return result
 
         # start_challenge 带重试：平台可能暂时认为容器数已满（close 延迟释放）
         container_addr: tuple[str, ...] = ()
         import time as _time
         _t_start_begin = _time.time()
         for attempt in range(1, self.start_retry_max + 1):
+            if _deadline_reached(self.deadline):
+                result.error = "deadline_exceeded"
+                self._scoreboard.mark_skipped(code, result.error)
+                return result
             try:
                 _t_attempt = _time.time()
                 start = self.client.start_challenge(code)
@@ -821,16 +740,40 @@ class Scheduler:
                     "total_elapsed_s": round(_time.time() - _t_start_begin, 2),
                 })
                 break
-            except (InvalidState, ResourceUnavailable) as e:
+            except InvalidState as e:
+                if not _is_capacity_invalid_state(e):
+                    _emit("scheduler_terminal_error", {
+                        "unique_code": code,
+                        "code": getattr(e, "code", "invalid_state"),
+                        "error": str(e),
+                    })
+                    raise
+                wait = _retry_delay(self.start_retry_interval, attempt)
                 _emit("challenge_start_retry", {
                     "unique_code": code,
                     "attempt": attempt,
                     "reason": str(e),
-                    "wait": self.start_retry_interval,
+                    "wait": round(wait, 2),
                     "elapsed_so_far_s": round(_time.time() - _t_start_begin, 2),
                 })
                 if attempt < self.start_retry_max:
-                    time.sleep(self.start_retry_interval)
+                    _sleep_retry(wait, self.deadline)
+                else:
+                    _emit("challenge_skip", {"unique_code": code, "reason": str(e)})
+                    result.error = str(e)
+                    self._scoreboard.mark_skipped(code, str(e))
+                    return result
+            except ResourceUnavailable as e:
+                wait = _retry_delay(self.start_retry_interval, attempt)
+                _emit("challenge_start_retry", {
+                    "unique_code": code,
+                    "attempt": attempt,
+                    "reason": str(e),
+                    "wait": round(wait, 2),
+                    "elapsed_so_far_s": round(_time.time() - _t_start_begin, 2),
+                })
+                if attempt < self.start_retry_max:
+                    _sleep_retry(wait, self.deadline)
                 else:
                     _emit("challenge_skip", {"unique_code": code, "reason": str(e)})
                     result.error = str(e)
@@ -839,11 +782,12 @@ class Scheduler:
             except TsecbenchConnectionError as e:
                 # 连接超时：服务端可能已启动容器但客户端没收到响应
                 # 尝试 close 释放可能占用的槽位，然后重试
+                wait = _retry_delay(self.start_retry_interval, attempt)
                 _emit("challenge_start_retry", {
                     "unique_code": code,
                     "attempt": attempt,
                     "reason": f"connection_error: {e}",
-                    "wait": self.start_retry_interval,
+                    "wait": round(wait, 2),
                     "elapsed_so_far_s": round(_time.time() - _t_start_begin, 2),
                 })
                 # 尝试 close（可能服务端已启动）
@@ -852,88 +796,91 @@ class Scheduler:
                 except Exception:
                     pass
                 if attempt < self.start_retry_max:
-                    time.sleep(self.start_retry_interval)
+                    _sleep_retry(wait, self.deadline)
                 else:
                     _emit("challenge_skip", {"unique_code": code, "reason": str(e)})
                     result.error = str(e)
                     self._scoreboard.mark_skipped(code, str(e))
                     return result
+            except TaskNotFound:
+                # A token/task failure is process-wide, never a per-challenge
+                # start failure.
+                raise
             except TsecbenchError as e:
                 _emit("challenge_error", {"unique_code": code, "error": str(e)})
                 result.error = str(e)
                 self._scoreboard.mark_skipped(code, str(e))
                 return result
 
-        _ctx.reset()
-        bridge_tools.configure_tsecbench(self.client, code)
-        _ctx.challenge_id = code
-
         # 每题独立的工作目录（并行安全）
         challenge_workspace = os.path.join(self.workspace_dir, code)
         os.makedirs(challenge_workspace, exist_ok=True)
-        _ctx.challenge_dir = challenge_workspace
+        # Reset persistent Memory/Ideas/journals when this mounted workspace
+        # belongs to another benchmark task before any Solver sees it.
+        if prepare_challenge_state(challenge_workspace):
+            _emit("challenge_state_reset", {"unique_code": code})
 
-        if container_addr:
-            addr = container_addr[0]
-            url = addr if addr.startswith("http") else f"http://{addr}"
-            _ctx.target_url = url
+        target = container_addr[0] if container_addr else ""
 
-            # ━━ 靶场健康检查 ━━
-            # start 成功后探测目标是否可达，不可达则标记 environment_issue
-            # 由调度器放入重试队列，5 分钟后重新尝试
-            _t_health = _time.time()
-            _health_ok = _ensure_target_ready(url)
-            _emit("timing_health_check", {"unique_code": code, "elapsed_s": round(_time.time() - _t_health, 2), "ok": _health_ok})
-            if not _health_ok:
-                _emit("challenge_env_issue", {"unique_code": code, "url": url})
-                # close 释放槽位
-                try:
-                    self.client.close_challenge(code)
-                except Exception:
-                    pass
-                with self._active_lock:
-                    self._active_codes.discard(code)
-                bridge_tools.clear_tsecbench()
-                _ctx.reset()
-                result.error = "environment_issue: target unreachable"
-                self._scoreboard.mark_skipped(code, "靶场不可达")
-                return result
+        run_context = RunContext(
+            unique_code=code,
+            challenge_id=code,
+            challenge_dir=challenge_workspace,
+            target_url=target,
+            deadline=self.deadline,
+            run_id=os.environ.get("CTF_RUN_ID", ""),
+        )
+        _ctx.reset()
+        _ctx.configure(run_context, self.client)
 
         # 单线程模式下还是设置环境变量（向后兼容）
         if self.max_parallel <= 1:
             os.environ["CTF_CHALLENGE_ID"] = code
             os.environ["CTF_WORKSPACE"] = challenge_workspace
             if container_addr:
-                os.environ["CTF_TARGET_URL"] = url
+                os.environ["CTF_TARGET_URL"] = target
 
         # ━━ Multi-Solver：hard 题启动两个不同策略的 Solver ━━
         if self._should_multi_solve(challenge):
             _emit("multi_solver_start", {"unique_code": code, "reason": "hard_challenge"})
             result = self._attempt_multi_solver(
-                challenge, container_addr, challenge_workspace, code, url
+                challenge, container_addr, challenge_workspace, code, target
             )
             # 更新平台状态
             try:
-                updated = self.client.list_challenges()
+                updated = self._list_challenges()
                 current = next((c for c in updated if c.unique_code == code), None)
                 if current:
                     result.correct_flag_count = current.correct_flag_count
                     result.total_flag_count = current.flag_count
                     result.success = current.is_completed
-                if result.success:
-                    _save_attack_chain(challenge_workspace, code, True)
+            except (TaskNotFound, InvalidState):
+                raise
             except Exception:
                 pass
-            # close
+            self._record_attempt_outcome(challenge_workspace, result)
+            # close; retain the active marker on failure so the outer
+            # finally/close_all_active path can retry rather than leaking a
+            # container slot silently.
+            close_ok = False
             for attempt in range(1, self.close_retry_max + 1):
                 try:
-                    self.client.close_challenge(code)
+                    closed = self.client.close_challenge(code)
+                    if hasattr(closed, "closed") and not closed.closed:
+                        raise RuntimeError("平台未确认容器已关闭")
+                    close_ok = True
                     break
                 except Exception:
                     if attempt < self.close_retry_max:
-                        time.sleep(self.close_retry_interval)
-            with self._active_lock:
-                self._active_codes.discard(code)
+                        _sleep_retry(self.close_retry_interval, self.deadline)
+            if close_ok:
+                with self._active_lock:
+                    self._active_codes.discard(code)
+            else:
+                _emit("challenge_close_error", {
+                    "unique_code": code,
+                    "error": "multi-solver close failed",
+                })
             bridge_tools.clear_tsecbench()
             self._scoreboard.mark_done(
                 code, success=result.success,
@@ -945,29 +892,27 @@ class Scheduler:
             _ctx.reset()
             return result
 
-        task = _build_task_from_challenge(challenge, container_addr)
-
-        # ━━ 跨题经验注入（同类题已解攻击链）━━
-        recent_chain = _load_recent_chain(challenge.unique_code)
-        if recent_chain:
-            task += recent_chain
-
-        # ━━ 攻击计划生成（一次性 LLM 调用，不参与运行时循环）━━
-        attack_plan = _generate_attack_plan(challenge, container_addr, self.settings)
-        if attack_plan:
-            task += f"\n\n## 本题攻击计划（自动生成，按优先级执行）\n{attack_plan}"
-            # 写入 .attack-plan.json 供 Observer 对照
-            plan_path = os.path.join(challenge_workspace, ".attack-plan.json")
-            try:
-                import json
-                plan_steps = [
-                    s.strip() for s in attack_plan.split("\n")
-                    if s.strip() and (s.strip()[0].isdigit() or s.strip().startswith("-"))
-                ]
-                with open(plan_path, "w", encoding="utf-8") as f:
-                    json.dump({"steps": plan_steps, "raw": attack_plan}, f, ensure_ascii=False)
-            except Exception:
-                pass
+        contract = SubtaskContract(
+            task_id=run_context.run_id,
+            challenge_id=code,
+            attempt_id="primary",
+            objective="完成当前题目并验证提交结果",
+            hypothesis="选择一个有证据支持的最短解法并验证提交",
+            success_condition="获得可重复验证的 flag 或明确记录终止边界",
+            stop_condition="无新证据时停止重复并记录失败边界",
+        )
+        write_contract(run_context.attempt_dir, contract)
+        _emit("subtask_assigned", {
+            "unique_code": code,
+            "attempt_id": "primary",
+            "contract": contract.to_dict(),
+        })
+        task = self._build_agent_task(
+            challenge,
+            container_addr,
+            challenge_workspace,
+            attempt_context=run_context,
+        ) + "\n\n" + contract.prompt_text()
 
         try:
             agent = self._agent_factory(
@@ -975,17 +920,29 @@ class Scheduler:
                 settings=self.settings,
                 skills_dir=self.skills_dir,
             )
+            if self.max_parallel > 1:
+                # A terminal platform error in one worker asks other workers
+                # to stop at their next round boundary instead of consuming a
+                # full budget after the task has already ended.
+                agent._stop_event = self._abort_event
             _emit("timing_agent_start", {
                 "unique_code": code,
                 "elapsed_since_attempt_begin": round(_time.time() - _t_start_begin, 2),
             })
             agent.run()
             result.rounds = agent.round
+            result.material_progress_count = int(
+                getattr(agent, "_material_progress_count", 0) or 0
+            )
             _emit("timing_agent_done", {
                 "unique_code": code,
                 "rounds": agent.round,
                 "elapsed_since_attempt_begin": round(_time.time() - _t_start_begin, 2),
             })
+        except (TaskNotFound, InvalidState):
+            # Platform terminal states must not be downgraded to an ordinary
+            # solver failure or trigger another challenge/retry round.
+            raise
         except Exception as e:
             import traceback
             _emit("solver_error", {
@@ -995,30 +952,28 @@ class Scheduler:
             })
             result.error = str(e)
 
-        # ━━ 跨题经验：解出后保存攻击链 ━━
+        # 刷新一次平台状态，同时用于结果统计。
         try:
-            updated = self.client.list_challenges()
-            current = next((c for c in updated if c.unique_code == code), None)
-            if current and current.is_completed:
-                _save_attack_chain(challenge_workspace, code, True)
-        except Exception:
-            pass
-
-        try:
-            updated = self.client.list_challenges()
+            updated = self._list_challenges()
             current = next((c for c in updated if c.unique_code == code), None)
             if current:
                 result.correct_flag_count = current.correct_flag_count
                 result.total_flag_count = current.flag_count
                 result.success = current.is_completed
+        except (TaskNotFound, InvalidState):
+            raise
         except Exception:
             pass
+
+        self._record_attempt_outcome(challenge_workspace, result)
 
         # close_challenge 带重试：确保平台侧容器被释放，防止槽位泄漏
         close_ok = False
         for attempt in range(1, self.close_retry_max + 1):
             try:
-                self.client.close_challenge(code)
+                closed = self.client.close_challenge(code)
+                if hasattr(closed, "closed") and not closed.closed:
+                    raise RuntimeError("平台未确认容器已关闭")
                 close_ok = True
                 break
             except Exception as e:
@@ -1028,10 +983,11 @@ class Scheduler:
                     "error": str(e),
                 })
                 if attempt < self.close_retry_max:
-                    time.sleep(self.close_retry_interval)
+                    _sleep_retry(self.close_retry_interval, self.deadline)
 
-        with self._active_lock:
-            self._active_codes.discard(code)
+        if close_ok:
+            with self._active_lock:
+                self._active_codes.discard(code)
         if close_ok:
             _emit("challenge_closed", {"unique_code": code})
         else:
@@ -1063,13 +1019,42 @@ class Scheduler:
         for code in codes:
             for attempt in range(self.close_retry_max):
                 try:
-                    self.client.close_challenge(code)
+                    closed = self.client.close_challenge(code)
+                    if hasattr(closed, "closed") and not closed.closed:
+                        raise RuntimeError("平台未确认容器已关闭")
                     with self._active_lock:
                         self._active_codes.discard(code)
                     break
                 except Exception:
                     if attempt < self.close_retry_max - 1:
-                        time.sleep(self.close_retry_interval)
+                        _sleep_retry(self.close_retry_interval, self.deadline)
+
+    def _list_challenges(self) -> list[Challenge]:
+        """Serialize state snapshots so parallel attempts see a coherent platform view."""
+        with self._platform_state_lock:
+            return self.client.list_challenges()
+
+    @staticmethod
+    def _record_attempt_outcome(
+        challenge_workspace: str,
+        result: SchedulerResult,
+    ) -> None:
+        try:
+            ChallengeLedger(challenge_workspace).record_attempt({
+                "initial_correct_flags": result.initial_correct_flag_count,
+                "final_correct_flags": result.correct_flag_count,
+                "new_flags": result.new_flag_count,
+                "material_progress": result.material_progress_count,
+                "rounds": result.rounds,
+                "success": result.success,
+                "error": result.error[:300],
+            })
+        except Exception as exc:
+            _emit("challenge_ledger_error", {
+                "unique_code": result.unique_code,
+                "phase": "record_attempt",
+                "error": str(exc),
+            })
 
     @staticmethod
     def _collect_failure_note(challenge_workspace: str) -> str:

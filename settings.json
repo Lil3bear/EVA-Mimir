@@ -1,9 +1,17 @@
 {
   "llm": {
-    "base_url": "https://api.deepseek.com",
+    "base_url": "https://api.deepseek.com/v1",
     "api_key": "",
-    "default_model": "deepseek-v4-pro",
-    "observer_model": "deepseek-v4-pro"
+    "default_model": "deepseek-v4-flash",
+    "pro_model": "deepseek-v4-pro",
+    "observer_model": "deepseek-v4-flash",
+    "reasoning_effort": "high",
+    "max_output_tokens": 8192,
+    "summary_max_output_tokens": 8192,
+    "observer_thinking_enabled": false,
+    "observer_reasoning_effort": "high",
+    "observer_max_output_tokens": 8192,
+    "observer_max_react_rounds": 2
   },
   "docker": {
     "image_name": "eva-mimir-solver",
@@ -11,9 +19,17 @@
     "workspace_dir": "./workspace"
   },
   "solver": {
-    "max_rounds": 100,
-    "observer_every_rounds": 6,
+    "max_rounds": null,
+    "pro_enabled": true,
+    "allow_easy_hint": false,
+    "observer_correction_max_lag": 3,
     "memory_limit": 10,
-    "idea_limit": 8
+    "idea_limit": 8,
+    "decision_control": {
+      "enabled": true,
+      "action_repeat_threshold": 4,
+      "vector_repeat_threshold": 4,
+      "inject_switch_for_easy": false
+    }
   }
 }

@@ -1,8 +1,17 @@
 import os
 import subprocess
 
+from solver.worker_context import ctx as _ctx
+
 
 MAX_OUTPUT = 8000
+
+
+def _resolve_path(path: str) -> str:
+    if not path or os.path.isabs(path):
+        return path
+    base = _ctx.attempt_dir if _ctx.attempt_dir != "/workspace" else os.getcwd()
+    return os.path.join(base, path)
 
 READ_TOOL_DEF = {
     "type": "function",
@@ -56,7 +65,7 @@ GREP_TOOL_DEF = {
 
 
 def read_file(args: dict) -> str:
-    path = args.get("path", "")
+    path = _resolve_path(args.get("path", ""))
     offset = args.get("offset", 0)
     limit = args.get("limit", None)
 
@@ -81,7 +90,7 @@ def read_file(args: dict) -> str:
 
 
 def write_file(args: dict) -> str:
-    path = args.get("path", "")
+    path = _resolve_path(args.get("path", ""))
     content = args.get("content", "")
 
     if not path:
@@ -98,7 +107,7 @@ def write_file(args: dict) -> str:
 
 def grep(args: dict) -> str:
     pattern = args.get("pattern", "")
-    path = args.get("path", "")
+    path = _resolve_path(args.get("path", ""))
     recursive = args.get("recursive", False)
 
     cmd = ["grep", "-n", "--color=never"]

@@ -1,9 +1,189 @@
 """Tests for new features: difficulty-based max_rounds, path traversal dedup, forced review."""
+import tempfile
+import threading
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
-from collections import Counter
 
-from solver.tools.bash_tool import _extract_url_pattern
+from solver.tools.bash_tool import _extract_url_pattern, _inline_http_variant_count
+from solver.runtime.control import ControlPolicy
+from solver.runtime.context import RunContext, ctx
+
+
+class ObserverControlPlaneTests(unittest.TestCase):
+    def test_disabled_observer_is_noop(self):
+        from solver.observer.loop import ObserverLoop
+
+        observer = ObserverLoop(
+            settings={"solver": {"observer_enabled": False}},
+            on_correction=MagicMock(),
+        )
+        observer.on_round_start(1)
+        observer.on_tool_call("bash", {"cmd": "id"}, "uid=0")
+        observer.on_round_end(1)
+        observer.trigger_now()
+        observer.on_agent_end()
+
+        self.assertEqual(observer._round_logs, [])
+        self.assertIsNone(observer._review_thread)
+        self.assertEqual(observer._VECTOR_CYCLE_THRESHOLD, 4)
+
+    def test_stop_discards_pending_review_without_blocking_shutdown(self):
+        from solver.observer.loop import ObserverLoop
+
+        observer = ObserverLoop(settings={"solver": {"observer_enabled": True}})
+        observer.on_round_start(1)
+        observer.on_tool_call("bash", {"cmd": "id"}, "uid=0")
+        observer.on_round_end(1)
+        observer.stop()
+
+        self.assertFalse(observer.enabled)
+        self.assertEqual(observer._round_logs, [])
+
+    def test_late_observer_review_cannot_emit_after_stop(self):
+        from solver.observer.loop import ObserverLoop
+
+        correction = MagicMock()
+        observer = ObserverLoop(
+            settings={"solver": {"observer_enabled": True}},
+            on_correction=correction,
+        )
+        observer.stop()
+        review = MagicMock(
+            side_effect=lambda **kwargs: kwargs["on_correction"]("late advice")
+        )
+        with patch("solver.observer.agent.ObserverAgent") as observer_cls, patch.object(
+            observer, "_check_progress"
+        ) as check_progress:
+            observer_cls.return_value.review = review
+            path = Path(tempfile.mkdtemp(prefix="observer-late-"))
+            observer._run_review([{"round": 3}], path, path)
+
+        correction.assert_not_called()
+        check_progress.assert_not_called()
+
+    @patch("solver.observer.agent.OpenAI")
+    def test_observer_has_separate_bounded_budget(self, _mock_openai):
+        from solver.observer.agent import ObserverAgent
+
+        observer = ObserverAgent(settings={"llm": {}})
+
+        self.assertEqual(observer._reasoning_effort, "high")
+        self.assertFalse(observer._thinking_enabled)
+        self.assertEqual(observer._max_output_tokens, 8192)
+        self.assertEqual(observer._max_react_rounds, 2)
+
+
+class ObserverPromptTests(unittest.TestCase):
+    def test_used_memory_is_not_reported_as_wholly_unused(self):
+        from shared.data.memory import add_memory
+        from solver.observer.agent import _build_observer_prompt
+
+        challenge_dir = Path(tempfile.mkdtemp(prefix="observer-prompt-"))
+        entry = add_memory(
+            challenge_dir,
+            "fact",
+            "current host 10.0.0.1; old host 10.0.0.2 " + "detail " * 1000,
+        )
+        rounds = [{
+            "round": 8,
+            "tool_calls": [{
+                "tool": "bash",
+                "args": {"cmd": "check 10.0.0.1"},
+                "result": "ok",
+            }],
+        }]
+
+        prompt = _build_observer_prompt(rounds, challenge_dir)
+
+        self.assertEqual(prompt.count(entry.id), 1)
+        self.assertLess(len(prompt), 4000)
+
+    def test_observer_history_reader_has_character_cap(self):
+        from solver.observer.tools import read_file
+
+        path = Path(tempfile.mkdtemp(prefix="observer-history-")) / "history.jsonl"
+        path.write_text("x" * 20000 + "TAIL", encoding="utf-8")
+
+        result = read_file({"path": str(path), "limit": 50})
+
+        self.assertIn("仅保留末尾", result)
+        self.assertTrue(result.endswith("TAIL"))
+        self.assertLess(len(result), 12100)
+
+
+class ChallengeRoutingTests(unittest.TestCase):
+    def test_c_challenge_does_not_treat_port_as_http_proof(self):
+        from solver.ctfplatform.policy import infer_challenge_type
+
+        profile = infer_challenge_type("c-03", ("10.0.0.9:3000",))
+        self.assertEqual(profile.primary_skill, "pentest")
+        self.assertEqual(profile.protocol_hint, "probe")
+        self.assertIn("web", profile.candidate_skills)
+        self.assertIn("pwn", profile.candidate_skills)
+
+    def test_known_web_prefix_can_still_use_http_hint(self):
+        from solver.ctfplatform.policy import infer_challenge_type
+
+        profile = infer_challenge_type("a-03", ("10.0.0.9:80",))
+        self.assertEqual(profile.primary_skill, "web")
+        self.assertEqual(profile.protocol_hint, "http")
+
+
+class ControlPolicyTests(unittest.TestCase):
+    def test_difficulty_and_challenge_type_share_one_budget_policy(self):
+        easy = ControlPolicy.from_settings({"solver": {}}, "easy")
+        hard_pentest = ControlPolicy.from_settings(
+            {"solver": {}}, "hard", pentest=True
+        )
+        self.assertEqual(easy.max_rounds, 40)
+        self.assertEqual(hard_pentest.max_rounds, 190)
+        self.assertEqual(easy.observer_every_rounds, 15)
+        self.assertEqual(hard_pentest.observer_every_rounds, 8)
+        # hard 多阶段题的 stop_after 必须足够宽，避免侦察阶段就 force_stop
+        self.assertEqual(hard_pentest.stop_after, 72)
+        self.assertEqual(ControlPolicy.from_settings({"solver": {}}, "hard").stop_after, 48)
+
+    def test_explicit_policy_overrides_are_positive_only(self):
+        policy = ControlPolicy.from_settings(
+            {"solver": {
+                "max_rounds": 7,
+                "switch_after_rounds": 3,
+                "no_progress_rounds": 5,
+                "observer_every_rounds": 2,
+            }},
+            "medium",
+        )
+        self.assertEqual(
+            (policy.max_rounds, policy.switch_after, policy.stop_after, policy.observer_every_rounds),
+            (7, 3, 5, 2),
+        )
+
+    def test_same_action_deadloop_stops_deep_lane(self):
+        policy = ControlPolicy.from_settings({"solver": {}}, "hard")
+        # deep lane、同一条命令连续重复 6 次 → 立即判停，不等 idle
+        d = policy.decide(
+            round_num=100, last_progress_round=98, lane="deep",
+            same_action_streak=6,
+        )
+        self.assertEqual(d.action, "stop")
+        self.assertEqual(d.reason, "same_action_deadloop")
+
+    def test_same_action_deadloop_does_not_stop_easy(self):
+        policy = ControlPolicy.from_settings({"solver": {}}, "easy")
+        d = policy.decide(
+            round_num=100, last_progress_round=0, lane="deep",
+            same_action_streak=11,
+        )
+        self.assertEqual(d.action, "continue")
+
+    def test_low_same_action_streak_continues(self):
+        policy = ControlPolicy.from_settings({"solver": {}}, "hard")
+        d = policy.decide(
+            round_num=100, last_progress_round=98, lane="deep",
+            same_action_streak=5,
+        )
+        self.assertEqual(d.action, "continue")
 
 
 class DifficultyMaxRoundsTests(unittest.TestCase):
@@ -12,32 +192,91 @@ class DifficultyMaxRoundsTests(unittest.TestCase):
     @patch("solver.agent.ObserverLoop")
     @patch("solver.agent.OpenAI")
     @patch("solver.agent.search_tool")
-    def test_easy_gets_30_rounds(self, mock_search, mock_openai, mock_observer):
+    def test_easy_gets_40_rounds(self, mock_search, mock_openai, mock_observer):
         from solver.agent import SolverAgent
         task = "# CTF 题目：a-05\n- 难度：easy\n- 目标地址：http://10.0.1.1"
         settings = {"llm": {"base_url": "http://x", "api_key": "k"}}
         agent = SolverAgent(task=task, settings=settings, skills_dir="/skills")
-        self.assertEqual(agent.max_rounds, 30)
+        self.assertEqual(agent.max_rounds, 40)
+        self.assertEqual(agent._context_window_tokens, 1_000_000)
+        self.assertEqual(
+            agent._context_window_tokens - agent._reserve_tokens,
+            967_232,
+        )
+        self.assertEqual(agent._max_output_tokens, 8_192)
+        # 早期无卡死 → easy 默认拒绝 hint
+        agent.round = 5
+        agent._last_discovery_round = 5
+        self.assertIn("easy 题默认不查看提示", agent._tool_gate("challenge_get_hint", {}))
+        # 卡死（连续无发现 15 轮）→ easy 兜底解锁，不再拒绝
+        agent.round = 20
+        agent._last_discovery_round = 5
+        self.assertNotIn(
+            "easy 题默认不查看提示",
+            agent._tool_gate("challenge_get_hint", {}),
+        )
 
     @patch("solver.agent.ObserverLoop")
     @patch("solver.agent.OpenAI")
     @patch("solver.agent.search_tool")
-    def test_medium_gets_60_rounds(self, mock_search, mock_openai, mock_observer):
+    def test_medium_gets_70_rounds(self, mock_search, mock_openai, mock_observer):
         from solver.agent import SolverAgent
         task = "# CTF 题目：a-03\n- 难度：medium\n- 目标地址：http://10.0.1.1"
         settings = {"llm": {"base_url": "http://x", "api_key": "k"}}
         agent = SolverAgent(task=task, settings=settings, skills_dir="/skills")
-        self.assertEqual(agent.max_rounds, 60)
+        self.assertEqual(agent.max_rounds, 70)
 
     @patch("solver.agent.ObserverLoop")
     @patch("solver.agent.OpenAI")
     @patch("solver.agent.search_tool")
-    def test_hard_gets_100_rounds(self, mock_search, mock_openai, mock_observer):
+    def test_multi_flag_task_widens_auto_submit_limit(self, mock_search, mock_openai, mock_observer):
+        from solver.agent import SolverAgent
+        task = (
+            "# CTF 题目：b-02\n- 难度：hard\n- 目标地址：http://10.0.1.1\n"
+            "- ⚠️ 本题包含 6 个 Flag（多阶段渗透题）"
+        )
+        settings = {"llm": {"base_url": "http://x", "api_key": "k"}}
+        agent = SolverAgent(task=task, settings=settings, skills_dir="/skills")
+        self.assertEqual(agent._auto_submit_limit, 6)
+
+    @patch("solver.agent.ObserverLoop")
+    @patch("solver.agent.OpenAI")
+    @patch("solver.agent.search_tool")
+    def test_hint_min_round_scales_with_difficulty(self, mock_search, mock_openai, mock_observer):
+        from solver.agent import SolverAgent
+
+        def make(difficulty):
+            task = f"# CTF 题目：a-01\n- 难度：{difficulty}\n- 目标地址：http://10.0.1.1"
+            settings = {"llm": {"base_url": "http://x", "api_key": "k"}}
+            return SolverAgent(task=task, settings=settings, skills_dir="/skills")
+
+        self.assertEqual(make("easy")._hint_min_round, 8)
+        self.assertEqual(make("medium")._hint_min_round, 8)
+        self.assertEqual(make("hard")._hint_min_round, 6)
+        self.assertEqual(make("difficult")._hint_min_round, 6)
+
+    @patch("solver.agent.ObserverLoop")
+    @patch("solver.agent.OpenAI")
+    @patch("solver.agent.search_tool")
+    def test_explicit_hint_min_round_overrides_difficulty(self, mock_search, mock_openai, mock_observer):
+        from solver.agent import SolverAgent
+        task = "# CTF 题目：a-13\n- 难度：hard\n- 目标地址：http://10.0.1.1"
+        settings = {
+            "llm": {"base_url": "http://x", "api_key": "k"},
+            "solver": {"hint_min_round": 15},
+        }
+        agent = SolverAgent(task=task, settings=settings, skills_dir="/skills")
+        self.assertEqual(agent._hint_min_round, 15)
+
+    @patch("solver.agent.ObserverLoop")
+    @patch("solver.agent.OpenAI")
+    @patch("solver.agent.search_tool")
+    def test_hard_gets_110_rounds(self, mock_search, mock_openai, mock_observer):
         from solver.agent import SolverAgent
         task = "# CTF 题目：a-13\n- 难度：hard\n- 目标地址：http://10.0.1.1"
         settings = {"llm": {"base_url": "http://x", "api_key": "k"}}
         agent = SolverAgent(task=task, settings=settings, skills_dir="/skills")
-        self.assertEqual(agent.max_rounds, 100)
+        self.assertEqual(agent.max_rounds, 110)
 
     @patch("solver.agent.ObserverLoop")
     @patch("solver.agent.OpenAI")
@@ -90,6 +329,189 @@ class PathTraversalDedupTests(unittest.TestCase):
         self.assertIsNotNone(p)
 
 
+class BashAttemptBudgetTests(unittest.TestCase):
+    def test_counts_values_hidden_in_http_loop(self):
+        cmd = "for value in one two three four; do curl -s http://example.invalid/$value; done"
+        self.assertEqual(_inline_http_variant_count(cmd), 4)
+
+    @patch("solver.tools.bash_tool.subprocess.run")
+    def test_blocks_oversized_http_variant_loop(self, run):
+        from solver.tools.bash_tool import execute
+        from solver.worker_context import RunContext, ctx
+
+        base = tempfile.mkdtemp(prefix="bash-budget-")
+        context = RunContext.create(base, "case")
+        # 值爆破：循环变量注入固定端点的查询值 = wordlist 攻击，拦。
+        cmd = "for v in one two three four; do curl -s 'http://example.invalid/x?id=$v'; done"
+        with ctx.bind(context):
+            result = execute({"cmd": cmd})
+
+        self.assertIn("[阻止]", result)
+        run.assert_not_called()
+
+    @patch("solver.tools.bash_tool.subprocess.run")
+    def test_recon_loop_over_distinct_pages_allowed(self, run):
+        """侦察循环（打不同页面/端口）不是值爆破，不应被当作 wordlist 拦截（b-02/b-03 根因）。"""
+        run.return_value = MagicMock(stdout="ok", stderr="", returncode=0)
+        base = tempfile.mkdtemp(prefix="bash-budget-")
+        context = RunContext.create(base, "b-03")
+        with ctx.bind(context):
+            from solver.tools.bash_tool import execute
+            result = execute({"cmd": (
+                "for p in robots.txt about.php news.php contact.php admin/login.php; "
+                "do curl -s http://target/$p; done"
+            )})
+        self.assertNotIn("[阻止]", result)
+
+    @patch("solver.tools.bash_tool.subprocess.run")
+    def test_cross_turn_single_requests_allowed_until_threshold(self, run):
+        """跨轮单发的自适应探测放宽到 12（正经简单题也可能需 4~5 次同结构探测）。"""
+        from solver.tools.bash_tool import execute
+        from solver.worker_context import RunContext, ctx
+
+        run.return_value = MagicMock(stdout="ok", stderr="", returncode=0)
+        base = tempfile.mkdtemp(prefix="bash-budget-")
+        context = RunContext.create(base, "case")
+        with ctx.bind(context):
+            # 前 12 次单发（含第 4~5 次）都不被硬封，只会在第 3 次起软提醒。
+            for value in range(12):
+                self.assertNotIn(
+                    "[阻止]",
+                    execute({"cmd": f"curl -s http://example.invalid/item?id={value}"}),
+                )
+            # 第 13 次超过兜底阈值才硬封。
+            result = execute({"cmd": "curl -s http://example.invalid/item?id=13"})
+        self.assertIn("[阻止]", result)
+        self.assertEqual(run.call_count, 12)
+
+    @patch("solver.tools.bash_tool.subprocess.run")
+    def test_inline_loop_wordlist_blocked_immediately(self, run):
+        """把字典塞进一条 shell 循环（≥ 4 变体）= 爆破向量，第一条就拦。"""
+        from solver.tools.bash_tool import execute
+        from solver.worker_context import RunContext, ctx
+
+        run.return_value = MagicMock(stdout="ok", stderr="", returncode=0)
+        base = tempfile.mkdtemp(prefix="bash-budget-")
+        context = RunContext.create(base, "case")
+        with ctx.bind(context):
+            result = execute({"cmd": (
+                "for p in a b c d e; do curl -s http://target/login?p=$p; done"
+            )})
+        self.assertIn("[阻止]", result)
+        run.assert_not_called()
+
+    @patch("solver.tools.bash_tool.subprocess.run")
+    def test_scoring_endpoint_is_not_blocked_at_fourth(self, run):
+        """打分/提交型端点（/check /submit …）的迭代提交不能在第 3 次封死。"""
+        from solver.tools.bash_tool import execute
+        from solver.worker_context import RunContext, ctx
+
+        run.return_value = MagicMock(stdout="ok", stderr="", returncode=0)
+        base = tempfile.mkdtemp(prefix="bash-budget-")
+        context = RunContext.create(base, "case")
+        with ctx.bind(context):
+            for value in range(6):
+                self.assertNotIn(
+                    "[阻止]",
+                    execute({"cmd": f"curl -s http://example.invalid/check?v={value}"}),
+                )
+        self.assertEqual(run.call_count, 6)
+
+    @patch("solver.tools.bash_tool.subprocess.run")
+    def test_evasion_challenge_exempts_repeated_submissions(self, run):
+        """e3 检测对抗题：反复提交代码给评分器是解法本身，不按暴力破解封锁。"""
+        from solver.tools.bash_tool import execute
+        from solver.worker_context import RunContext, ctx
+
+        run.return_value = MagicMock(stdout="ok", stderr="", returncode=0)
+        base = tempfile.mkdtemp(prefix="bash-budget-")
+        context = RunContext.create(base, "e3-04")
+        with ctx.bind(context):
+            for value in range(6):
+                self.assertNotIn(
+                    "[阻止]",
+                    execute({"cmd": f"curl -s http://target/anything?v={value}"}),
+                )
+        self.assertEqual(run.call_count, 6)
+
+    @patch("solver.tools.bash_tool.subprocess.run")
+    def test_blind_injection_extraction_is_not_blocked(self, run):
+        """盲注 / LFI 需要对同一端点发多次自适应请求，不能在第 3 次封死。"""
+        from solver.tools.bash_tool import execute
+        from solver.worker_context import RunContext, ctx
+
+        run.return_value = MagicMock(stdout="ok", stderr="", returncode=0)
+        base = tempfile.mkdtemp(prefix="bash-budget-")
+        context = RunContext.create(base, "a-14")
+        with ctx.bind(context):
+            for i in range(1, 7):
+                self.assertNotIn(
+                    "[阻止]",
+                    execute({"cmd": (
+                        "curl -s 'http://target/news.php?id=1 AND "
+                        f"SUBSTRING(user(),{i},1)=0x61'"
+                    )}),
+                )
+        self.assertEqual(run.call_count, 6)
+
+    @patch("solver.tools.bash_tool.subprocess.run")
+    def test_lfi_reading_many_files_is_not_blocked(self, run):
+        """多阶段题靠 LFI 读源码/配置/多个 flag，读第 4+ 个文件不能被封（b-01 根因）。"""
+        from solver.tools.bash_tool import execute
+        from solver.worker_context import RunContext, ctx
+
+        run.return_value = MagicMock(stdout="root:x:0:0", stderr="", returncode=0)
+        base = tempfile.mkdtemp(prefix="bash-budget-")
+        context = RunContext.create(base, "b-01")
+        files = [
+            "etc/passwd", "proc/self/cmdline", "var/www/html/config.php",
+            "app/flag1.txt", "app/flag2.txt", "var/www/html/db.php",
+        ]
+        with ctx.bind(context):
+            for path in files:
+                cmd = f"curl -s 'http://target/services.php?lang=....//....//{path}'"
+                self.assertNotIn("[阻止]", execute({"cmd": cmd}), path)
+        self.assertEqual(run.call_count, len(files))
+
+    @patch("solver.tools.bash_tool.subprocess.run")
+    def test_ssrf_internal_enumeration_is_not_blocked(self, run):
+        """SSRF 端点（/api/import 等）的内网枚举不能在第 3 次封死（a-14 根因）。"""
+        from solver.tools.bash_tool import execute
+        from solver.worker_context import RunContext, ctx
+
+        run.return_value = MagicMock(stdout="ok", stderr="", returncode=0)
+        base = tempfile.mkdtemp(prefix="bash-budget-")
+        context = RunContext.create(base, "a-14")
+        internal = ["10.0.255.53", "127.0.0.1:5000", "192.168.0.1", "169.254.169.254"]
+        with ctx.bind(context):
+            for i, host in enumerate(internal + internal):
+                self.assertNotIn(
+                    "[阻止]",
+                    execute({"cmd": (
+                        "curl -s http://target/api/import "
+                        f"-d '{{\"url\":\"http://{host}/\"}}'"
+                    )}),
+                )
+        self.assertEqual(run.call_count, 8)
+
+    @patch("solver.tools.bash_tool.subprocess.run")
+    def test_login_bruteforce_loop_still_blocked(self, run):
+        """登录爆破的真正向量是字典循环，仍被即时拦截。"""
+        from solver.tools.bash_tool import execute
+        from solver.worker_context import RunContext, ctx
+
+        run.return_value = MagicMock(stdout="ok", stderr="", returncode=0)
+        base = tempfile.mkdtemp(prefix="bash-budget-")
+        context = RunContext.create(base, "a-01")
+        with ctx.bind(context):
+            result = execute({"cmd": (
+                "for p in 111111 222222 333333 444444; do "
+                "curl -s \"http://target/login?u=admin&p=$p\"; done"
+            )})
+        self.assertIn("[阻止]", result)
+        run.assert_not_called()
+
+
 class ExtractDifficultyTests(unittest.TestCase):
     """SolverAgent._extract_difficulty()"""
 
@@ -108,6 +530,41 @@ class ExtractDifficultyTests(unittest.TestCase):
     def test_no_difficulty_returns_empty(self):
         from solver.agent import SolverAgent
         self.assertEqual(SolverAgent._extract_difficulty("no difficulty here"), "")
+
+
+class AutoSubmitSafetyTests(unittest.TestCase):
+    @patch("solver.agent.bridge_tools.submit_flag")
+    def test_rejects_flag_echoed_by_password_script(self, submit_flag):
+        """A dictionary result must not turn a failed password into a flag."""
+        from solver.agent import SolverAgent
+
+        agent = SolverAgent.__new__(SolverAgent)
+        agent._auto_submit_count = 0
+        output = (
+            "⚡ 发现疑似 flag：['flag{candidate123}']\n"
+            "[0] admin/flag{candidate123} => nope\n"
+        )
+
+        self.assertEqual(
+            agent._auto_submit_flags(
+                output,
+                tool_name="bash",
+                tool_args={"cmd": "./try-passwords.sh"},
+            ),
+            "",
+        )
+        submit_flag.assert_not_called()
+
+    @patch("solver.agent.bridge_tools.submit_flag")
+    def test_marker_without_visible_source_line_is_not_evidence(self, submit_flag):
+        from solver.agent import SolverAgent
+
+        agent = SolverAgent.__new__(SolverAgent)
+        agent._auto_submit_count = 0
+        marker_only = "⚡ 发现疑似 flag：['flag{truncated123}']"
+
+        self.assertEqual(agent._auto_submit_flags(marker_only, "bash", {}), "")
+        submit_flag.assert_not_called()
 
 
 class AutoExtractTests(unittest.TestCase):
@@ -149,6 +606,35 @@ class AutoExtractTests(unittest.TestCase):
         result = _auto_extract("route via 10.0.100.1 dev tun0")
         # VPN 网关 10.0.100.x 应被过滤
         self.assertNotIn("内网", result)
+
+    def test_configured_target_is_not_reported_as_lateral_host(self):
+        from solver.tools.bash_tool import _auto_extract
+        from solver.worker_context import RunContext, ctx
+
+        base = tempfile.mkdtemp(prefix="auto-extract-")
+        context = RunContext.create(base, "case", target_url="http://10.0.1.1:80")
+        with ctx.bind(context):
+            result = _auto_extract("request to 10.0.1.1 completed")
+
+        self.assertNotIn("内网", result)
+
+    def test_target_ip_does_not_trigger_phase_transition(self):
+        from solver.agent import SolverAgent
+
+        agent = SolverAgent.__new__(SolverAgent)
+        agent._phase = "INITIAL_ACCESS"
+        agent._got_shell = True
+        agent._target_url = "http://10.0.1.1:80"
+        agent._found_internal_ips = set()
+        agent._pending_injections = []
+        agent._injection_lock = threading.Lock()
+
+        agent._detect_phase_transition(
+            "bash", {"cmd": "curl http://10.0.1.1"}, "connected to 10.0.1.1"
+        )
+
+        self.assertEqual(agent._phase, "INITIAL_ACCESS")
+        self.assertEqual(agent._found_internal_ips, set())
 
 
 if __name__ == "__main__":

@@ -29,3 +29,7 @@ nul
 # 不提交的文档
 开发记录/
 百度比赛提交材料/
+
+# Local run logs (never package benchmark traces)
+run_log_*.log
+.DS_Store

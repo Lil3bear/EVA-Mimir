@@ -1,14 +1,20 @@
-import sys
 import os
+import json
 import threading
 from typing import Any
 
-from shared.jsonl import serialize, deserialize
+from shared.jsonl import deserialize, write_line
 from solver.ctfplatform.tsecbench_client import (
     Challenge,
     DuplicateSubmit,
+    InvalidState,
+    TaskNotFound,
     TsecbenchClient,
 )
+from solver.runtime.challenge_ledger import ChallengeLedger
+from solver.runtime.stage_ledger import StageLedger
+from solver.runtime.state_events import StateEventLog
+from solver.runtime.submission_store import SubmissionOutcome, SubmissionStore
 from solver.worker_context import ctx as _ctx
 
 
@@ -54,8 +60,7 @@ def _request_bridge(action: str, params: dict, timeout: float = 30.0) -> dict:
         "action": action,
         "params": params,
     }
-    sys.stdout.write(serialize(msg))
-    sys.stdout.flush()
+    write_line(msg)
 
     done.wait(timeout=timeout)
 
@@ -183,6 +188,7 @@ def _request_tsecbench(action: str, params: dict) -> dict:
 
 
 def _challenge_to_state(challenge: Challenge) -> dict:
+    remaining = max(0, challenge.flag_count - challenge.correct_flag_count)
     return {
         "name": challenge.unique_code,
         "category": "unknown",
@@ -194,24 +200,134 @@ def _challenge_to_state(challenge: Challenge) -> dict:
         "unique_code": challenge.unique_code,
         "flag_count": challenge.flag_count,
         "correct_flag_count": challenge.correct_flag_count,
+        "remaining_flag_count": remaining,
         "container_status": challenge.container_status,
         "container_addr": list(challenge.container_addr),
     }
 
 
 def _request_backend(action: str, params: dict) -> dict:
-    if _ctx.client is not None:
+    if _ctx.client is None:
+        return _request_bridge(action, params)
+    try:
         return _request_tsecbench(action, params)
-    return _request_bridge(action, params)
+    except (TaskNotFound, InvalidState) as exc:
+        # ToolRunner 将异常格式化成文本，但任务终止必须穿透到
+        # Agent/Scheduler，不能被当成普通 bash/submit 失败继续重跑。
+        text = " ".join(
+            str(value).lower()
+            for value in (exc, getattr(exc, "message", ""), getattr(exc, "detail", ""))
+        )
+        hint_completed = action == "challenge_get_hint" and any(
+            marker in text for marker in ("completed", "complete", "通关", "已完成")
+        )
+        capacity = (
+            "max active" in text
+            or ("active" in text and "limit" in text)
+            or "上限" in text
+            or "最大活跃" in text
+        )
+        if isinstance(exc, TaskNotFound) or (isinstance(exc, InvalidState) and not hint_completed and not capacity):
+            _ctx.terminal_error = exc
+        raise
+
+
+def _challenge_dir() -> str:
+    d = getattr(_ctx, "challenge_dir", "") or ""
+    if not d or d == "/workspace":
+        return ""
+    return d
 
 
 def submit_flag(args: dict) -> str:
     flag = args.get("flag", "").strip()
     writeup = args.get("writeup", "")
-    try:
-        data = _request_backend("challenge_submit_flag", {"flag": flag, "writeup": writeup})
-    except DuplicateSubmit:
-        return f"[重复] Flag 已经提交并计分：{flag}"
+
+    def submit_once() -> dict:
+        try:
+            return _request_backend(
+                "challenge_submit_flag", {"flag": flag, "writeup": writeup}
+            )
+        except DuplicateSubmit:
+            # A duplicate means this flag index was previously accepted.  The
+            # duplicate response has no score/progress metadata, so reconcile
+            # current completion state before updating the local store.
+            duplicate = {"correct": True, "duplicate": True}
+            try:
+                state = _request_backend(
+                    "challenge_get_state", {"unique_code": _current_unique_code()}
+                )
+                duplicate.update({
+                    "correct_flag_count": state.get("correct_flag_count", 0),
+                    "total_flag_count": state.get("flag_count", 0),
+                    "is_completed": state.get("is_completed", False),
+                })
+            except (TaskNotFound, InvalidState):
+                raise
+            except Exception:
+                # The duplicate itself is still authoritative; a transient
+                # snapshot failure must not turn it into a wrong submission.
+                pass
+            return duplicate
+
+    challenge_dir = _challenge_dir()
+    if challenge_dir:
+        outcome = SubmissionStore(challenge_dir).submit(flag, submit_once)
+    else:
+        data = submit_once()
+        outcome = SubmissionOutcome(
+            status="correct" if data.get("correct") else "wrong",
+            response=data,
+            duplicate=False,
+            wrong_count=0 if data.get("correct") else 1,
+        )
+
+    persistence_warning = (
+        f"\n[警告] 平台响应已生效，但本地提交状态未完整持久化：{outcome.persistence_error}"
+        if outcome.persistence_error else ""
+    )
+
+    if outcome.duplicate:
+        if outcome.status == "correct":
+            return f"[重复] Flag 已提交且正确：{flag}{persistence_warning}"
+        return f"[重复] 该 flag 之前已提交且判定错误：{flag}。禁止重复提交同一 flag，请换方向重新分析。{persistence_warning}"
+
+    if outcome.status == "limited":
+        return (
+            f"[拦截] 本题已累计提交 {outcome.wrong_count} 个错误 flag，"
+            "禁止继续猜。请回到题目逻辑重新分析，找到确定证据后再提交。"
+        )
+
+    data = outcome.response or {}
+    if challenge_dir and data:
+        try:
+            stage_state = StageLedger(challenge_dir).record_submission(
+                data, attempt_id=getattr(_ctx, "attempt_id", "primary")
+            )
+            StateEventLog(challenge_dir).append(
+                "flag_progressed",
+                {
+                    "correct": bool(data.get("correct")),
+                    "correct_flags": stage_state.get("correct_flags", 0),
+                    "total_flags": stage_state.get("total_flags", 0),
+                    "matched_index": data.get("matched_flag_index"),
+                },
+                attempt_id=getattr(_ctx, "attempt_id", "primary"),
+                run_id=getattr(_ctx, "run_id", ""),
+            )
+        except Exception as exc:
+            # Submission remains authoritative; ledger is a coordination aid.
+            data.setdefault("stage_ledger_warning", str(exc))
+    if data.get("duplicate"):
+        correct = data.get("correct_flag_count", "?")
+        total = data.get("total_flag_count", "?")
+        progress = f"（进度 {correct}/{total}）"
+        if data.get("is_completed"):
+            return (
+                f"[重复] Flag 已经正确提交并计分：{flag}{progress} "
+                f"🎉 全部 Flag 已找到，题目完成！{persistence_warning}"
+            )
+        return f"[重复] Flag 已经正确提交并计分：{flag}{progress}{persistence_warning}"
     if data.get("correct"):
         score = data.get("awarded")
         correct = data.get("correct_flag_count", "?")
@@ -220,27 +336,59 @@ def submit_flag(args: dict) -> str:
         suffix = f"，本次得分 {score}" if score is not None else ""
         progress = f"（进度 {correct}/{total}）"
         if completed:
-            return f"[✓] Flag 提交正确：{flag}{suffix}{progress} 🎉 全部 Flag 已找到，题目完成！"
+            return f"[✓] Flag 提交正确：{flag}{suffix}{progress} 🎉 全部 Flag 已找到，题目完成！{persistence_warning}"
         else:
-            return f"[✓] Flag 提交正确：{flag}{suffix}{progress} 还有剩余 Flag，请继续寻找！"
+            return f"[✓] Flag 提交正确：{flag}{suffix}{progress} 还有剩余 Flag，请继续寻找！{persistence_warning}"
     else:
-        return f"[✗] Flag 提交错误：{flag}，请继续寻找"
+        wrong = outcome.wrong_count
+        warn = ""
+        if wrong >= 3:
+            warn = (
+                f"\n⚠️ 已累计提交 {wrong} 个错误 flag。"
+                "立即停止猜 flag，回到题目逻辑重新分析，找到确定证据后再提交。"
+            )
+        return f"[✗] Flag 提交错误：{flag}，请继续寻找{warn}{persistence_warning}"
 
 
 def get_state(args: dict) -> str:
     data = _request_backend("challenge_get_state", args)
-    if data.get("challenges"):
+    challenge_dir = _challenge_dir()
+    if challenge_dir and not data.get("challenges"):
+        try:
+            StageLedger(challenge_dir).reconcile_state(data)
+        except Exception:
+            pass
+    if data.get("challenges"): 
         return "[题目列表]\n" + "\n".join(
             f"- {item.get('unique_code')}: {item.get('correct_flag_count', 0)}/{item.get('flag_count', 0)}，"
             f"状态={item.get('container_status')}，完成={item.get('is_completed')}"
             for item in data["challenges"]
         )
+    correct = int(data.get("correct_flag_count", 0))
+    total = int(data.get("flag_count", 0))
+    remaining = max(0, total - correct)
+    stage_line = ""
+    if challenge_dir:
+        try:
+            stage = StageLedger(challenge_dir).snapshot()
+            stage_line = (
+                f"阶段账本：{stage.get('current_stage', 'stage_1')}，"
+                f"已提交索引 {stage.get('correct_flags', 0)}/{stage.get('total_flags', total)}"
+            )
+        except Exception:
+            stage_line = ""
     lines = [
         f"题目：{data.get('name')} ({data.get('category')} / {data.get('difficulty')})",
         f"URL：{data.get('url')}",
         f"描述：{data.get('description')}",
-        f"已完成：{'是' if data.get('is_completed') else '否'}",
+        f"Flag 进度：已找到 {correct}/{total} 个",
     ]
+    if stage_line:
+        lines.append(stage_line)
+    if data.get("is_completed"):
+        lines.append("状态：✅ 已完成（全部 Flag 已提交）")
+    else:
+        lines.append(f"状态：未完成，还有 {remaining} 个 Flag 待找，必须继续提交")
     correct_flags = data.get("correct_flags", [])
     if correct_flags:
         lines.append(f"已找到的 Flag：{', '.join(correct_flags)}")
@@ -248,11 +396,26 @@ def get_state(args: dict) -> str:
 
 
 def get_hint(args: dict) -> str:
-    data = _request_backend("challenge_get_hint", args)
-    hints = data.get("hints", [])
+    # 提示扣分按题目一次性计算；跨 Agent/重跑时允许重看，但直接返回
+    # 题目级缓存，避免 Multi-Solver 重复请求平台和重复消耗时间。
+    challenge_dir = _challenge_dir()
+
+    def fetch() -> list[str]:
+        data = _request_backend("challenge_get_hint", args)
+        return [str(value) for value in data.get("hints", []) if value]
+
+    if challenge_dir:
+        hints, cached = ChallengeLedger(challenge_dir).get_or_fetch_hints(fetch)
+    else:
+        hints, cached = fetch(), False
     if not hints:
-        return "[提示] 暂无提示"
-    return "[提示]\n" + "\n".join(f"- {h}" for h in hints)
+        suffix = "（本地缓存）" if cached else ""
+        return f"[提示]{suffix} 暂无提示"
+    source = "本地缓存，未重复请求平台" if cached else "首次获取并已缓存"
+    return (
+        f"[提示]（{source}；本题提示扣分不重复叠加）\n"
+        + "\n".join(f"- {hint}" for hint in hints)
+    )
 
 
 def start_challenge(args: dict) -> str:

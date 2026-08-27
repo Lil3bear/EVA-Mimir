@@ -6,7 +6,7 @@ flag 提交改为直接打印（不走 Bridge 协议）。
 docker run --rm -it \
   -e LLM_BASE_URL="https://api.deepseek.com" \
   -e LLM_API_KEY="sk-xxx" \
-  -e LLM_MODEL="deepseek-chat" \
+  -e LLM_MODEL="deepseek-v4-flash" \
   -v D:/AgentProjectPractice/EVA-Mimir/tests/e2e_test.py:/tmp/e2e_test.py \
   eva-mimir:latest \
   python3 /tmp/e2e_test.py
@@ -15,6 +15,10 @@ docker run --rm -it \
 import os
 import sys
 import json
+import unittest
+
+if __name__ != "__main__":
+    raise unittest.SkipTest("manual Docker end-to-end script")
 
 # 设置环境变量
 os.environ.setdefault("CTF_WORKSPACE", "/root/workspace")
@@ -96,7 +100,7 @@ def main():
     print(f"  EVA-Mimir 端到端测试", file=sys.stderr)
     print(f"  题目: {CHALLENGE_NAME}", file=sys.stderr)
     print(f"  目标: {TARGET_URL}", file=sys.stderr)
-    print(f"  模型: {os.environ.get('LLM_MODEL', 'deepseek-chat')}", file=sys.stderr)
+    print(f"  模型: {os.environ.get('LLM_MODEL', 'deepseek-v4-flash')}", file=sys.stderr)
     print(f"  最大轮次: {MAX_ROUNDS}", file=sys.stderr)
     print(f"{'='*60}", file=sys.stderr)
 
@@ -104,8 +108,8 @@ def main():
         "llm": {
             "base_url": os.environ.get("LLM_BASE_URL", ""),
             "api_key": os.environ.get("LLM_API_KEY", ""),
-            "default_model": os.environ.get("LLM_MODEL", "deepseek-chat"),
-            "observer_model": os.environ.get("LLM_MODEL", "deepseek-chat"),
+            "default_model": os.environ.get("LLM_MODEL", "deepseek-v4-flash"),
+            "observer_model": os.environ.get("LLM_MODEL", "deepseek-v4-flash"),
         },
         "solver": {
             "max_rounds": MAX_ROUNDS,

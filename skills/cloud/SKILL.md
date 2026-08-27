@@ -3,6 +3,10 @@
 ## 适用场景
 CTF 云安全攻击类题目，包括云元数据服务利用、IAM 提权、S3 桶配置错误、容器逃逸、Kubernetes 利用等。
 
+**专项 reference（用 skill_load 加载）**：
+- 云函数/Serverless（Lambda/CloudFunc）→ `skill_load(name="cloud", resource="serverless.md")`
+- Azure Blob Storage / SAS 签名利用 → `skill_load(name="cloud", resource="azure-storage.md")`
+
 ---
 
 ## 阶段一：云环境识别

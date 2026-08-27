@@ -3,17 +3,40 @@ import os
 import sys
 import time
 import threading
+import uuid
+import copy
 from pathlib import Path
 
-from shared.jsonl import serialize, deserialize
+from shared.jsonl import deserialize, write_line
 from shared.bridge_types import SolverInitPayload
+from solver.runtime.settings import (
+    apply_llm_gateway as _apply_llm_gateway,
+    load_settings as _load_settings_from_env,
+)
 from solver.tools import bridge_tools
+from solver.runtime.submission_store import benchmark_task_id, score_belongs_to_current_task
+from solver.runtime.retry_ledger import RetryLedger
 
 
 def _emit(event_type: str, data=None) -> None:
-    msg = {"type": event_type, "data": data}
-    sys.stdout.write(serialize(msg))
-    sys.stdout.flush()
+    write_line({"type": event_type, "data": data})
+
+
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    raw = os.environ.get(name, str(default)).strip()
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"环境变量 {name} 必须是整数，实际为 {raw!r}") from exc
+    if value < minimum:
+        raise ValueError(f"环境变量 {name} 必须大于等于 {minimum}，实际为 {value}")
+    return value
+
+
+def _env_codes(name: str, default: str) -> set[str]:
+    """读逗号分隔的题号列表（环境变量），用于跳过名单。"""
+    raw = os.environ.get(name, default).strip()
+    return {code.strip() for code in raw.split(",") if code.strip()}
 
 
 def _read_stdin_loop(agent) -> None:
@@ -62,40 +85,82 @@ def _run_tsecbench_mode() -> None:
     """
     Tsecbench 比赛模式：检测到 BENCHMARK_TOKEN 和 BENCHMARK_BASE_URL 时自动进入。
     使用调度器遍历所有题目，逐题解题。
-    支持多轮重跑：第一遍跑全部 63 题，后续轮次只跑失败题，
-    连续两轮都失败的题放弃。
+    支持多轮重跑：第一遍跑全部题，后续轮次只跑未完成题；
+    按难度连续 2～3 次没有新增 flag 或实质证据的题暂停。
     """
-    from solver.ctfplatform.tsecbench_client import TsecbenchClient
+    from solver.ctfplatform.tsecbench_client import (
+        InvalidState,
+        TaskNotFound,
+        TsecbenchClient,
+        VpnCheckError,
+    )
     from solver.ctfplatform.scheduler import Scheduler
 
     _emit("mode", {"mode": "tsecbench"})
+    # Deadline covers preflight, LLM probe, retries and solver work—not only
+    # the first challenge attempt.
+    run_start_time = time.time()
 
     # 从环境变量读取 LLM 配置（比赛环境下可能通过环境变量传入）
-    settings = _load_settings_from_env()
+    try:
+        settings = _load_settings_from_env()
+    except ValueError as exc:
+        _emit("error", {"msg": f"配置加载失败：{exc}"})
+        sys.exit(1)
+
+    # 强制前置 VPN 健康检查：任何 LLM 探测或挑战 API 之前，先确认
+    # http://10.0.100.58 返回 status=ok。Scheduler 会再次检查以覆盖
+    # 长时间运行期间 VPN 断线的情况。
+    try:
+        client = TsecbenchClient.from_env()
+        vpn = client.check_vpn()
+        _emit("vpn_preflight_ok", {
+            "client_ip": vpn.client_ip,
+            "time": vpn.time,
+        })
+    except VpnCheckError as exc:
+        _emit("error", {"msg": "VPN检测未通过,请检查靶场VPN网络配置", "detail": str(exc)})
+        if "client" in locals():
+            client.close()
+        sys.exit(1)
+    except ValueError as exc:
+        _emit("error", {"msg": f"Tsecbench 客户端初始化失败：{exc}"})
+        sys.exit(1)
 
     # 验证 LLM 配置
     llm_cfg = settings.get("llm", {})
     llm_url = llm_cfg.get("base_url") or os.environ.get("LLM_BASE_URL", "")
     llm_key = llm_cfg.get("api_key") or os.environ.get("LLM_API_KEY", "")
-    if not llm_url or not llm_key:
+
+    # 托管模式默认只能访问平台网关；但显式 LLM_GATEWAY=0 时保持直连
+    # （例如 tokenhub.tencentmaas.com 等可直连端点）。
+    if not llm_url:
+        llm_url = "http://api.deepseek.com.tsecbench.gw/v1"
+    else:
+        # LLM_GATEWAY=1 → 强制改写为 *.tsecbench.gw；否则保持直连。
+        llm_url = _apply_llm_gateway(llm_url)
+    llm_cfg["base_url"] = llm_url
+
+    if not llm_key:
         _emit("error", {"msg": (
-            "LLM 配置缺失。请设置环境变量 LLM_BASE_URL 和 LLM_API_KEY。"
-            " 比赛环境网关地址示例：LLM_BASE_URL=http://api.deepseek.com.tsecbench.gw"
+            "LLM_API_KEY 未配置。请在平台运行时环境变量中添加：\n"
+            "  LLM_API_KEY=<你的大模型 API Key>\n"
+            "可选：LLM_MODEL=deepseek-v4-flash（默认已是）、LLM_GATEWAY=1（自动改写网关）。"
         )})
         sys.exit(1)
-    _emit("llm_config", {"base_url": llm_url, "model": llm_cfg.get("default_model", "deepseek-chat")})
+    _emit("llm_config", {"base_url": llm_url, "model": llm_cfg.get("default_model", "deepseek-v4-flash")})
 
     # ━━ LLM 连通性测试 ━━
     _emit("llm_probe", {"status": "testing", "url": llm_url})
     try:
-        import httpx2 as httpx
+        import httpx
         from openai import OpenAI
         probe_client = OpenAI(
             base_url=llm_url,
             api_key=llm_key,
             timeout=httpx.Timeout(10.0, connect=8.0),
         )
-        probe_model = llm_cfg.get("default_model") or os.environ.get("LLM_MODEL", "deepseek-chat")
+        probe_model = llm_cfg.get("default_model") or os.environ.get("LLM_MODEL", "deepseek-v4-flash")
         probe_resp = probe_client.chat.completions.create(
             model=probe_model,
             messages=[{"role": "user", "content": "ping"}],
@@ -111,31 +176,56 @@ def _run_tsecbench_mode() -> None:
     os.environ.setdefault("CTF_WORKSPACE", workspace_dir)
     os.environ.setdefault("CTF_SKILLS_DIR", skills_dir)
 
-    # 创建 Tsecbench 客户端
-    try:
-        client = TsecbenchClient.from_env()
-    except ValueError as e:
-        _emit("error", {"msg": f"Tsecbench 客户端初始化失败：{e}"})
-        sys.exit(1)
-
     # 并行度：settings.solver.max_parallel 或环境变量 SOLVER_MAX_PARALLEL（默认 3）
     max_parallel = settings.get('solver', {}).get('max_parallel', 3)
-    if os.environ.get('SOLVER_MAX_PARALLEL'):
-        max_parallel = int(os.environ['SOLVER_MAX_PARALLEL'])
+    try:
+        if os.environ.get('SOLVER_MAX_PARALLEL'):
+            max_parallel = _env_int('SOLVER_MAX_PARALLEL', 3, minimum=1)
+        else:
+            max_parallel = int(max_parallel)
+    except (TypeError, ValueError) as exc:
+        _emit("error", {"msg": str(exc)})
+        client.close()
+        sys.exit(1)
+    # 平台上限是 3；调度器也会再次限幅，入口处先规范化日志和配置。
+    max_parallel = min(3, max(1, max_parallel))
 
     # 前缀过滤：只跑指定前缀的题目（如 SOLVER_PREFIX_FILTER=b- 只跑多阶段渗透）
     prefix_filter = os.environ.get('SOLVER_PREFIX_FILTER', '').strip() or None
+    # 精确题号过滤：只跑指定题号（用于专项研究能力瓶颈题，如 SOLVER_ONLY_CODES=a-18,c-03）
+    only_codes = _env_codes("SOLVER_ONLY_CODES", "")
 
     # 多轮重跑参数
-    total_timeout_min = int(os.environ.get('SOLVER_TOTAL_TIMEOUT', '350'))
-    max_retry_rounds = int(os.environ.get('SOLVER_MAX_RETRY_ROUNDS', '5'))
-    start_time = time.time()
+    try:
+        total_timeout_min = _env_int('SOLVER_TOTAL_TIMEOUT', 350, minimum=0)
+        max_retry_rounds = _env_int('SOLVER_MAX_RETRY_ROUNDS', 5, minimum=0)
+    except ValueError as exc:
+        _emit("error", {"msg": str(exc)})
+        client.close()
+        sys.exit(1)
+    start_time = run_start_time
+    # 同一进程内的重跑共享 run_id；SubmissionStore 用它清理旧 run 的
+    # 错误猜测，同时保留本次 run 已经正确提交的 flag。
+    os.environ.setdefault("CTF_RUN_ID", uuid.uuid4().hex)
+    deadline = start_time + max(0, total_timeout_min) * 60
 
-    # 连续 MAX_FAIL_STREAK 轮都失败（0 correct）的题 → 放弃
-    fail_streak: dict[str, int] = {}  # 每题连续失败轮数
-    abandoned_codes: set[str] = set()
+    # 旧版（run-11649 基线）语义：连续 MAX_FAIL_STREAK 轮 0 correct 才放弃，
+    # 部分解出（correct>0）重置计数。不用 made_progress / 无增量收敛，
+    # 避免 hard 多阶段题在拿不到新增 flag 时被提前暂停。
+    retry_ledger = RetryLedger(workspace_dir, benchmark_task_id())
+    retry_state = retry_ledger.snapshot()
+    fail_streak: dict[str, int] = dict(retry_state.get("fail_streak", {}))
+    abandoned_codes: set[str] = set(retry_state.get("abandoned", []))
+    # 解题顺序改为简单后难（policy.py 难度升序）；瓶颈题不再放开头攻坚，
+    # 连续失败后仍由 retry ledger 自动 abandon。要显式跳过时用 SOLVER_SKIP_CODES。
+    pre_skip_codes = _env_codes("SOLVER_SKIP_CODES", "")
     MAX_FAIL_STREAK = 4
     cumulative_report: dict = {}
+    # Only report a total count that came from a successful platform snapshot;
+    # never hard-code a presumed benchmark size after a terminal error.
+    known_total_count = 0
+    round_idx = 0
+    terminal_error_code = ""
 
     for round_idx in range(1, max_retry_rounds + 1):
         elapsed_min = (time.time() - start_time) / 60
@@ -157,6 +247,7 @@ def _run_tsecbench_mode() -> None:
         if time_ratio < 0.2 and round_idx > 1:
             try:
                 all_ch = client.list_challenges()
+                known_total_count = len(all_ch)
                 for c in all_ch:
                     if (c.difficulty.lower() in ("hard", "difficult")
                             and not c.is_completed
@@ -168,22 +259,61 @@ def _run_tsecbench_mode() -> None:
                         "codes": sorted(skip_hard_new),
                         "time_ratio": round(time_ratio, 2),
                     })
-            except Exception:
-                pass
+            except (TaskNotFound, InvalidState) as exc:
+                _emit("terminal_error", {
+                    "phase": "time_pressure_list_challenges",
+                    "code": getattr(exc, "code", ""),
+                    "message": str(exc),
+                })
+                break
+            except Exception as exc:
+                _emit("warning", {
+                    "phase": "time_pressure_list_challenges",
+                    "message": str(exc),
+                })
+
+        # 第 2 轮起，用 baseline 宽松模式重跑未解题（无早停/无切换/无强干预，
+        # 完整预算自由探索，用于兑底保分）。首轮仍走 Fast/Deep Lane。
+        round_settings = settings
+        if round_idx >= 2:
+            round_settings = copy.deepcopy(settings)
+            round_settings.setdefault("solver", {})["baseline_mode"] = True
+
+        retry_state = retry_ledger.snapshot()
+        retry_cooldown = {
+            code for code, until in retry_state.get("cooldown_until_round", {}).items()
+            if int(until or 0) > round_idx and code not in abandoned_codes
+        }
+        if retry_cooldown:
+            _emit("retry_cooldown", {
+                "round": round_idx,
+                "codes": sorted(retry_cooldown),
+            })
 
         scheduler = Scheduler(
             client=client,
-            settings=settings,
+            settings=round_settings,
             skills_dir=skills_dir,
             workspace_dir=workspace_dir,
             max_parallel=max_parallel,
+            deadline=deadline,
             skip_completed=True,
-            skip_codes=abandoned_codes | skip_hard_new,
+            skip_codes=pre_skip_codes | abandoned_codes | skip_hard_new | retry_cooldown,
             prefix_filter=prefix_filter,
+            only_codes=only_codes,
         )
 
         try:
             report = scheduler.run_all()
+            known_total_count = max(known_total_count, report.total_challenges)
+        except (TaskNotFound, InvalidState) as e:
+            terminal_error_code = getattr(e, "code", "") or type(e).__name__
+            _emit("terminal_error", {
+                "code": terminal_error_code,
+                "message": str(e),
+            })
+            scheduler.close_all_active()
+            break
         except KeyboardInterrupt:
             _emit("scheduler_interrupted", {})
             scheduler.close_all_active()
@@ -194,7 +324,8 @@ def _run_tsecbench_mode() -> None:
             scheduler.close_all_active()
             break
 
-        # 统计本轮失败的题目
+        # 统计本轮无增量题。部分题不能只看 correct>0：如果从 1/4
+        # 到本轮结束仍是 1/4 且没有新证据，同样必须累计失败次数。
         this_round_failed: set[str] = set()
         this_round_solved = 0
         for r in report.results:
@@ -204,7 +335,7 @@ def _run_tsecbench_mode() -> None:
             elif r.correct_flag_count == 0:
                 this_round_failed.add(r.unique_code)
             else:
-                # 部分解出（correct > 0），重置失败计数
+                # 部分解出（correct>0）重置失败计数（旧版语义）
                 fail_streak.pop(r.unique_code, None)
 
         _emit("retry_round_end", {
@@ -214,44 +345,121 @@ def _run_tsecbench_mode() -> None:
             "failed": len(this_round_failed),
         })
 
-        # 更新连续失败计数
-        for code in this_round_failed:
-            fail_streak[code] = fail_streak.get(code, 0) + 1
+        # 持久化连续失败、attempt 次数、cooldown 和 abandoned；重启后不丢。
+        retry_state = retry_ledger.record_round(
+            round_num=round_idx,
+            failed_codes=this_round_failed,
+            partial_codes={r.unique_code for r in report.results if not r.success and r.correct_flag_count > 0},
+            solved_codes={r.unique_code for r in report.results if r.success},
+            max_fail_streak=MAX_FAIL_STREAK,
+        )
+        fail_streak = dict(retry_state.get("fail_streak", {}))
+        previous_abandoned = set(abandoned_codes)
+        abandoned_codes = set(retry_state.get("abandoned", []))
 
-        # 连续 MAX_FAIL_STREAK 轮失败 → 放弃
-        newly_abandoned = {code for code, streak in fail_streak.items() if streak >= MAX_FAIL_STREAK}
-        abandoned_codes |= newly_abandoned
-        for code in newly_abandoned:
-            fail_streak.pop(code, None)
+        # 连续 MAX_FAIL_STREAK 轮失败（0 correct）→ 放弃
+        newly_abandoned = abandoned_codes - previous_abandoned
         if newly_abandoned:
             _emit("retry_abandoned", {
                 "codes": sorted(newly_abandoned),
+                "reason": "consecutive_zero_correct_rounds",
                 "total_abandoned": len(abandoned_codes),
+                "persisted": True,
             })
 
         # 检查是否还有未完成的题
         try:
             remaining_challenges = client.list_challenges()
+            known_total_count = len(remaining_challenges)
             undone = [
                 c for c in remaining_challenges
-                if not c.is_completed and c.unique_code not in abandoned_codes
+                if not c.is_completed
+                and c.unique_code not in abandoned_codes
+                and c.unique_code not in pre_skip_codes
             ]
             if not undone:
                 _emit("retry_stop", {"reason": "all_completed"})
                 break
-        except Exception:
-            pass
+        except (TaskNotFound, InvalidState) as exc:
+            _emit("terminal_error", {
+                "phase": "retry_list_challenges",
+                "code": getattr(exc, "code", ""),
+                "message": str(exc),
+            })
+            break
+        except Exception as exc:
+            _emit("warning", {
+                "phase": "retry_list_challenges",
+                "message": str(exc),
+            })
 
     # 最终报告
     try:
         final_challenges = client.list_challenges()
-        total_score = sum(c.total_score for c in final_challenges if c.is_completed)
+        total_score = 0
+        for c in final_challenges:
+            challenge_dir = Path(workspace_dir) / c.unique_code
+            score_file = challenge_dir / ".cumulative_score"
+            try:
+                if not score_belongs_to_current_task(challenge_dir):
+                    continue
+                total_score += max(0, int(score_file.read_text(encoding="utf-8").strip()))
+            except (OSError, ValueError):
+                if c.is_completed:
+                    total_score += c.total_score
         total_solved = sum(1 for c in final_challenges if c.is_completed)
         total_count = len(final_challenges)
-    except Exception:
+    except (TaskNotFound, InvalidState) as exc:
+        # 任务结束后 list 接口可能返回 invalid_state；token 无效则是
+        # task_not_found。两者都要进入终态报告，不能伪装成普通网络异常。
+        if not terminal_error_code:
+            terminal_error_code = getattr(exc, "code", "") or type(exc).__name__
+        _emit("terminal_error", {
+            "phase": "final_list_challenges",
+            "code": terminal_error_code,
+            "message": str(exc),
+        })
         total_score = 0
         total_solved = 0
-        total_count = 63
+        total_count = known_total_count
+        # Preserve scores already acknowledged by submit responses even when
+        # the final snapshot is rejected because the benchmark ended.
+        try:
+            base = Path(workspace_dir)
+            if base.is_dir():
+                for score_file in base.glob("*/.cumulative_score"):
+                    if not score_belongs_to_current_task(score_file.parent):
+                        continue
+                    try:
+                        total_score += max(0, int(score_file.read_text(encoding="utf-8").strip()))
+                    except (OSError, ValueError):
+                        continue
+                    if score_file.with_name(".completed").exists():
+                        total_solved += 1
+        except Exception:
+            pass
+    except Exception:
+        # 其它最终快照失败也改为从工作区落盘的实际得分统计；如果此时
+        # 已知 token/task 终止状态，保持终态计数语义。
+        total_score = 0
+        total_solved = 0
+        total_count = known_total_count
+        try:
+            base = Path(workspace_dir)
+            if base.is_dir():
+                for score_file in base.glob("*/.cumulative_score"):
+                    try:
+                        if not score_belongs_to_current_task(score_file.parent):
+                            continue
+                        total_score += max(0, int(score_file.read_text(encoding="utf-8").strip()))
+                    except (OSError, ValueError):
+                        continue
+                    # .completed 由 SubmissionStore 在 API 明确报告全部
+                    # flag 完成时写入；仅有累计分不能推断通关。
+                    if score_file.with_name(".completed").exists():
+                        total_solved += 1
+        except Exception:
+            pass
     finally:
         client.close()
 
@@ -261,6 +469,7 @@ def _run_tsecbench_mode() -> None:
         "cumulative_score": total_score,
         "retry_rounds": round_idx,
         "abandoned": len(abandoned_codes),
+        "terminal_error": terminal_error_code,
     })
 
     print(f"\n{'='*60}")
@@ -270,53 +479,14 @@ def _run_tsecbench_mode() -> None:
     print(f"  重跑轮数：{round_idx} | 放弃题数：{len(abandoned_codes)}")
     print(f"{'='*60}\n")
 
-    sys.exit(0 if total_solved == total_count else 1)
-
-
-def _load_settings_from_env() -> dict:
-    """
-    从环境变量加载 settings（比赛环境下不走 settings.json）。
-    支持的环境变量：
-      LLM_BASE_URL, LLM_API_KEY, LLM_MODEL    → settings.llm
-      SOLVER_MAX_ROUNDS, SOLVER_OBSERVER_EVERY → settings.solver
-    也尝试从 /workspace/settings.json 或当前目录 settings.json 读取。
-    """
-    settings: dict = {}
-
-    # 优先从文件加载（settings.local.json 优先，不进版本控制）
-    for candidate in ["/workspace/settings.local.json", "/workspace/settings.json",
-                      "settings.local.json", "settings.json"]:
-        try:
-            settings = json.loads(Path(candidate).read_text(encoding="utf-8"))
-            break
-        except Exception:
-            continue
-
-    # 环境变量覆盖
-    llm = settings.setdefault("llm", {})
-    if os.environ.get("LLM_BASE_URL"):
-        llm["base_url"] = os.environ["LLM_BASE_URL"]
-    if os.environ.get("LLM_API_KEY"):
-        llm["api_key"] = os.environ["LLM_API_KEY"]
-    if os.environ.get("LLM_MODEL"):
-        llm["default_model"] = os.environ["LLM_MODEL"]
-
-    # search_llm 配置
-    search_llm = settings.setdefault("search_llm", {})
-    if os.environ.get("SEARCH_LLM_BASE_URL"):
-        search_llm["base_url"] = os.environ["SEARCH_LLM_BASE_URL"]
-    if os.environ.get("SEARCH_LLM_API_KEY"):
-        search_llm["api_key"] = os.environ["SEARCH_LLM_API_KEY"]
-    if os.environ.get("SEARCH_LLM_MODEL"):
-        search_llm["model"] = os.environ["SEARCH_LLM_MODEL"]
-
-    solver = settings.setdefault("solver", {})
-    if os.environ.get("SOLVER_MAX_ROUNDS"):
-        solver["max_rounds"] = int(os.environ["SOLVER_MAX_ROUNDS"])
-    if os.environ.get("SOLVER_OBSERVER_EVERY"):
-        solver["observer_every_rounds"] = int(os.environ["SOLVER_OBSERVER_EVERY"])
-
-    return settings
+    # total_count == 0 只代表没有可信的题目列表（例如 token 无效），
+    # 不能被误报为成功；终态错误必须返回非零让托管平台识别失败。
+    success = (
+        not terminal_error_code
+        and total_count > 0
+        and total_solved == total_count
+    )
+    sys.exit(0 if success else 1)
 
 
 def _run_bridge_mode() -> None:
@@ -373,6 +543,15 @@ def _run_bridge_mode() -> None:
     os.environ["CTF_CHALLENGE_ID"] = challenge_id
     os.environ["CTF_WORKSPACE"] = workspace_dir
     os.environ["CTF_SKILLS_DIR"] = skills_dir
+
+    from solver.worker_context import RunContext, ctx
+    ctx.configure(
+        RunContext.create(
+            workspace_dir,
+            challenge_id,
+            target_url=os.environ.get("CTF_TARGET_URL", ""),
+        )
+    )
 
     _emit("init_success", {"solver_id": solver_id, "challenge_id": challenge_id})
 

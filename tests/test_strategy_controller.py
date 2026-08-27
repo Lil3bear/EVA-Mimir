@@ -1,0 +1,384 @@
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock
+
+from solver.runtime.decision_state import (
+    ActionOutcomeKind,
+    HypothesisStatus,
+    classify_action,
+    extract_evidence_fingerprints,
+)
+from solver.runtime.observer_advice import ObserverAdvice
+from solver.runtime.portfolio import PortfolioBudget
+from solver.runtime.strategy_controller import ControlAdvice, StrategyController
+
+
+class DecisionStateClassificationTests(unittest.TestCase):
+    def test_identical_http_evidence_is_soft_but_not_novel_twice(self):
+        output = "HTTP/1.1 200 OK\nServer: demo"
+        first = classify_action("bash", {"cmd": "curl http://target/"}, output)
+        known = set(first.evidence_fingerprints)
+        second = classify_action(
+            "bash", {"cmd": "curl http://target/"}, output, known_evidence=known
+        )
+
+        self.assertTrue(first.soft_progress)
+        self.assertTrue(first.novel_progress)
+        self.assertFalse(second.novel_progress)
+        self.assertTrue(second.soft_progress)
+        self.assertEqual(second.kind, ActionOutcomeKind.DUPLICATE.value)
+
+    def test_new_negative_boundary_is_novel_but_not_positive(self):
+        output = "HTTP/1.1 404 Not Found\n/path/missing"
+        outcome = classify_action("bash", {"cmd": "curl http://target/missing"}, output)
+
+        self.assertTrue(outcome.novel_progress)
+        self.assertFalse(outcome.positive_progress)
+        self.assertEqual(outcome.kind, ActionOutcomeKind.NEGATIVE_BOUNDARY.value)
+
+    def test_control_inputs_do_not_refresh_target_progress(self):
+        for tool in ("challenge_get_hint", "skill_load", "memory_list", "idea_list"):
+            outcome = classify_action(tool, {}, "HTTP/1.1 200 OK flag{example_only}")
+            self.assertFalse(outcome.soft_progress, tool)
+            self.assertFalse(outcome.novel_progress, tool)
+
+    def test_wrong_submission_is_not_positive_progress(self):
+        outcome = classify_action(
+            "challenge_submit_flag", {"flag": "flag{guess}"}, "wrong flag"
+        )
+        self.assertFalse(outcome.positive_progress)
+        self.assertEqual(outcome.kind, ActionOutcomeKind.SUBMISSION.value)
+
+
+class ObserverAdviceTests(unittest.TestCase):
+    def test_version_and_expiry_guard(self):
+        advice = ObserverAdvice.from_mapping(
+            {
+                "action": "switch_strategy",
+                "mode": "alternate",
+                "reason": "repeat",
+                "message": "change direction",
+                "state_version": 7,
+                "expires_after_rounds": 3,
+            },
+            default_state_version=0,
+            default_round=10,
+        )
+        self.assertTrue(advice.is_applicable(current_state_version=7, current_round=12))
+        self.assertFalse(advice.is_applicable(current_state_version=8, current_round=12))
+        self.assertFalse(advice.is_applicable(current_state_version=7, current_round=14))
+        self.assertEqual(advice.mode, "ALTERNATE")
+
+
+class StrategyControllerTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="strategy-controller-"))
+
+    def test_switches_after_repeated_action_without_breaking_legacy_counters(self):
+        controller = StrategyController(
+            self.root,
+            attempt_id="steady",
+            switch_after=12,
+            action_repeat_threshold=4,
+        )
+        output = "HTTP/1.1 200 OK\nServer: demo"
+        advice = None
+        for round_num in range(1, 5):
+            advice = controller.observe(
+                "bash", {"cmd": "curl -s http://target/"}, output, round_num
+            )
+
+        self.assertIsNotNone(advice)
+        self.assertEqual(advice.action, "switch_strategy")
+        self.assertEqual(advice.mode, "ALTERNATE")
+        state = controller.snapshot()
+        self.assertEqual(state.last_novel_progress_round, 1)
+        self.assertEqual(state.last_soft_progress_round, 4)
+        self.assertEqual(state.same_action_streak, 4)
+        self.assertEqual(state.switch_count, 1)
+
+    def test_fast_lane_records_evidence_without_consuming_a_switch(self):
+        controller = StrategyController(
+            self.root,
+            switch_after=6,
+            action_repeat_threshold=3,
+        )
+        output = "HTTP/1.1 200 OK\nServer: demo"
+        for round_num in range(1, 7):
+            advice = controller.observe(
+                "bash",
+                {"cmd": "curl http://target/"},
+                output,
+                round_num,
+                allow_switch=False,
+            )
+            self.assertIsNone(advice)
+
+        state = controller.snapshot()
+        self.assertEqual(state.total_actions, 6)
+        self.assertEqual(state.switch_count, 0)
+
+    def test_switch_advice_has_a_cooldown(self):
+        controller = StrategyController(
+            self.root,
+            switch_after=6,
+            action_repeat_threshold=3,
+        )
+        output = "HTTP/1.1 200 OK\nServer: demo"
+        advices = []
+        for round_num in range(1, 9):
+            advice = controller.observe(
+                "bash", {"cmd": "curl http://target/"}, output, round_num
+            )
+            if advice:
+                advices.append(advice)
+
+        self.assertLessEqual(len(advices), 2)
+        self.assertEqual(controller.snapshot().switch_count, len(advices))
+
+    def test_hypothesis_lease_prevents_two_attempts_from_claiming(self):
+        controller = StrategyController(self.root)
+        hypothesis = controller.register_hypothesis(
+            "validate the primary application behavior",
+            domain="web",
+            expected_evidence="a reproducible response difference",
+        )
+        self.assertTrue(
+            controller.claim_hypothesis(
+                hypothesis.id, owner="aggressive", round_num=1, lease_rounds=8
+            )
+        )
+        self.assertFalse(
+            controller.claim_hypothesis(
+                hypothesis.id, owner="steady", round_num=2, lease_rounds=8
+            )
+        )
+        self.assertTrue(
+            controller.release_hypothesis(
+                hypothesis.id,
+                owner="aggressive",
+                status=HypothesisStatus.DISPROVED.value,
+                result="boundary observed",
+            )
+        )
+        self.assertTrue(
+            controller.claim_hypothesis(
+                hypothesis.id, owner="steady", round_num=10, lease_rounds=4
+            )
+        )
+
+    def test_concurrent_updates_are_serialized_and_recoverable(self):
+        controller = StrategyController(self.root, action_repeat_threshold=100)
+        output = "HTTP/1.1 200 OK\nServer: demo"
+        errors = []
+
+        def worker(index):
+            try:
+                for offset in range(5):
+                    controller.observe(
+                        "bash",
+                        {"cmd": f"curl http://target/{index}/{offset}"},
+                        output,
+                        index * 5 + offset + 1,
+                    )
+            except Exception as exc:  # pragma: no cover - diagnostic guard
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(errors, [])
+        state = controller.snapshot()
+        self.assertEqual(state.state_version, 20)
+        self.assertEqual(state.total_actions, 20)
+        self.assertTrue((self.root / ".decision-state.json").exists())
+
+
+class PortfolioBudgetTests(unittest.TestCase):
+    def test_live_peers_cannot_consume_each_others_reserve(self):
+        budget = PortfolioBudget(expected_attempts=2)
+        budget.register("aggressive", 2)
+        budget.register("steady", 2)
+
+        self.assertTrue(budget.claim_round("aggressive"))
+        self.assertTrue(budget.claim_round("aggressive"))
+        self.assertFalse(budget.claim_round("aggressive"))
+        self.assertTrue(budget.claim_round("steady"))
+
+    def test_survivor_borrows_unused_peer_quota(self):
+        budget = PortfolioBudget(expected_attempts=2)
+        budget.register("aggressive", 2)
+        budget.register("steady", 3)
+        self.assertTrue(budget.claim_round("aggressive"))
+        budget.mark_done("steady")
+
+        self.assertTrue(budget.claim_round("aggressive"))
+        self.assertTrue(budget.claim_round("aggressive"))
+        self.assertTrue(budget.claim_round("aggressive"))
+        self.assertTrue(budget.claim_round("aggressive"))
+        self.assertFalse(budget.claim_round("aggressive"))
+        self.assertEqual(budget.snapshot()["total_used"], 5)
+
+    def test_no_tool_round_can_be_returned(self):
+        budget = PortfolioBudget(expected_attempts=1)
+        budget.register("primary", 1)
+        self.assertTrue(budget.claim_round("primary"))
+        budget.release_round("primary")
+        self.assertTrue(budget.claim_round("primary"))
+
+
+class StrategySwitchInjectionTests(unittest.TestCase):
+    """难度门槛：easy 题不注入策略切换，medium/hard 保留。"""
+
+    def _make_agent(self, inject_switch: bool):
+        from solver.agent import SolverAgent
+
+        agent = SolverAgent.__new__(SolverAgent)
+        agent._inject_strategy_switch = inject_switch
+        agent._stuck_switched = False
+        agent._pending_injections = []
+        agent._injection_lock = threading.Lock()
+        agent._difficulty = "hard" if inject_switch else "easy"
+        controller = MagicMock()
+        controller.observe.return_value = ControlAdvice(
+            action="switch_strategy",
+            mode="ALTERNATE",
+            reason="same_action_without_novel_evidence",
+            state_version=1,
+            round_num=5,
+        )
+        controller.summary.return_value = {"state_version": 1}
+        agent._strategy_controller = controller
+        return agent
+
+    def test_easy_does_not_inject_any_strategy_switch(self):
+        agent = self._make_agent(inject_switch=False)
+
+        agent._record_strategy_observation(
+            "bash", {"cmd": "curl http://target/"}, "HTTP/1.1 200 OK", 5
+        )
+
+        self.assertEqual(agent._pending_injections, [])
+        self.assertFalse(agent._stuck_switched)
+
+    def test_hard_injects_switch_and_suppresses_legacy_switch(self):
+        agent = self._make_agent(inject_switch=True)
+
+        agent._record_strategy_observation(
+            "bash", {"cmd": "curl http://target/"}, "HTTP/1.1 200 OK", 5
+        )
+
+        self.assertEqual(len(agent._pending_injections), 1)
+        self.assertTrue(agent._stuck_switched)
+
+
+class LaneTerminationTests(unittest.TestCase):
+    """Fast/Deep Lane and the single no-progress terminal authority."""
+
+    def _make(self, lane: str, *, upgraded: bool = False, rounds: int = 0,
+              last_progress: int = 0, difficulty: str = "easy",
+              lane_entered: int = 0, strategy_failures: int = 0):
+        from solver.agent import SolverAgent
+        from solver.runtime.control import ControlPolicy
+
+        agent = SolverAgent.__new__(SolverAgent)
+        agent._lane = lane
+        agent._fast_lane = lane == "fast"
+        agent._lane_upgraded = upgraded
+        agent._lane_entered_round = lane_entered
+        agent._strategy_failure_count = strategy_failures
+        agent._stuck_switched = False
+        agent.round = rounds
+        agent._last_progress_round = last_progress
+        agent._difficulty = difficulty
+        agent._control_policy = ControlPolicy.from_settings({}, difficulty)
+        agent._hint_focus_start_round = None
+        agent._material_progress_count = 0
+        agent._hint_focus_progress_baseline = 0
+        agent._hint_focus_limit = 8
+        return agent
+
+    def test_classify_lane(self):
+        from solver.agent import SolverAgent
+
+        self.assertEqual(SolverAgent._classify_lane("easy", False, False), "fast")
+        self.assertEqual(SolverAgent._classify_lane("medium", False, False), "fast")
+        self.assertEqual(SolverAgent._classify_lane("hard", False, False), "deep")
+        self.assertEqual(SolverAgent._classify_lane("difficult", False, False), "deep")
+        self.assertEqual(SolverAgent._classify_lane("medium", True, False), "deep")
+        self.assertEqual(SolverAgent._classify_lane("medium", False, True), "deep")
+
+    def test_easy_fast_lane_upgrades_instead_of_stopping(self):
+        from solver.runtime.control import ControlAction
+
+        agent = self._make("fast", rounds=30, last_progress=0)
+        decision = agent._runtime_control_decision()
+        self.assertEqual(decision.action, ControlAction.UPGRADE_LANE.value)
+        self.assertFalse(decision.terminal)
+
+    def test_easy_never_idle_stops_or_forced_switches_even_after_upgrade(self):
+        from solver.runtime.control import ControlAction
+
+        agent = self._make(
+            "fast", upgraded=True, rounds=39, last_progress=0,
+            difficulty="easy", lane_entered=30, strategy_failures=9,
+        )
+        self.assertTrue(agent._deep_controls_active())
+        decision = agent._runtime_control_decision()
+        self.assertEqual(decision.action, ControlAction.CONTINUE.value)
+        self.assertFalse(decision.terminal)
+
+    def test_medium_upgrade_starts_a_fresh_idle_epoch(self):
+        from solver.runtime.control import ControlAction
+
+        agent = self._make(
+            "fast", upgraded=True, rounds=31, last_progress=0,
+            difficulty="medium", lane_entered=30,
+        )
+        decision = agent._runtime_control_decision()
+        self.assertEqual(decision.action, ControlAction.CONTINUE.value)
+        self.assertEqual(decision.idle_rounds, 1)
+
+    def test_medium_requires_multiple_failed_strategies_before_terminal(self):
+        from solver.runtime.control import ControlAction
+
+        one = self._make(
+            "deep", rounds=40, last_progress=0, difficulty="medium",
+            strategy_failures=1,
+        )
+        one._stuck_switched = True
+        self.assertEqual(
+            one._runtime_control_decision().action,
+            ControlAction.CONTINUE.value,
+        )
+
+        two = self._make(
+            "deep", rounds=40, last_progress=0, difficulty="medium",
+            strategy_failures=2,
+        )
+        two._stuck_switched = True
+        self.assertTrue(two._runtime_control_decision().terminal)
+
+    def test_baseline_mode_never_upgrades_or_stops(self):
+        from solver.runtime.control import ControlAction
+
+        agent = self._make(
+            "fast", rounds=60, last_progress=0, difficulty="medium",
+        )
+        agent._baseline_mode = True
+        agent._lane = "fast"
+        agent._fast_lane = True
+        agent._upgrade_after = 0
+        decision = agent._runtime_control_decision()
+        self.assertEqual(decision.action, ControlAction.CONTINUE.value)
+        self.assertFalse(decision.terminal)
+        self.assertFalse(agent._deep_controls_active())
+
+
+if __name__ == "__main__":
+    unittest.main()

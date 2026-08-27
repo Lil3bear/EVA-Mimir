@@ -1,6 +1,10 @@
 import json
 import sys
+import threading
 from typing import Any
+
+
+_WRITE_LOCK = threading.RLock()
 
 
 def serialize(obj: Any) -> str:
@@ -13,8 +17,9 @@ def deserialize(line: str) -> Any:
 
 def write_line(obj: Any, stream=None) -> None:
     out = stream or sys.stdout
-    out.write(serialize(obj))
-    out.flush()
+    with _WRITE_LOCK:
+        out.write(serialize(obj))
+        out.flush()
 
 
 def read_lines(stream=None):

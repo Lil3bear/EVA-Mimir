@@ -2,15 +2,71 @@ import subprocess
 import os
 import re
 import hashlib
+import shlex
 from collections import Counter
+from urllib.parse import urlsplit
 
 from solver.worker_context import ctx as _ctx
+from solver.tools import knowledge_router
 
 # 常量
 _DEDUP_WINDOW = 10
 _DEDUP_WARN_THRESHOLD = 3
-_APPROACH_WARN_THRESHOLD = 5
+_APPROACH_WARN_THRESHOLD = 3
+# 跨轮累计的同结构请求硬阈值。3 太紧——正经简单题也可能需要 4~5 次同结构
+# 探测（不同 Content-Type / header / 状态码），无法可靠归入“迭代利用”豁免。
+# 放宽到 12：给合法多探留空间，仍对失控 grind 兜底；真正的爆破向量（把
+# wordlist 塞进一条 shell 循环）由 _INLINE_LOOP_BLOCK 独立即时拦截。
+_APPROACH_BLOCK_THRESHOLD = 12
+# 单条命令内联循环的变体数上限。超过（≥ 4）即判定为“把字典塞进循环”
+# 的爆破，无论跨轮累计多少都立即拦截。这才是原护栏真正要防的东西。
+_INLINE_LOOP_BLOCK = 3
 _HOST_FAIL_WARN_THRESHOLD = 3
+# 检测对抗（e3）题与打分/提交型端点：反复提交代码给评分器迭代改进就是解法本身，
+# 不能按暴力破解在第 3 次封锁；给一个宽裕预算，只防真正的失控循环。
+_ITERATIVE_SUBMIT_BUDGET = 60
+_ITERATIVE_SUBMIT_WARN_EVERY = 10
+_SCORING_ENDPOINT_RE = re.compile(
+    r"/(check|submit|score|scoring|eval|evaluate|verify|judge|grade|run"
+    r"|import|fetch|proxy|preview|render|webhook|callback|redirect|ssrf)\b",
+    re.IGNORECASE,
+)
+# oracle 驱动的利用（盲注 / LFI / SSTI / 命令注入 / 上下文提取）天生需要对同一
+# 端点发几十上百次自适应请求，不能按登录爆破在第 3 次封死。这些签名只
+# 抬高验证预算，不影响内联循环变体计数（把 wordlist 藏进 shell 循环仍会被拦）。
+_EXPLOIT_PAYLOAD_RE = re.compile(
+    r"union\s+select|select\s.+\sfrom\s|information_schema|order\s+by\s+\d"
+    r"|sleep\s*\(|benchmark\s*\(|waitfor\s+delay|pg_sleep"
+    r"|substr(?:ing)?\s*\(|\bascii\s*\(|updatexml|extractvalue"
+    r"|\bor\s+1\s*=\s*1|\band\s+1\s*=\s*1|\band\s+\d+\s*=\s*\d+"
+    # LFI / 路径穿越（含 `....//` 等绕过变体）+ PHP 包装器 + 敏感读取目标。
+    # 多阶段题靠 LFI 读多个文件（源码/配置/多个 flag），属于迭代利用。
+    r"|\.\./|\.\.%2f|\.\.\\|\.{3,}[\\/]|%2e%2e"
+    r"|php://|data://|file://|phar://|zip://|expect://|filter/|convert\.base64"
+    r"|/etc/(?:passwd|shadow|hosts)|/proc/(?:self|\d)|/var/www|/var/log"
+    r"|/root/|/home/\w|/app/|\.env\b|wp-config|config\.php|/flag|\.ssh/"
+    r"|\{\{.+\}\}|\$\{.+\}|<%.+%>"
+    r"|\$\(|%0a|\|\s*id\b|;\s*id\b"
+    # SSRF 内网枚举：内网 IP / localhost / 危险 scheme
+    r"|127\.0\.0\.1|localhost|169\.254\.|0\.0\.0\.0"
+    r"|10\.\d+\.\d+\.\d+|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\."
+    r"|gopher://|dict://|file://|ftp://",
+    re.IGNORECASE,
+)
+
+
+def _is_iterative_submission(url_pattern: str, cmd: str = "") -> bool:
+    """迭代利用场景：检测对抗题 / 打分提交端点 / oracle 驱动的利用 payload。
+
+    这类交互的核心就是对同一端点反复发自适应请求（每次根据上次响应
+    调整），属于有效迭代而非盲目爆破，必须豁免 3 次硬预算。
+    """
+    code = (getattr(_ctx, "unique_code", "") or "").lower()
+    if code.startswith("e3"):
+        return True
+    if _SCORING_ENDPOINT_RE.search(url_pattern or ""):
+        return True
+    return bool(cmd and _EXPLOIT_PAYLOAD_RE.search(cmd))
 
 
 def register_observer_trigger(callback) -> None:
@@ -100,6 +156,71 @@ def _extract_host(cmd: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _target_hostname(target_url: str | None = None) -> str:
+    """Return the configured target host without doing DNS resolution."""
+    value = (target_url if target_url is not None else _ctx.target_url).strip()
+    if not value:
+        return ""
+    try:
+        return urlsplit(value if "://" in value else f"//{value}").hostname or ""
+    except ValueError:
+        return ""
+
+
+def _url_targets_current_target(cmd: str) -> bool:
+    """Whether the HTTP request is aimed at the current challenge target.
+
+    The 3-times budget only protects the *current* target host from brute
+    force (same URL structure with different action ids / paths / passwords).
+    Requests to *other* hosts — pentest lateral movement, SSRF internal
+    probing — are legitimate information gathering and must not be blocked.
+    """
+    host = _extract_host(cmd)
+    if not host:
+        return True  # 无法解析时保守按目标处理
+    hostname = host.split(":", 1)[0]
+    target = _target_hostname()
+    if not target:
+        return True
+    return hostname == target
+
+
+def _inline_http_variant_count(cmd: str) -> int:
+    """Count values in a shell ``for ... in ...`` loop that drives HTTP calls."""
+    if "curl" not in cmd.lower() or not re.search(r'https?://', cmd, re.IGNORECASE):
+        return 1
+    match = re.search(
+        r'\bfor\s+[A-Za-z_]\w*\s+in\s+(.+?);\s*do\b', cmd, re.DOTALL
+    )
+    if not match:
+        return 1
+    try:
+        return max(1, len(shlex.split(match.group(1))))
+    except ValueError:
+        return 1
+
+
+def _loop_is_endpoint_recon(cmd: str) -> bool:
+    """Whether a ``for`` loop varies the *endpoint* (path/port) rather than a value.
+
+    Fetching several distinct pages or ports in one loop is legitimate
+    reconnaissance (`for p in about.php news.php ...`, `for port in 8080 8000`),
+    not a wordlist attack against a fixed endpoint.  A loop that injects the
+    variable into a query value (`?id=$x`) or POST body is value brute-force.
+    """
+    m = re.search(r'\bfor\s+([A-Za-z_]\w*)\s+in\s+', cmd)
+    if not m:
+        return False
+    var = re.escape(m.group(1))
+    # 值爆破：变量注入查询值或 POST body → 不是侦察。
+    if re.search(rf'=\s*["\']?\$\{{?{var}\b', cmd):
+        return False
+    # 端点侦察：变量在路径（/$var）或端口（:$var）位。
+    if re.search(rf'[/:]\$\{{?{var}\b', cmd):
+        return True
+    return False
+
+
 def _is_connection_refused(output: str) -> bool:
     """判断 bash 输出是否表明目标不可达（Connection Refused / timeout）。"""
     patterns = [
@@ -110,6 +231,9 @@ def _is_connection_refused(output: str) -> bool:
         'curl: (28)',  # curl 超时
         'Network unreachable',
         'No route to host',
+        'timed out',
+        'TimeoutError',
+        'Operation timed out',
     ]
     return any(p.lower() in output.lower() for p in patterns)
 
@@ -124,6 +248,7 @@ TOOL_DEF = {
             "禁止 cd /root/workspace，所有文件操作都在当前目录进行。"
             "输出超长时会截断，截断提示里会给出完整结果的绝对路径，可用 grep/cat 查询。"
             "对于耗时较长的求解脚本（python3/sage），可设置 timeout 参数（最大 600 秒）。"
+            "同一 HTTP 请求结构最多执行 3 个变体；批量 shell 循环按循环值逐个计数，超限会被阻止。"
         ),
         "parameters": {
             "type": "object",
@@ -165,8 +290,22 @@ def execute(args: dict) -> str:
     if not cmd:
         return "[错误] 命令不能为空"
 
+    # 将全局 benchmark deadline 传递到工具层，避免一个 600 秒脚本
+    # 越过总时限。没有 deadline 的本地 Bridge 模式保持旧行为。
+    import time
+    deadline = float(getattr(_ctx, "deadline", 0.0) or 0.0)
+    if deadline and time.time() >= deadline:
+        return "[停止] 已达到本次运行截止时间，命令未执行。"
+
     requested_timeout = args.get("timeout")
     timeout = _get_timeout(cmd, requested_timeout)
+    if deadline:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return "[停止] 已达到本次运行截止时间，命令未执行。"
+        # subprocess timeout accepts fractions; using the real remaining
+        # budget avoids the old minimum-10s window crossing the benchmark end.
+        timeout = min(float(timeout), max(0.1, remaining))
 
     # 重复操作检测（命令级）
     fp = _cmd_fingerprint(cmd)
@@ -185,9 +324,55 @@ def execute(args: dict) -> str:
     approach_warn = ""
     url_pattern = _extract_url_pattern(cmd)
     if url_pattern:
-        _ctx.approach_counter[url_pattern] += 1
-        approach_count = _ctx.approach_counter[url_pattern]
-        if approach_count >= _APPROACH_WARN_THRESHOLD:
+        variant_count = _inline_http_variant_count(cmd)
+        previous_count = _ctx.approach_counter[url_pattern]
+        approach_count = previous_count + variant_count
+        # 分题型防爆破：只对“当前目标 host”的请求严格 block；内网其他 host
+        # （pentest 横向移动 / SSRF 内网探测）只警告不 block。
+        # 检测对抗题 / 打分端点走宽裕的迭代预算，不在第 3 次封死核心反馈回路。
+        targets_current = _url_targets_current_target(cmd)
+        iterative = _is_iterative_submission(url_pattern, cmd)
+        block_threshold = _ITERATIVE_SUBMIT_BUDGET if iterative else _APPROACH_BLOCK_THRESHOLD
+        # 单条命令把一大批变体塞进 shell 循环 = 爆破向量，独立于跨轮累计即时拦截。
+        # 但多端点侦察循环（打不同页面/端口）不是对固定端点的值爆破，放行
+        # 交给跨轮累计（12）兼底；只拦“对同一端点试不同值”的字典循环。
+        # 迭代利用（注入/SSRF/提取）应改用本地脚本远端一次完成。
+        if (
+            targets_current
+            and not iterative
+            and variant_count > _INLINE_LOOP_BLOCK
+            and not _loop_is_endpoint_recon(cmd)
+        ):
+            if _ctx.observer_trigger_callback:
+                _ctx.observer_trigger_callback(reason=f"inline_loop_bruteforce:{url_pattern[:60]}")
+            return (
+                f"[阻止] 单条命令把 {variant_count} 个变体塞进 shell 循环，判定为爆破。"
+                "请改成精确单发（一次一个有依据的 payload），或把循环放进本地脚本远端一次完成；"
+                "这不代表该端点不可利用，切勿记为失败边界。"
+            )
+        if targets_current and approach_count > block_threshold:
+            _ctx.approach_counter[url_pattern] = block_threshold + 1
+            if previous_count <= block_threshold and _ctx.observer_trigger_callback:
+                _ctx.observer_trigger_callback(reason=f"approach_blocked:{url_pattern[:60]}")
+            return (
+                f"[阻止] 同一 HTTP 请求结构本次包含 {variant_count} 个变体，"
+                f"累计将达到 {approach_count} 个，超过 {block_threshold} 个限速阀值。"
+                "这是工具层限速，不是证明该端点不可利用——切勿把它记为“该结构不可再试”的失败边界（那会毒化重试）。"
+                "若仍需迭代（盲注 / SSRF 内网枚举 / SECRET_KEY 伪造 / 逐字符提取），请改用一个本地脚本"
+                "把循环放到远端一次完成（如 flask-unsign / 一段 python requests 提取），或换一个真正不同的精确 payload。"
+            )
+        _ctx.approach_counter[url_pattern] = approach_count
+        if iterative:
+            # 迭代提交：鼓励继续投递，但每隔若干次提醒确保代码有实质变化。
+            if (
+                approach_count >= _ITERATIVE_SUBMIT_WARN_EVERY
+                and approach_count % _ITERATIVE_SUBMIT_WARN_EVERY == 0
+            ):
+                approach_warn = (
+                    f"\nℹ️ [迭代提交] 已向评分端点提交 {approach_count} 次（{url_pattern[:80]}）。"
+                    f"继续迭代没问题，但请确保每次提交的实现有实质差异，并对照上次评分调整。\n"
+                )
+        elif approach_count >= _APPROACH_WARN_THRESHOLD:
             approach_warn = (
                 f"\n⚠️ [方向循环警告] 同一请求结构已尝试 {approach_count} 次（{url_pattern[:80]}），"
                 f"换传参方式或换攻击方向，不要再用相同结构重试。\n"
@@ -197,7 +382,7 @@ def execute(args: dict) -> str:
                 _ctx.observer_trigger_callback(reason=f"approach_loop:{url_pattern[:60]}")
 
     # 每题独立的工作目录（并行安全）
-    cwd = _ctx.challenge_dir if (_ctx.challenge_dir and _ctx.challenge_dir != "/workspace") else "/root/workspace"
+    cwd = _ctx.attempt_dir if (_ctx.attempt_dir and _ctx.attempt_dir != "/workspace") else "/root/workspace"
     os.makedirs(cwd, exist_ok=True)
 
     try:
@@ -237,22 +422,34 @@ def execute(args: dict) -> str:
         _ctx.host_fail_counter[host] += 1
         fail_count = _ctx.host_fail_counter[host]
         if fail_count >= _HOST_FAIL_WARN_THRESHOLD:
-            conn_warn = (
-                f"\n⚠️ [目标不可达] {host} 已连续 {fail_count} 次 Connection Refused。"
-                f"目标实例可能已下线。请调用 challenge_get_state 确认题目 URL 是否变化，"
-                f"不要继续猜端口或换节点重试。\n"
+            # 区分两类失败：端口拒绝（实例下线） vs 应用层超时（TCP 通但服务无响应）
+            is_timeout = any(
+                p in output.lower()
+                for p in ('timed out', 'timeouterror', 'operation timed out', 'curl: (28)')
             )
+            if is_timeout:
+                conn_warn = (
+                    f"\n⚠️ [目标异常] {host} 已连续 {fail_count} 次超时（TCP 可能可连但应用层无响应）。"
+                    f"实例可能未就绪或已崩。请先 challenge_get_state 确认容器状态，"
+                    f"若状态异常则 challenge_close 后重新 start，不要继续猜端口或反复 curl。\n"
+                )
+            else:
+                conn_warn = (
+                    f"\n⚠️ [目标不可达] {host} 已连续 {fail_count} 次 Connection Refused。"
+                    f"目标实例可能已下线。请调用 challenge_get_state 确认题目 URL 是否变化，"
+                    f"不要继续猜端口或换节点重试。\n"
+                )
     elif host and not _is_connection_refused(output):
         # 连接成功，重置该 host 的失败计数
         _ctx.host_fail_counter[host] = 0
 
-    return repeat_warn + approach_warn + conn_warn + _auto_extract(output) + output
+    return repeat_warn + approach_warn + conn_warn + _auto_extract(output, cmd) + output
 
 
 def _save_full_output(cmd: str, output: str) -> str:
     import time, hashlib
     # 每题独立的 tool-results 目录（并行安全）
-    base_dir = _ctx.challenge_dir if (_ctx.challenge_dir and _ctx.challenge_dir != "/workspace") else "/root/workspace"
+    base_dir = _ctx.attempt_dir if (_ctx.attempt_dir and _ctx.attempt_dir != "/workspace") else "/root/workspace"
     results_dir = os.path.join(base_dir, ".tool-results")
     os.makedirs(results_dir, exist_ok=True)
     ts = int(time.time() * 1000)
@@ -274,7 +471,7 @@ _MIDDLEWARE_KEYWORDS = [
 ]
 
 
-def _auto_extract(output: str) -> str:
+def _auto_extract(output: str, command: str = "") -> str:
     """
     对 bash 输出做确定性后处理：用正则提取 flag、凭据、内网 IP、中间件名。
     结果作为醒目前缀追加到输出开头，确保模型不会遗漏关键信息。
@@ -309,20 +506,26 @@ def _auto_extract(output: str) -> str:
     )
     if internal_ips:
         # 去重 + 排除常见无关 IP
+        target_host = _target_hostname()
         unique_ips = [ip for ip in dict.fromkeys(internal_ips)
                       if not ip.startswith('10.0.100.')  # VPN 网关
-                      and ip != '172.17.0.1']  # Docker 网关
+                      and ip != '172.17.0.1'  # Docker 网关
+                      and ip != target_host]
         if unique_ips:
             findings.append(f"🌐 发现内网 IP：{unique_ips[:5]}，可能需要横向移动！")
 
-    # 4. 中间件/框架识别
-    output_lower = output.lower()
-    detected_mw = [mw for mw in _MIDDLEWARE_KEYWORDS if mw in output_lower]
-    if detected_mw:
-        findings.append(
-            f"🔍 识别到中间件：{detected_mw[:3]}"
-            f"，立即用 security_search 搜索对应 CVE！"
-        )
+    # 4. 中间件/框架识别 → 确定性 CVE 路由（本地表命中直接注入，不靠模型回忆）
+    cve_hint = knowledge_router.lookup(output, context=command)
+    if cve_hint:
+        findings.append(cve_hint)
+    else:
+        output_lower = output.lower()
+        detected_mw = [mw for mw in _MIDDLEWARE_KEYWORDS if mw in output_lower]
+        if detected_mw:
+            findings.append(
+                f"🔍 识别到中间件：{detected_mw[:3]}"
+                f"（本地 CVE 表未命中，可用 security_search 补充，结果必须 bash 验证）"
+            )
 
     if not findings:
         return ""

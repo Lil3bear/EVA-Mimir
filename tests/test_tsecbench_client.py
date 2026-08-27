@@ -1,4 +1,6 @@
+import threading
 import unittest
+from unittest.mock import patch
 
 from solver.ctfplatform.tsecbench_client import (
     DuplicateSubmit,
@@ -120,6 +122,38 @@ class TsecbenchClientTests(unittest.TestCase):
         self.assertFalse(TsecbenchClient.is_configured({"BENCHMARK_BASE_URL": ""}))
         with self.assertRaises(ValueError):
             TsecbenchClient.from_env({"BENCHMARK_BASE_URL": "https://bench.example"})
+
+    def test_default_session_is_thread_local(self):
+        sessions = []
+
+        def make_session():
+            session = FakeSession([FakeResponse(200, [])])
+            sessions.append(session)
+            return session
+
+        errors = []
+        with patch(
+            "solver.ctfplatform.tsecbench_client.requests.Session",
+            side_effect=make_session,
+        ):
+            client = TsecbenchClient("https://bench.example", "token")
+
+            def request():
+                try:
+                    client.list_challenges()
+                except Exception as exc:
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=request) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            client.close()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(sessions), 2)
+        self.assertTrue(all(session.closed for session in sessions))
 
 
 if __name__ == "__main__":

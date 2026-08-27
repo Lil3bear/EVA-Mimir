@@ -1,14 +1,11 @@
 import hashlib
 import os
 import re
-import sys
 import threading
 from pathlib import Path
 
 from solver.worker_context import ctx as _ctx
-
-
-_emit_lock = threading.Lock()
+from shared.jsonl import write_line
 
 
 # 攻击向量关键词映射：命中任意关键词→向量名
@@ -76,16 +73,28 @@ class ObserverLoop:
     """
 
     REVIEW_EVERY_ROUNDS = 6
-    NO_PROGRESS_THRESHOLD = 1  # 连续几个审查周期无进展才触发强干预
+    # 一次快照不变不代表方向已死；至少两个审查周期再强干预，
+    # 避免 Observer 与 Solver 的正常验证动作互相打断。
+    NO_PROGRESS_THRESHOLD = 2
 
     def __init__(self, settings: dict, on_correction: callable = None):
         self.settings = settings
         self.on_correction = on_correction
+        self.enabled = settings.get("solver", {}).get("observer_enabled", True)
+        # easy 题不发无进展/向量循环强干预，只保留看板维护 review。
+        self._allow_strong_intervention = bool(
+            settings.get("solver", {}).get("observer_strong_intervention", True)
+        )
         self._round_logs: list[dict] = []
         self._current_round: dict | None = None
         self._lock = threading.Lock()
         self._review_thread: threading.Thread | None = None
-        self.review_every = settings.get("solver", {}).get("observer_every_rounds", 6)
+        try:
+            self.review_every = max(
+                1, int(settings.get("solver", {}).get("observer_every_rounds", 6))
+            )
+        except (TypeError, ValueError):
+            self.review_every = 6
         # 内容指纹去重：相同方向的纠偏只发一次，不限轮次
         self._sent_correction_fps: set[str] = set()
         # 无进展检测：记录上次审查时 ideas 的 active 状态快照
@@ -94,38 +103,60 @@ class ObserverLoop:
         # 攻击向量级循环检测
         self._recent_vectors: list[str | None] = []  # 每轮的主要攻击向量
         self._vector_cycle_warned: set[str] = set()  # 已警告过的向量
-        self._VECTOR_CYCLE_THRESHOLD = 8  # 连续 N 轮同一向量则触发
+        self._VECTOR_CYCLE_THRESHOLD = 4  # 第 4 轮前强制切换已连续失败的方向
+        self._run_context = _ctx.snapshot()
+        self._client = _ctx.client
 
     def trigger_now(self, reason: str = "", extra_context: str = "") -> None:
         """立即触发一次 Observer 审查（不等周期）。"""
+        if not self.enabled:
+            return
         with self._lock:
             rounds_to_review = list(self._round_logs)
             self._round_logs = []
 
         challenge_dir = self._get_challenge_dir()
+        attempt_dir = self._get_attempt_dir()
 
         if self._review_thread and self._review_thread.is_alive():
             self._review_thread.join(timeout=10)
+            if self._review_thread.is_alive():
+                # Keep the evidence for the next review rather than starting two
+                # observers that concurrently mutate the same blackboard.
+                with self._lock:
+                    self._round_logs = rounds_to_review + self._round_logs
+                return
 
         self._review_thread = threading.Thread(
             target=self._run_review,
-            args=(rounds_to_review, challenge_dir),
+            args=(rounds_to_review, challenge_dir, attempt_dir),
             daemon=True,
         )
         self._review_thread.start()
 
     def on_round_start(self, round_num: int) -> None:
+        if not self.enabled:
+            return
         with self._lock:
             self._current_round = {"round": round_num, "tool_calls": []}
 
     def on_tool_call(self, tool: str, args: dict, result: str) -> None:
+        if not self.enabled:
+            return
         with self._lock:
             if self._current_round is not None:
-                # 取末尾 300 字节：失败原因/诊断信息通常在输出末尾
+                # Preserve both response identity and final diagnostics.
+                result_excerpt = result
+                if len(result_excerpt) > 1200:
+                    result_excerpt = (
+                        result_excerpt[:400]
+                        + "\n...[observer excerpt]...\n"
+                        + result_excerpt[-800:]
+                    )
                 self._current_round["tool_calls"].append({
                     "tool": tool,
                     "args": args,
-                    "result": result[-300:],
+                    "result": result_excerpt,
                 })
                 # 攻击向量分类（只对 bash 命令）
                 if tool == "bash":
@@ -134,6 +165,8 @@ class ObserverLoop:
                         self._current_round["_attack_vector"] = vector
 
     def on_round_end(self, round_num: int) -> None:
+        if not self.enabled:
+            return
         with self._lock:
             current = self._current_round
             if current:
@@ -156,6 +189,8 @@ class ObserverLoop:
         检测是否连续 N 轮都在同一攻击向量上。
         触发时立即调起 Observer 审查，并附上向量循环上下文。
         """
+        if not self._allow_strong_intervention:
+            return
         threshold = self._VECTOR_CYCLE_THRESHOLD
         if len(self._recent_vectors) < threshold:
             return
@@ -194,12 +229,15 @@ class ObserverLoop:
 
         if self.on_correction:
             if self._should_send_correction(message, round_num):
-                self.on_correction(message)
+                self.on_correction(message, round_num)
 
         # 同时触发 Observer 审查，让它结合 Memory/Ideas 做更智能的纠偏
         self.trigger_now(reason=f"vector_cycle:{dominant}")
 
     def on_agent_end(self) -> None:
+        """Optionally flush one final review for a normal local run."""
+        if not self.enabled:
+            return
         with self._lock:
             has_unreviewed = bool(self._round_logs)
 
@@ -208,6 +246,22 @@ class ObserverLoop:
 
         if self._review_thread and self._review_thread.is_alive():
             self._review_thread.join(timeout=60)
+
+    def stop(self) -> None:
+        """Stop scheduling observer work when the Solver has already ended.
+
+        A solved/deadline/terminal Solver must not pay for a final LLM review
+        after its useful work is over.  An already-running daemon review gets
+        a short chance to notice the disabled flag, but is never allowed to
+        block shutdown for the full observer timeout.
+        """
+        self.enabled = False
+        with self._lock:
+            self._round_logs = []
+            self._current_round = None
+        thread = self._review_thread
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=0.2)
 
     def _trigger_review(self, force: bool = False) -> None:
         if self._review_thread and self._review_thread.is_alive():
@@ -221,10 +275,11 @@ class ObserverLoop:
             return
 
         challenge_dir = self._get_challenge_dir()
+        attempt_dir = self._get_attempt_dir()
 
         self._review_thread = threading.Thread(
             target=self._run_review,
-            args=(rounds_to_review, challenge_dir),
+            args=(rounds_to_review, challenge_dir, attempt_dir),
             daemon=True,
         )
         self._review_thread.start()
@@ -235,6 +290,12 @@ class ObserverLoop:
         if _ctx.challenge_dir and _ctx.challenge_dir != "/workspace":
             return Path(_ctx.challenge_dir)
         return Path(os.environ.get("CTF_WORKSPACE", "/workspace"))
+
+    @staticmethod
+    def _get_attempt_dir() -> Path:
+        if _ctx.attempt_dir and _ctx.attempt_dir != "/workspace":
+            return Path(_ctx.attempt_dir)
+        return ObserverLoop._get_challenge_dir()
 
     def _should_send_correction(self, content: str, current_round: int) -> bool:
         # 只做内容指纹去重，不限轮次 cooldown
@@ -251,18 +312,19 @@ class ObserverLoop:
         - 若所有 ideas 均为 failed 且 Memory 无新 evidence，立即触发强干预（不等周期）
         - 若连续 NO_PROGRESS_THRESHOLD 个周期没有任何 idea 推进到 testing/verified，触发强干预
         """
+        if not self._allow_strong_intervention:
+            return
         try:
-            from shared.data import ideas as idea_store, memory as mem_store
-            all_ideas = idea_store.list_ideas(challenge_dir)
-            all_memories = mem_store.list_memory(challenge_dir)
+            from solver.runtime.scoped_state import observer_ideas, observer_memories
+            all_ideas = observer_ideas(challenge_dir)
+            all_memories = observer_memories(challenge_dir)
         except Exception:
             return
 
         # 快速路径：所有 idea 均 failed → 立即触发，不等周期计数
         non_failed = [i for i in all_ideas if i.status != "failed"]
         if all_ideas and not non_failed:
-            evidence = [m for m in all_memories if m.kind == "evidence"]
-            self._send_no_progress_intervention(all_ideas, current_round, fast_path=True)
+            self._send_no_progress_intervention(all_ideas, all_memories, current_round, fast_path=True)
             return
 
         # 常规路径：tracking testing/verified 推进
@@ -279,68 +341,102 @@ class ObserverLoop:
 
         if self._no_progress_periods >= self.NO_PROGRESS_THRESHOLD:
             self._no_progress_periods = 0
-            self._send_no_progress_intervention(all_ideas, current_round)
+            self._send_no_progress_intervention(all_ideas, all_memories, current_round)
 
-    def _send_no_progress_intervention(self, all_ideas, current_round: int, fast_path: bool = False) -> None:
-        """连续无进展时发送强干预：列出所有 failed 路线，要求从未尝试方向出发。"""
+    def _send_no_progress_intervention(self, all_ideas, all_memories, current_round: int, fast_path: bool = False) -> None:
+        """连续无进展时发送卡点摘要强干预。
+
+        不只是列 failed/pending，而是把“已验证事实 + 失败边界 + 关键约定
+        + 未尝试方向”结构化地重新摆到 Solver 面前，打破它对失败方向的锚定。
+        """
         failed = [i for i in all_ideas if i.status == "failed"]
         pending = [i for i in all_ideas if i.status == "pending"]
+        evidence = [m for m in all_memories if m.kind == "evidence"]
+        facts = [m for m in all_memories if m.kind == "fact"]
+        failures = [m for m in all_memories if m.kind == "failure"]
 
         trigger_reason = "所有攻击方向均已失败" if fast_path else "已连续多个周期没有新进展"
         lines = [
-            f"[OBSERVER][强干预] {trigger_reason}。",
+            f"[OBSERVER][卡点刷新] {trigger_reason}，重新梳理当前题目的完整卡点：",
             "",
         ]
-        if failed:
-            lines.append("以下方向已确认失败，不要再尝试：")
+        if evidence or facts:
+            lines.append("## 已验证事实（禁止丢失，直接复用，不要再重新探测）")
+            for m in evidence[-6:]:
+                lines.append(f"  - [evidence] {m.content}")
+            for m in facts[-6:]:
+                lines.append(f"  - [fact] {m.content}")
+            lines.append("")
+        if failures or failed:
+            lines.append("## 失败边界（禁止重复，再试即浪费轮次）")
+            for m in failures[-5:]:
+                lines.append(f"  - {m.content}")
             for i in failed:
                 result_str = f"（{i.result}）" if i.result else ""
                 lines.append(f"  - {i.content}{result_str}")
             lines.append("")
+        lines.append("## 关键约定（满足条件立即执行，不要继续当前循环）")
+        lines.append(
+            "  - 本平台 flag 都在 `/challenge/flag*.txt`：一旦拿到任意文件读取/LFI/路径穿越/RCE，"
+            "第一时间 `cat /challenge/flag1.txt`（或 flag.txt/flag2.txt），把内容带回工具输出；"
+            "禁止只读 `ls`、禁止把内容写到远程 /tmp 后去读别的文件。"
+        )
+        lines.append(
+            "  - 已拿到凭据/webshell 时，直接复用它们推进，不要回头重新枚举入口。"
+        )
+        lines.append("")
         if pending:
-            lines.append("以下是尚未探索的方向，请从中选一个开始：")
+            lines.append("## 未尝试方向（从中选一个全新的开始）")
             for i in pending:
                 lines.append(f"  - {i.content}")
             lines.append("")
         lines.append(
-            "必须立即切换到一个未尝试过的全新方向。"
-            "如果 idea 列表已空，调用 security_search 搜索该题目类型的其他常见漏洞或 writeup。"
+            "必须立即停止当前循环，从「未尝试方向」选一个，或执行「关键约定」。"
+            "若方向已空，用 security_search 搜该题型其他漏洞。"
         )
 
         message = "\n".join(lines)
         if self._should_send_correction(message, current_round):
             if self.on_correction:
-                self.on_correction(message)
+                self.on_correction(message, current_round)
 
-    def _run_review(self, rounds: list[dict], challenge_dir: Path) -> None:
+    def _run_review(
+        self, rounds: list[dict], challenge_dir: Path, attempt_dir: Path
+    ) -> None:
+        if not self.enabled:
+            return
         current_round = rounds[-1]["round"] if rounds else 0
 
-        def guarded_correction(content: str) -> None:
-            if self._should_send_correction(content, current_round):
+        def guarded_correction(content) -> None:
+            if not self.enabled:
+                return
+            advice_round = int(getattr(content, "reviewed_round", current_round) or 0)
+            rendered = content.render() if hasattr(content, "render") else str(content)
+            if self._should_send_correction(rendered, advice_round):
                 if self.on_correction:
-                    self.on_correction(content)
+                    try:
+                        self.on_correction(content, advice_round)
+                    except TypeError:
+                        self.on_correction(rendered, advice_round)
             else:
-                from shared.jsonl import serialize
-                with _emit_lock:
-                    sys.stdout.write(serialize({
-                        "type": "observer_correction_suppressed",
-                        "data": {"reason": "cooldown_or_duplicate", "round": current_round}
-                    }))
-                    sys.stdout.flush()
+                write_line({
+                    "type": "observer_correction_suppressed",
+                    "data": {"reason": "cooldown_or_duplicate", "round": advice_round},
+                })
 
         try:
             from solver.observer.agent import ObserverAgent
-            observer = ObserverAgent(settings=self.settings)
-            observer.review(
-                recent_rounds=rounds,
-                challenge_dir=challenge_dir,
-                on_correction=guarded_correction,
-            )
+            with _ctx.bind(self._run_context, self._client):
+                observer = ObserverAgent(settings=self.settings)
+                observer.review(
+                    recent_rounds=rounds,
+                    challenge_dir=challenge_dir,
+                    attempt_dir=attempt_dir,
+                    on_correction=guarded_correction,
+                )
         except Exception as e:
-            from shared.jsonl import serialize
-            with _emit_lock:
-                sys.stdout.write(serialize({"type": "observer_error", "data": {"msg": str(e)}}))
-                sys.stdout.flush()
+            write_line({"type": "observer_error", "data": {"msg": str(e)}})
 
-        # 审查结束后做无进展检测
-        self._check_progress(challenge_dir, current_round)
+        # 审查结束后做无进展检测；Agent 已结束时丢弃迟到结果。
+        if self.enabled:
+            self._check_progress(challenge_dir, current_round)
