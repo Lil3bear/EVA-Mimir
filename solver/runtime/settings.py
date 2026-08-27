@@ -60,6 +60,7 @@ def load_settings(
         "LLM_BASE_URL": "base_url",
         "LLM_API_KEY": "api_key",
         "LLM_MODEL": "default_model",
+        "LLM_PRO_MODEL": "pro_model",
     })
     if llm.get("base_url"):
         llm["base_url"] = apply_llm_gateway(str(llm["base_url"]), env)

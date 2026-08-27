@@ -339,7 +339,122 @@ class SchedulerTests(unittest.TestCase):
         )
 
         enabled = [s["solver"]["observer_enabled"] for s in created_settings]
-        self.assertCountEqual(enabled, [True, False])
+        # 三个竞争假设（foothold/lateral/source）只选一个 Observer 作为控制面。
+        self.assertCountEqual(enabled, [True, False, False])
+
+    def test_multi_solver_wires_pro_model(self):
+        """hard 竞争假设的 spec.model="pro" 必须真正切换到 pro 模型。"""
+        challenge = _make_challenge("hard-01", difficulty="hard")
+        client = self._make_mock_client([challenge])
+        created_settings = []
+
+        def factory(**kwargs):
+            created_settings.append(kwargs["settings"])
+            return MagicMock(solved=False, round=1)
+
+        scheduler = Scheduler(
+            client,
+            settings={
+                "llm": {"default_model": "deepseek-v4-flash", "pro_model": "deepseek-v4-pro"},
+                "solver": {},
+            },
+            agent_factory=factory,
+            workspace_dir=self._tmpdir,
+        )
+        workspace = os.path.join(self._tmpdir, challenge.unique_code)
+
+        scheduler._attempt_multi_solver(
+            challenge,
+            ("10.0.0.2:8080",),
+            workspace,
+            challenge.unique_code,
+            "10.0.0.2:8080",
+        )
+
+        models = [s["llm"]["default_model"] for s in created_settings]
+        self.assertEqual(models, ["deepseek-v4-pro"] * 3)
+
+    def test_multi_solver_pro_can_be_disabled(self):
+        """solver.pro_enabled=false 时，hard 竞争假设仍用默认 flash 模型。"""
+        challenge = _make_challenge("hard-01", difficulty="hard")
+        client = self._make_mock_client([challenge])
+        created_settings = []
+
+        def factory(**kwargs):
+            created_settings.append(kwargs["settings"])
+            return MagicMock(solved=False, round=1)
+
+        scheduler = Scheduler(
+            client,
+            settings={
+                "llm": {"default_model": "deepseek-v4-flash", "pro_model": "deepseek-v4-pro"},
+                "solver": {"pro_enabled": False},
+            },
+            agent_factory=factory,
+            workspace_dir=self._tmpdir,
+        )
+        workspace = os.path.join(self._tmpdir, challenge.unique_code)
+
+        scheduler._attempt_multi_solver(
+            challenge,
+            ("10.0.0.2:8080",),
+            workspace,
+            challenge.unique_code,
+            "10.0.0.2:8080",
+        )
+
+        models = [s["llm"]["default_model"] for s in created_settings]
+        self.assertEqual(models, ["deepseek-v4-flash"] * 3)
+
+    @patch("solver.agent.ObserverLoop")
+    @patch("solver.agent.OpenAI")
+    @patch("solver.agent.search_tool")
+    def test_multi_solver_agent_uses_pro_model_end_to_end(
+        self, mock_search, mock_openai, mock_observer
+    ):
+        """端到端：spec.model="pro" 一路穿透到 SolverAgent.model == llm.pro_model。"""
+        from solver.agent import SolverAgent
+
+        challenge = _make_challenge("hard-01", difficulty="hard")
+        client = self._make_mock_client([challenge])
+        created_agents = []
+
+        def factory(**kwargs):
+            agent = SolverAgent(
+                task=kwargs["task"],
+                settings=kwargs["settings"],
+                skills_dir="/skills",
+            )
+            created_agents.append(agent)
+            # 阻止真正发起 LLM 调用，只验证模型接线。
+            agent.run = lambda: None
+            agent.round = 1
+            agent.solved = False
+            return agent
+
+        scheduler = Scheduler(
+            client,
+            settings={
+                "llm": {
+                    "default_model": "deepseek-v4-flash",
+                    "pro_model": "deepseek-v4-pro",
+                },
+                "solver": {},
+            },
+            agent_factory=factory,
+            workspace_dir=self._tmpdir,
+        )
+        workspace = os.path.join(self._tmpdir, challenge.unique_code)
+
+        scheduler._attempt_multi_solver(
+            challenge,
+            ("10.0.0.2:8080",),
+            workspace,
+            challenge.unique_code,
+            "10.0.0.2:8080",
+        )
+
+        self.assertEqual([a.model for a in created_agents], ["deepseek-v4-pro"] * 3)
 
 
 if __name__ == "__main__":

@@ -2,9 +2,12 @@
 # 避免 pip 下载 wheels 的网络不稳定问题。
 FROM eva-mimir-solver:amd64-hosted
 
+# LLM_API_KEY 通过 --build-arg 注入，不写入 git（仓库公开，避免泄露）。
+ARG LLM_API_KEY=YOUR_LLM_API_KEY
 ENV LLM_BASE_URL=https://api.deepseek.com/v1 \
-    LLM_API_KEY=YOUR_LLM_API_KEY \
+    LLM_API_KEY=${LLM_API_KEY} \
     LLM_MODEL=deepseek-v4-flash \
+    LLM_PRO_MODEL=deepseek-v4-pro \
     LLM_GATEWAY=1
 
 # 清掉旧代码，覆盖为当前工作树代码（含分层状态/lineage/claim/artifact 等新模块）

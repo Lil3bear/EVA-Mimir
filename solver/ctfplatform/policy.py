@@ -63,23 +63,21 @@ def _type_cost(code: str) -> float:
 # waited in queue).
 _DEFERRED_PREFIXES = ("b-", "e1", "e2", "e3", "f1", "f2")
 _DIFFICULTY_RANK = {"easy": 0, "medium": 1, "hard": 2, "difficult": 2}
-
-# 能力瓶颈题：历史多次 run 从未解出。放开头攻坚（解出就赚分），连续失败后
-# 由 retry ledger 自动 abandon，不再长期占 worker slot。
-_BOTTLENECK_CODES = {"a-18", "c-03", "c-06", "c-08", "f2-05"}
+# 同难度内的次级排序：耗时长、易占满 worker slot 的 pentest/pwn/reverse
+# 家族（b-/e1/e2/e3/f1/f2）排在 web/misc 之后（run-12717：b-* 占满 3 槽
+# 41 分钟导致 easy 题排队）。
+_DEFERRED_OFFSET = 3
 
 
 def _tier(challenge: Challenge) -> int:
-    """Lower tier runs first.  Bottleneck challenges run even before web/misc
-    so a hard problem gets the freshest budget, then is abandoned and the
-    remaining 58 challenges run uninterrupted.
+    """Lower tier runs first。简单后难：难度升序（easy → medium → hard）为主，
+    同难度内再把耗时家族（b/e/f）后置。
     """
-    if challenge.unique_code.lower() in _BOTTLENECK_CODES:
-        return -1
     rank = _DIFFICULTY_RANK.get(challenge.difficulty.lower(), 1)
+    tier = rank * 10
     if challenge.unique_code.lower().startswith(_DEFERRED_PREFIXES):
-        rank += 3
-    return rank
+        tier += _DEFERRED_OFFSET
+    return tier
 
 
 def _roi(challenge: Challenge) -> float:
@@ -92,11 +90,10 @@ def _roi(challenge: Challenge) -> float:
 
 
 def sort_challenges(challenges: list[Challenge]) -> list[Challenge]:
-    """Front-load fast, high-yield points; defer slot-hogging families to the tail.
+    """简单后难：难度升序，再把耗时家族后置。
 
-    Ordering key is ``(tier, -roi, code)``: tier front-loads easy/web wins,
-    ROI ranks value within a tier, and the code is a deterministic final
-    tiebreak.
+    Ordering key is ``(tier, -roi, code)``: tier 先排 easy/web 快速高分题，
+    难度相同再按 ROI（期望分/成本）排，code 作为确定性 tiebreak。
     """
     return sorted(
         challenges,

@@ -3,6 +3,7 @@
     "base_url": "https://api.deepseek.com/v1",
     "api_key": "",
     "default_model": "deepseek-v4-flash",
+    "pro_model": "deepseek-v4-pro",
     "observer_model": "deepseek-v4-flash",
     "reasoning_effort": "high",
     "max_output_tokens": 8192,
@@ -19,6 +20,7 @@
   },
   "solver": {
     "max_rounds": null,
+    "pro_enabled": true,
     "allow_easy_hint": false,
     "observer_correction_max_lag": 3,
     "memory_limit": 10,

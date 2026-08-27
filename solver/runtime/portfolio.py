@@ -16,6 +16,7 @@ class AttemptSpec:
     hypothesis: str = ""
     allowed_scope: str = "current_challenge"
     strategy_hint: str = ""
+    model: str = ""  # 空=默认 flash；"pro"=deepseek-v4-pro（难题攻坚）
 
 
 class PortfolioBudget:
@@ -144,6 +145,41 @@ _PRIMARY = AttemptSpec(
 _TWO_STRATEGY = (_AGGRESSIVE, _STEADY)
 _SOLO = (_PRIMARY,)
 
+# 竞争假设（agent-team 式）：hard/瓶颈题用三个不同正交假设并行攻坚，
+# claim 保证互斥、artifact 共享结构化证据、谁先解出谁赢。
+# model="pro" 表示攻坚时切换到 deepseek-v4-pro（稳定深度）。
+_HARD_FOOTHOLD = AttemptSpec(
+    "foothold",
+    role="scout-executor",
+    objective="在 Web 入口找可复现的初始访问（LFI/SQLi/上传/已知 CVE）",
+    success_condition="得到可复现的入口或 flag",
+    stop_condition="验证少量高概率 Web 入口后无新证据，释放该假设",
+    hypothesis="优先 Web 初始入口：文件包含/注入/上传/已知产品 CVE",
+    strategy_hint="只验证有指纹或 skill 证据支持的最高概率 Web 入口，不做全盘扫描。",
+    model="pro",
+)
+_HARD_LATERAL = AttemptSpec(
+    "lateral",
+    role="evidence-executor",
+    objective="找内网/横向移动/凭据复用的第二条路",
+    success_condition="发现新主机、新权限或可复用凭据",
+    stop_condition="无 SSRF/内网/凭据证据时释放该假设",
+    hypothesis="优先 SSRF/内网枚举/凭据复用/横向移动",
+    strategy_hint="先用已有入口和 hint 里的拓扑线索精确探测内网，不盲目全量扫。",
+    model="pro",
+)
+_HARD_SOURCE = AttemptSpec(
+    "source",
+    role="evidence-executor",
+    objective="从源码/配置/泄露找直接 flag 或提权路径",
+    success_condition="从源码/配置读到的凭据、漏洞或 flag",
+    stop_condition="无明显源码/配置泄露入口时释放该假设",
+    hypothesis="优先源码泄露/配置文件/中间件版本对应的已知 CVE",
+    strategy_hint="先读源码/配置/环境变量找 flag 定义位置或硬编码凭据。",
+    model="pro",
+)
+_COMPETING_HYPOTHESES = (_HARD_FOOTHOLD, _HARD_LATERAL, _HARD_SOURCE)
+
 
 def challenge_plan(challenge) -> tuple[tuple[AttemptSpec, ...], str]:
     """Return ``(attempts, memory_scope)`` for one challenge.
@@ -168,9 +204,15 @@ def challenge_plan(challenge) -> tuple[tuple[AttemptSpec, ...], str]:
     ):
         return (_TWO_STRATEGY, "shared")
 
-    # 已知需要双策略的硬题 / 弱中题：隔离赛跑。
+    # hard/瓶颈题：竞争假设（agent-team 式），三个正交假设并行攻坚，
+    # 用 pro 模型稳定深度。memory 私有隔离，结构化证据经 artifact/
+    # memory_promote 受控共享；claim 互斥、谁先解出谁赢。
+    if hard:
+        return (_COMPETING_HYPOTHESES, "private")
+
+    # 多 flag（非 b/e1）和弱中题：隔离双策略赛跑。
     weak_medium = prefix in _MULTI_SOLVE_PREFIXES and diff == "medium"
-    if hard or multi_flag or weak_medium:
+    if multi_flag or weak_medium:
         return (_TWO_STRATEGY, "isolated")
 
     # 前排 web/misc 简单题（a-/c-/g-/d-）：并行多解，memory 完全隔离。

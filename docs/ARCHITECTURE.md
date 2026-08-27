@@ -72,13 +72,30 @@ Solver B 可消费已验证证据
 - `command` 让 Observer 可以定向调度（assign/pause/fork/close）；
 - `stage_ledger` 让多 Flag 题的阶段进度共享、不存 flag 原文。
 
+### hard/瓶颈题：竞争假设（agent-team 式）
+
+hard/difficult 题由 `portfolio.py` 生成三个正交竞争假设并行攻坚：
+
+```text
+foothold（Web 初始入口）   ─┐
+lateral（SSRF/内网/凭据复用）─┼─> 各自独立 context，claim 互斥
+source（源码/配置泄露）     ─┘    谁先解出谁赢（stop_event）
+```
+
+- 每个 attempt 的 `model="pro"` → 切换到 `llm.pro_model`（默认 `deepseek-v4-pro`）；
+  用 `solver.pro_enabled=false` 或环境变量 `LLM_PRO_MODEL` 覆盖。
+- `memory_scope="private"`：原始思路/失败流水默认互不可见；结构化证据经
+  `artifact_publish → artifact_approve`（或 `memory_share → memory_promote`）受控共享。
+- 一个 challenge 只选一个 Observer（当前为 foothold）作为控制面，避免多个
+  Observer 并发修改共享看板。
+
 ---
 
 ## 调度与题目分级
 
 `policy.py` 按 **tier + ROI** 排序题目：
 
-- **tier**：先把快速高分的 web/misc 题（a/c/d）前置，把耗时长、易占满 worker slot 的 pentest/pwn/reverse 家族（b/e/f）推迟到尾部；
+- **tier**：难度升序（简单后难 easy → medium → hard）；同难度内再把耗时长、易占满 worker slot 的 pentest/pwn/reverse 家族（b/e/f）推迟到尾部；
 - **ROI**：同类内按"期望分 / 成本"排序。
 
 这解决了"b 类多阶段题一开始就占满全部并行 slot、导致 a 类快速题排队"的问题（run-12717 的根因）。

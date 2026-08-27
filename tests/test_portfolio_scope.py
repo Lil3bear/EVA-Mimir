@@ -54,8 +54,8 @@ class LayeredOrderingTests(unittest.TestCase):
         order = [c.unique_code for c in sort_challenges(challenges)]
         self.assertEqual(order, ["a-easy", "a-medium", "a-hard"])
 
-    def test_bottleneck_codes_run_first(self):
-        """能力瓶颈题（a-18/c-03/c-06/c-08/f2-05）必须排在最前攻坚。"""
+    def test_simple_before_hard(self):
+        """简单后难：难度升序为主（easy → medium → hard），不再把瓶颈题放开头。"""
         challenges = [
             _ch("a-05", difficulty="easy"),
             _ch("a-18", difficulty="hard"),
@@ -63,10 +63,11 @@ class LayeredOrderingTests(unittest.TestCase):
             _ch("c-03", difficulty="hard"),
         ]
         order = [c.unique_code for c in sort_challenges(challenges)]
-        self.assertEqual(order[0], "a-18")
-        self.assertEqual(order[1], "c-03")
-        self.assertIn("a-05", order[2:])
-        self.assertIn("b-01", order[2:])
+        self.assertEqual(order[0], "a-05")
+        # medium 的 b-01 也必须排在 hard 的 a-18/c-03 之前（难度为主）。
+        self.assertLess(order.index("a-05"), order.index("b-01"))
+        self.assertLess(order.index("b-01"), order.index("a-18"))
+        self.assertLess(order.index("b-01"), order.index("c-03"))
 
 
 class CollaborationModeTests(unittest.TestCase):
@@ -84,9 +85,16 @@ class CollaborationModeTests(unittest.TestCase):
             self.assertEqual(scope, "isolated", code)
             self.assertEqual(len(attempts), 2, code)
 
-    def test_hard_challenge_isolated_multi(self):
-        _, scope = challenge_plan(_ch("a-09", difficulty="hard"))
-        self.assertEqual(scope, "isolated")
+    def test_hard_challenge_uses_competing_hypotheses(self):
+        # hard/瓶颈题：三个正交假设（foothold/lateral/source）并行攻坚，
+        # memory 私有隔离（各自独立 context），证据经 artifact/promote 受控共享，
+        # claim 互斥、谁先解出谁赢。
+        attempts, scope = challenge_plan(_ch("a-09", difficulty="hard"))
+        self.assertEqual(scope, "private")
+        self.assertEqual(
+            {a.name for a in attempts}, {"foothold", "lateral", "source"}
+        )
+        self.assertTrue(all(a.model == "pro" for a in attempts))
 
     def test_generic_or_unknown_stays_solo(self):
         for code in ("web-01", "misc-01", "unknown"):

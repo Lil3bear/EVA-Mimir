@@ -192,6 +192,8 @@ def _run_tsecbench_mode() -> None:
 
     # 前缀过滤：只跑指定前缀的题目（如 SOLVER_PREFIX_FILTER=b- 只跑多阶段渗透）
     prefix_filter = os.environ.get('SOLVER_PREFIX_FILTER', '').strip() or None
+    # 精确题号过滤：只跑指定题号（用于专项研究能力瓶颈题，如 SOLVER_ONLY_CODES=a-18,c-03）
+    only_codes = _env_codes("SOLVER_ONLY_CODES", "")
 
     # 多轮重跑参数
     try:
@@ -214,8 +216,8 @@ def _run_tsecbench_mode() -> None:
     retry_state = retry_ledger.snapshot()
     fail_streak: dict[str, int] = dict(retry_state.get("fail_streak", {}))
     abandoned_codes: set[str] = set(retry_state.get("abandoned", []))
-    # 能力瓶颈题不再默认跳过，而是放开头攻坚：解出就赚分，连续失败后
-    # 由 retry ledger 自动 abandon。要显式跳过时再通过 SOLVER_SKIP_CODES 设置。
+    # 解题顺序改为简单后难（policy.py 难度升序）；瓶颈题不再放开头攻坚，
+    # 连续失败后仍由 retry ledger 自动 abandon。要显式跳过时用 SOLVER_SKIP_CODES。
     pre_skip_codes = _env_codes("SOLVER_SKIP_CODES", "")
     MAX_FAIL_STREAK = 4
     cumulative_report: dict = {}
@@ -298,6 +300,7 @@ def _run_tsecbench_mode() -> None:
             skip_completed=True,
             skip_codes=pre_skip_codes | abandoned_codes | skip_hard_new | retry_cooldown,
             prefix_filter=prefix_filter,
+            only_codes=only_codes,
         )
 
         try:

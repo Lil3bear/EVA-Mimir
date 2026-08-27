@@ -193,6 +193,7 @@ class Scheduler:
         skip_completed: bool = True,
         skip_codes: set[str] | None = None,
         prefix_filter: str | None = None,
+        only_codes: set[str] | None = None,
         max_parallel: int = DEFAULT_MAX_PARALLEL,
         agent_factory=None,
         start_retry_max: int = _START_RETRY_MAX,
@@ -208,6 +209,7 @@ class Scheduler:
         self.skip_completed = skip_completed
         self.skip_codes = skip_codes or set()
         self.prefix_filter = prefix_filter.strip() if prefix_filter else None
+        self.only_codes = only_codes or set()
         # 平台最多同时运行 3 个容器；额外的 worker 只会制造
         # max-active 重试和 LLM 争抢，因此在调度器边界强制限幅。
         self.max_parallel = min(3, max(1, int(max_parallel)))
@@ -279,6 +281,11 @@ class Scheduler:
         if self.prefix_filter:
             todo = [c for c in todo if c.unique_code.lower().startswith(self.prefix_filter.lower())]
             _emit("prefix_filter", {"prefix": self.prefix_filter, "matched": len(todo)})
+
+        # 精确题号过滤：只跑指定题号（用于专项研究能力瓶颈题）
+        if self.only_codes:
+            todo = [c for c in todo if c.unique_code in self.only_codes]
+            _emit("only_codes", {"codes": sorted(self.only_codes), "matched": len(todo)})
 
         # 跳过被暂停的题目（跨重跑连续无新增 flag/实质证据）
         if self.skip_codes:
@@ -558,6 +565,31 @@ class Scheduler:
             # the shared Memory/Ideas board produced stale and conflicting edits.
             solver_cfg["observer_enabled"] = spec.name == observer_leader
             strategy_settings["solver"] = solver_cfg
+
+            # 每个 attempt 可指定独立模型：spec.model="pro" → llm.pro_model
+            # （默认 deepseek-v4-pro，用于 hard 竞争假设攻坚）。
+            # solver.pro_enabled=false 或 LLM_PRO_MODEL 可覆盖全局开关/模型名，
+            # 避免重跑时误烧 pro 额度或指向不存在的模型。
+            llm_cfg = dict(strategy_settings.get("llm", {}))
+            if spec.model:
+                pro_enabled = str(solver_cfg.get("pro_enabled", True)).strip().lower() not in {
+                    "0", "false", "no", "off",
+                }
+                if spec.model == "pro" and pro_enabled:
+                    llm_cfg["default_model"] = (
+                        llm_cfg.get("pro_model")
+                        or os.environ.get("LLM_PRO_MODEL", "").strip()
+                        or "deepseek-v4-pro"
+                    )
+                elif spec.model != "pro":
+                    llm_cfg["default_model"] = spec.model
+            strategy_settings["llm"] = llm_cfg
+            _emit("attempt_model", {
+                "unique_code": code,
+                "attempt_id": spec.name,
+                "model": llm_cfg.get("default_model", ""),
+                "spec_model": spec.model or "",
+            })
 
             agent = self._agent_factory(
                 task=task,

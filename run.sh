@@ -98,6 +98,7 @@ LLM_ENV_ARGS=()
 if [ -n "${LLM_BASE_URL:-}" ]; then LLM_ENV_ARGS+=(-e "LLM_BASE_URL=${LLM_BASE_URL}"); fi
 if [ -n "${LLM_API_KEY:-}" ]; then LLM_ENV_ARGS+=(-e "LLM_API_KEY=${LLM_API_KEY}"); fi
 if [ -n "${LLM_MODEL:-}" ]; then LLM_ENV_ARGS+=(-e "LLM_MODEL=${LLM_MODEL}"); fi
+if [ -n "${LLM_PRO_MODEL:-}" ]; then LLM_ENV_ARGS+=(-e "LLM_PRO_MODEL=${LLM_PRO_MODEL}"); fi
 if [ -n "${LLM_GATEWAY:-}" ]; then LLM_ENV_ARGS+=(-e "LLM_GATEWAY=${LLM_GATEWAY}"); fi
 
 docker run --rm --network host \
