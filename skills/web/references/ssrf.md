@@ -279,29 +279,29 @@ http://127.0.0.1:9000/actuator/shutdown
 http://127.0.0.1:9000/actuator/env
 ```
 
-### a-16 实测（内网资产探测服务 SSRF，✅ 已解出）
+### a-16 实测（内网资产探测服务 SSRF）
 
-**登录**：`admin/Password123` → session cookie，然后 POST `/probe`（`target_url`/`timeout`/`follow_redirect`）。
+**登录**：题目给的口令登录（弱口令）→ session cookie，然后 POST `/probe`（`target_url`/`timeout`/`follow_redirect`）。
 
 **过滤规则（实测）**：
-- 主机名含 `internal-api`/`localhost`/`127.0.0.1`/`0.0.0.0` → “访问被阻止”
+- 主机名含内网服务名/`localhost`/`127.0.0.1`/`0.0.0.0` → “访问被阻止”
 - 私有 IPv4 字面量 → “禁止访问内网地址”
 - `file`/`dict`/`gopher` → “不支持的协议”（**只支持 http/https GET**）
-- **两种绕过**：① `[::ffff:IP]` IPv6 映射；② 十进制 IP；③ **URL 解析差异（最稳）**：`http://internal-api:5000\@2130706433/../debug/config`——urlparse 看 host=2130706433（127.0.0.1 十进制）过过滤，urllib3 实际请求 internal-api:5000 且 `/../` 规范化为 `/`。
+- **绕过**：① `[::ffff:IP]` IPv6 映射；② 十进制 IP；③ **URL 解析差异（最稳）**：`http://<内网主机名>:5000\@2130706433/../<配置端点>`——urlparse 看 host=2130706433（127.0.0.1 十进制）过过滤，urllib3 实际请求内网主机名 且 `/../` 规范化为 `/`。
 
-**内网拓扑（Docker 网段漂移，按 /debug/config 实测为准）**：
+**内网拓扑（Docker 网段漂移，按配置端点实测为准）**：
 ```
-.1:8080 = gateway（Go 监控：/health 返回 running_range_count；/api/v1/ranges 需 agent token——⚠️ 这是干扰项，flag 不在这）
-.2:5000 = internal-api（Flask）—— flag 在这里
+.1:8080 = gateway（Go 监控：/health 返回 running_range_count；某 API 需 agent token——⚠️ 干扰项，flag 不在这）
+.2:5000 = 内网 API（Flask）—— flag 在这里
 .3:80   = probe 服务自身
 ```
 
-**✅ 正确解题链（评测 52 轮实测）**：
-1. `http://internal-api:5000\@2130706433/../debug/config` → 泄露 `admin_token`
-2. **`http://internal-api:5000\@2130706433/../admin/info?token=<admin_token>` → 200 直接返回 flag**
-3. 注意：`/admin/info` 用 **`token`** 参数（不是 `admin_token`/`key`/`auth`，那些 401）。
+**✅ 正确解题链（评测实测）**：
+1. URL 解析差异 payload 访问 `<配置端点>` → 泄露 `admin_token`
+2. **`<隐藏路由>?token=<admin_token>` → 200 直接返回 flag**
+3. 注意：隐藏路由用 **`token`** 参数（不是 `admin_token`/`key`/`auth`，那些 401）。
 
-**⚠️ 迷失教训（耗时根源）**：gateway 的 `/api/v1/ranges` 需要 “agent token” 是**干扰项**——flag 根本不在 gateway。正确做法是拿到 admin_token 后**继续枚举 internal-api 的 `/admin/*` 路径**（尤其 `/admin/info?token=...`），而不是去爆破 gateway 的 agent token。internal-api 公开路由仅 /health /status /debug/config，但**带 token 的隐藏路由**（如 /admin/info）才是 flag 所在地。
+**⚠️ 迷失教训（耗时根源）**：gateway 的某 API 需要 “agent token” 是**干扰项**——flag 根本不在 gateway。正确做法是拿到 admin_token 后**继续枚举内网 API 的 `/admin/*` 路径**，而不是去爆破 gateway 的 agent token。公开路由只有 /health /status /debug/config，但**带 token 的隐藏路由**才是 flag 所在地。
 
 ---
 

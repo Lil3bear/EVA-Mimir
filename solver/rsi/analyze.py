@@ -13,7 +13,7 @@ from solver.runtime.submission_store import score_belongs_to_current_task
 
 # Known failure patterns from docs/PROBLEMS.md — suggest next skill/router layer.
 _KNOWN_FAILURE_HINTS: dict[str, str] = {
-    "a-03": "三变体：V1有cookie→session；V2 pydash；V3无cookie+/login500→登录绕过后再报表/搜索注入（勿标死路）",
+    "a-03": "login 报 500/密码错误先试 SQLi UNION 注入拿 session，再枚举 /admin/* 隐藏路由",
     "c-08": "Langflow：validate/code 默认参数求值 payload（§6.10），禁止跨 IP :80",
     "c-05": "Gradio 4.x /file= 白名单：product-playbooks §6.8，验证 bypass 而非路径枚举",
     "c-02": "ComfyUI §6.5：weak+use_uv=False → setup.py sdist → pip 裸文本 → reboot → /view type=input；卡安装看 pip --log",
