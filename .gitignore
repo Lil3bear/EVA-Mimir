@@ -8,6 +8,7 @@ settings.local.json
 # 运行日志（可能含敏感信息）
 run_log*.jsonl
 run_log*.txt
+logs/
 
 # Docker 构建产物
 agent.tar*

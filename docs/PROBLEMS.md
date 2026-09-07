@@ -21,6 +21,15 @@
 - skill 加载后，把"关键利用路径 + payload 位置"作为 fact 写入 Memory；
 - 卡点摘要里加入"回看已加载 skill 的关键 payload，不要凭记忆重建、不要下载外网 scanner"。
 
+**已做修复（知识层）**：
+- `product-playbooks.md §6.6` 已换成**真实可用**的 React2Shell 手动 payload（此前 `["$@1"]`
+  是占位符，非工作利用）：检测用 `["$1:a:a"]`→500+`E{"digest"`；RCE 用 multipart 原型污染
+  劫持 `Chunk.prototype.then`→`Function` 构造器，含回显(NEXT_REDIRECT→X-Action-Redirect)与
+  盲执行两种变体，全部自包含、不依赖下载 scanner.py。
+- 明确写入原理"无需真实 action id、别抓 `$ACTION_ID_`、别下 scanner"，直接堵死此前跑偏路径。
+- `known-product-exploit.md` 的 Dify 行加了 "→ 见 §6.6" 指针，避免 agent 在只有一行的索引表里
+  空 grep 后凭记忆重建。
+
 ---
 
 ## 问题 2：逆向/固件题瞎猜 flag
@@ -72,6 +81,20 @@
 - 修问题 1（知识可达性）→ 救 c-03；
 - 修问题 2（逆向题干预）→ 救 f2-05；
 - a-18 / c-08 需单独分析卡点。
+
+### 假阳性 session 复盘（508850/509748/509749/597562）
+
+| 题 | session | 卡点 | 已落地修复 |
+|---|---|---|---|
+| c-03 | 509748 | CVE 条注入把模型推向 `security_search`+下载 scanner；CSS `body{…}` 被误报 flag；skill 有 CVE 名无可用 payload | cheatsheet→`["$1:a:a"]` 探测；KR 优先 `skill_load`、去掉 `security_search`；flag 正则只认 `flag\|ctf{`；CVE 横幅同 attempt 去重；product-playbooks §6.6 完整 payload |
+| c-06 | 509749 | 认出 HugeSecurityManager 后超时，未试到线程改名绕过；cheatsheet 无 HugeGraph 条目 | graph-db.md `#0` 线程改名；补 HugeGraph cheatsheet→`skill_load(graph-db.md)` |
+| c-08 | 508850 | TCP 通但 HTTP RST；curl -v 回显触发 Gradio 弱信号；旧 Memory `.98` 与当前 `.97` 横跳 | `_looks_like_web` 忽略 curl -v 客户端行；Memory 同 /24 旧 IP 标「疑似旧实例」；prompt 强化 HTTP 不通后禁跟端口弱信号 |
+| a-18 | 597562 / 619218 | 已拿 JWT `kid=prod.key`，未 load jwt-attacks；high 推理盲猜 | `skill_router` 强制 JWT 路由 + Memory pin；`hard_tier=light` 关闭 high |
+| c-08 | 508850 / 618684 | TCP 通但 HTTP RST；漂到同网段其它 IP:80 | IP 锁定横幅；协议探测 skill §6.9；curl -v 弱信号过滤 |
+| c-05 | 618723 | Gradio 4.12 `/file=` 白名单 403 | product-playbooks §6.8 |
+| c-02 | 619412 | ComfyUI 死磕 `/view` / 手写 tar 卡 pip | §6.5 标准 sdist + pip 裸文本 + use_uv=False；cheatsheet 对齐成功链；工程错误 oracle |
+
+**配置变更（关闭 high）**：`reasoning_effort=medium`、`reasoning_effort_cap=medium`、`hard_tier=light`、`escalate_rounds=0`。深度思考不能替代 skill/payload。
 
 ---
 

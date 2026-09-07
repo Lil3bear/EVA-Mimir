@@ -311,7 +311,8 @@ class LaneTerminationTests(unittest.TestCase):
         self.assertEqual(SolverAgent._classify_lane("hard", False, False), "deep")
         self.assertEqual(SolverAgent._classify_lane("difficult", False, False), "deep")
         self.assertEqual(SolverAgent._classify_lane("medium", True, False), "deep")
-        self.assertEqual(SolverAgent._classify_lane("medium", False, True), "deep")
+        self.assertEqual(SolverAgent._classify_lane("medium", False, True), "fast")
+        self.assertEqual(SolverAgent._classify_lane("hard", False, True), "deep")
 
     def test_easy_fast_lane_upgrades_instead_of_stopping(self):
         from solver.runtime.control import ControlAction

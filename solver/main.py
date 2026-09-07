@@ -16,6 +16,13 @@ from solver.runtime.settings import (
 from solver.tools import bridge_tools
 from solver.runtime.submission_store import benchmark_task_id, score_belongs_to_current_task
 from solver.runtime.retry_ledger import RetryLedger
+from solver.runtime.salvage import (
+    collect_salvage_targets,
+    long_hard_cut_codes,
+    resolve_salvage_phase,
+    salvage_abandoned_codes,
+)
+from solver.rsi.packs import resolve_only_codes, resolve_prefix_filter
 
 
 def _emit(event_type: str, data=None) -> None:
@@ -149,6 +156,13 @@ def _run_tsecbench_mode() -> None:
         )})
         sys.exit(1)
     _emit("llm_config", {"base_url": llm_url, "model": llm_cfg.get("default_model", "deepseek-v4-flash")})
+    if settings.pop("_routing_corrected", False):
+        routing = llm_cfg.get("routing") if isinstance(llm_cfg.get("routing"), dict) else {}
+        _emit("routing_config_corrected", {
+            "hard_tier": routing.get("hard_tier", "light"),
+            "escalate_rounds": routing.get("escalate_rounds", 0),
+            "hint": "已强制覆盖为 medium-only（hard_tier=light, escalate_rounds=0）",
+        })
 
     # ━━ LLM 连通性测试 ━━
     _emit("llm_probe", {"status": "testing", "url": llm_url})
@@ -191,13 +205,22 @@ def _run_tsecbench_mode() -> None:
     max_parallel = min(3, max(1, max_parallel))
 
     # 前缀过滤：只跑指定前缀的题目（如 SOLVER_PREFIX_FILTER=b- 只跑多阶段渗透）
-    prefix_filter = os.environ.get('SOLVER_PREFIX_FILTER', '').strip() or None
-    # 精确题号过滤：只跑指定题号（用于专项研究能力瓶颈题，如 SOLVER_ONLY_CODES=a-18,c-03）
-    only_codes = _env_codes("SOLVER_ONLY_CODES", "")
+    rsi_pack = (
+        os.environ.get("SOLVER_RSI_PACK", "").strip()
+        or (settings.get("rsi") or {}).get("active_pack", "").strip()
+    )
+    prefix_filter = resolve_prefix_filter(settings, os.environ, pack_name=rsi_pack)
+    # 精确题号过滤：SOLVER_ONLY_CODES > settings.rsi.only_codes > RSI pack
+    only_codes = resolve_only_codes(settings, os.environ, pack_name=rsi_pack)
+    if only_codes:
+        _emit("rsi_pack", {
+            "pack": rsi_pack or None,
+            "only_codes": sorted(only_codes),
+        })
 
     # 多轮重跑参数
     try:
-        total_timeout_min = _env_int('SOLVER_TOTAL_TIMEOUT', 350, minimum=0)
+        total_timeout_min = _env_int('SOLVER_TOTAL_TIMEOUT', 360, minimum=0)
         max_retry_rounds = _env_int('SOLVER_MAX_RETRY_ROUNDS', 5, minimum=0)
     except ValueError as exc:
         _emit("error", {"msg": str(exc)})
@@ -217,8 +240,16 @@ def _run_tsecbench_mode() -> None:
     fail_streak: dict[str, int] = dict(retry_state.get("fail_streak", {}))
     abandoned_codes: set[str] = set(retry_state.get("abandoned", []))
     # 解题顺序改为简单后难（policy.py 难度升序）；瓶颈题不再放开头攻坚，
-    # 连续失败后仍由 retry ledger 自动 abandon。要显式跳过时用 SOLVER_SKIP_CODES。
-    pre_skip_codes = _env_codes("SOLVER_SKIP_CODES", "")
+    # 连续失败后仍由 retry ledger 自动 abandon。显式跳过名单来自
+    # settings.json(solver.skip_codes) 与 SOLVER_SKIP_CODES 环境变量的并集，
+    # 不再硬编码在代码里。单题墙钟止损 + retry 自动 abandon + LaneBudget 已能
+    # 自动兜住"久攻不下"的题，因此该名单可按赛题清空（留空即全部尝试）。
+    configured_skip = settings.get("solver", {}).get("skip_codes", []) or []
+    if isinstance(configured_skip, str):
+        configured_skip = configured_skip.split(",")
+    pre_skip_codes = _env_codes("SOLVER_SKIP_CODES", "") | {
+        str(code).strip() for code in configured_skip if str(code).strip()
+    }
     MAX_FAIL_STREAK = 4
     cumulative_report: dict = {}
     # Only report a total count that came from a successful platform snapshot;
@@ -241,36 +272,93 @@ def _run_tsecbench_mode() -> None:
             "abandoned": len(abandoned_codes),
         })
 
-        # 剩余时间 < 20% 时，跳过未尝试过的 hard 题（不值得开新坑）
-        time_ratio = remaining_min / total_timeout_min if total_timeout_min > 0 else 1.0
+        salvage_plan = resolve_salvage_phase(
+            elapsed_min=elapsed_min,
+            remaining_min=remaining_min,
+            total_timeout_min=total_timeout_min,
+            round_idx=round_idx,
+            settings=settings,
+        )
+        salvaged_abandoned: set[str] = set()
+        salvage_focus: set[str] = set()
         skip_hard_new = set()
-        if time_ratio < 0.2 and round_idx > 1:
-            try:
-                all_ch = client.list_challenges()
-                known_total_count = len(all_ch)
-                for c in all_ch:
+        all_ch_for_round: list = []
+        try:
+            all_ch_for_round = client.list_challenges()
+            known_total_count = len(all_ch_for_round)
+
+            if salvage_plan.salvage_enabled:
+                if salvage_plan.cut_long_hard:
+                    cut_long_hard = long_hard_cut_codes(
+                        all_ch_for_round,
+                        phase=salvage_plan.phase,
+                        settings=settings,
+                    )
+                    if cut_long_hard:
+                        retry_state = retry_ledger.mark_abandoned(
+                            cut_long_hard,
+                            reason=f"salvage_{salvage_plan.phase}_long_hard",
+                        )
+                        abandoned_codes = set(retry_state.get("abandoned", []))
+                        _emit("late_game_cut_long_hard", {
+                            "codes": sorted(cut_long_hard),
+                            "phase": salvage_plan.phase,
+                            **salvage_plan.to_emit(),
+                        })
+
+                salvaged_abandoned = salvage_abandoned_codes(
+                    abandoned_codes, all_ch_for_round
+                )
+                salvage_focus = collect_salvage_targets(
+                    all_ch_for_round,
+                    abandoned=abandoned_codes,
+                    fail_streak=fail_streak,
+                    workspace_dir=workspace_dir,
+                )
+                salvage_focus |= salvaged_abandoned
+
+                if salvaged_abandoned:
+                    _emit("late_game_salvage", {
+                        "codes": sorted(salvaged_abandoned),
+                        "phase": salvage_plan.phase,
+                        **salvage_plan.to_emit(),
+                    })
+                if salvage_focus:
+                    _emit("salvage_focus", {
+                        "codes": sorted(salvage_focus),
+                        "count": len(salvage_focus),
+                        "phase": salvage_plan.phase,
+                    })
+
+            if salvage_plan.skip_hard_new and round_idx > 1:
+                for c in all_ch_for_round:
                     if (c.difficulty.lower() in ("hard", "difficult")
                             and not c.is_completed
                             and c.correct_flag_count == 0
-                            and c.unique_code not in abandoned_codes):
+                            and c.unique_code not in abandoned_codes
+                            and c.unique_code not in salvaged_abandoned):
                         skip_hard_new.add(c.unique_code)
                 if skip_hard_new:
                     _emit("skip_hard_time_pressure", {
                         "codes": sorted(skip_hard_new),
-                        "time_ratio": round(time_ratio, 2),
+                        "phase": salvage_plan.phase,
+                        **salvage_plan.to_emit(),
                     })
-            except (TaskNotFound, InvalidState) as exc:
-                _emit("terminal_error", {
-                    "phase": "time_pressure_list_challenges",
-                    "code": getattr(exc, "code", ""),
-                    "message": str(exc),
-                })
-                break
-            except Exception as exc:
-                _emit("warning", {
-                    "phase": "time_pressure_list_challenges",
-                    "message": str(exc),
-                })
+        except (TaskNotFound, InvalidState) as exc:
+            _emit("terminal_error", {
+                "phase": "time_pressure_list_challenges",
+                "code": getattr(exc, "code", ""),
+                "message": str(exc),
+            })
+            break
+        except Exception as exc:
+            _emit("warning", {
+                "phase": "time_pressure_list_challenges",
+                "message": str(exc),
+            })
+
+        if salvage_plan.late_game_mode:
+            _emit("salvage_phase", salvage_plan.to_emit())
 
         # 第 2 轮起，用 baseline 宽松模式重跑未解题（无早停/无切换/无强干预，
         # 完整预算自由探索，用于兑底保分）。首轮仍走 Fast/Deep Lane。
@@ -278,17 +366,35 @@ def _run_tsecbench_mode() -> None:
         if round_idx >= 2:
             round_settings = copy.deepcopy(settings)
             round_settings.setdefault("solver", {})["baseline_mode"] = True
+        if salvage_plan.late_game_mode:
+            if round_settings is settings:
+                round_settings = copy.deepcopy(settings)
+            solver_cfg = round_settings.setdefault("solver", {})
+            solver_cfg["late_game_mode"] = True
+            solver_cfg["salvage_phase"] = salvage_plan.phase
+            solver_cfg["salvage_only"] = salvage_plan.salvage_only
+            if salvage_focus:
+                solver_cfg["salvage_focus_codes"] = sorted(salvage_focus)
 
         retry_state = retry_ledger.snapshot()
         retry_cooldown = {
             code for code, until in retry_state.get("cooldown_until_round", {}).items()
             if int(until or 0) > round_idx and code not in abandoned_codes
         }
+        if salvage_plan.clear_easy_cooldown:
+            hard_codes = {
+                c.unique_code
+                for c in all_ch_for_round
+                if (c.difficulty or "").lower() in ("hard", "difficult")
+            }
+            retry_cooldown = retry_cooldown & hard_codes
         if retry_cooldown:
             _emit("retry_cooldown", {
                 "round": round_idx,
                 "codes": sorted(retry_cooldown),
             })
+
+        effective_abandoned = abandoned_codes - salvaged_abandoned
 
         scheduler = Scheduler(
             client=client,
@@ -298,7 +404,7 @@ def _run_tsecbench_mode() -> None:
             max_parallel=max_parallel,
             deadline=deadline,
             skip_completed=True,
-            skip_codes=pre_skip_codes | abandoned_codes | skip_hard_new | retry_cooldown,
+            skip_codes=pre_skip_codes | effective_abandoned | skip_hard_new | retry_cooldown,
             prefix_filter=prefix_filter,
             only_codes=only_codes,
         )
@@ -478,6 +584,27 @@ def _run_tsecbench_mode() -> None:
     print(f"  解出：{total_solved} | 累计得分：{total_score}")
     print(f"  重跑轮数：{round_idx} | 放弃题数：{len(abandoned_codes)}")
     print(f"{'='*60}\n")
+
+    rsi_cfg = settings.get("rsi") or {}
+    if rsi_cfg.get("enabled") and rsi_cfg.get("auto_analyze"):
+        try:
+            from solver.rsi.analyze import analyze_and_emit
+            from solver.rsi.packs import pack_codes
+
+            expected = sorted(only_codes) if only_codes else pack_codes(rsi_pack, settings)
+            report = analyze_and_emit(
+                workspace_dir,
+                pack=rsi_pack,
+                expected_codes=expected or None,
+                emit=_emit,
+            )
+            print(f"[RSI] 报告：{Path(workspace_dir) / 'rsi-report.md'}")
+            if report.next_actions:
+                print("[RSI] 待改进：")
+                for item in report.next_actions[:5]:
+                    print(f"  - {item['code']}: {item['hint']}")
+        except Exception as exc:
+            _emit("rsi_analyze_error", {"message": str(exc)})
 
     # total_count == 0 只代表没有可信的题目列表（例如 token 无效），
     # 不能被误报为成功；终态错误必须返回非零让托管平台识别失败。

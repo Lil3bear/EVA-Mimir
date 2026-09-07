@@ -1,4 +1,5 @@
 """Tests for new features: difficulty-based max_rounds, path traversal dedup, forced review."""
+import os
 import tempfile
 import threading
 import unittest
@@ -68,7 +69,7 @@ class ObserverControlPlaneTests(unittest.TestCase):
 
         observer = ObserverAgent(settings={"llm": {}})
 
-        self.assertEqual(observer._reasoning_effort, "high")
+        self.assertEqual(observer._reasoning_effort, "medium")
         self.assertFalse(observer._thinking_enabled)
         self.assertEqual(observer._max_output_tokens, 8192)
         self.assertEqual(observer._max_react_rounds, 2)
@@ -185,6 +186,111 @@ class ControlPolicyTests(unittest.TestCase):
         )
         self.assertEqual(d.action, "continue")
 
+    def test_time_budget_defaults_scale_with_difficulty_and_type(self):
+        self.assertEqual(
+            ControlPolicy.from_settings({"solver": {}}, "easy").time_budget_seconds,
+            600,
+        )
+        self.assertEqual(
+            ControlPolicy.from_settings({"solver": {}}, "hard").time_budget_seconds,
+            1800,
+        )
+        # hard 多阶段渗透 = 基础 1800 + pentest 900 + ctype 600。
+        hard_pentest_ctype = ControlPolicy.from_settings(
+            {"solver": {}}, "hard", pentest=True, ctype=True
+        )
+        self.assertEqual(hard_pentest_ctype.time_budget_seconds, 3300)
+
+    def test_time_budget_exhausted_stops_even_easy(self):
+        # 墙钟止损是与 idle/难度正交的硬安全阀：即使 easy 有新进展也照停。
+        policy = ControlPolicy.from_settings({"solver": {}}, "easy")
+        d = policy.decide(
+            round_num=5, last_progress_round=5, lane="fast",
+            elapsed_seconds=policy.time_budget_seconds + 1,
+        )
+        self.assertEqual(d.action, "stop")
+        self.assertEqual(d.reason, "time_budget_exhausted")
+        self.assertEqual(d.failure_scope, "task_exhausted")
+
+    def test_under_time_budget_does_not_stop(self):
+        policy = ControlPolicy.from_settings({"solver": {}}, "easy")
+        d = policy.decide(
+            round_num=5, last_progress_round=5, lane="fast",
+            elapsed_seconds=10,
+        )
+        self.assertEqual(d.action, "continue")
+
+    def test_time_budget_can_be_disabled(self):
+        policy = ControlPolicy.from_settings(
+            {"solver": {"time_budget_seconds": 0}}, "easy"
+        )
+        self.assertEqual(policy.time_budget_seconds, 0.0)
+        d = policy.decide(
+            round_num=5, last_progress_round=5, lane="fast",
+            elapsed_seconds=10_000,
+        )
+        self.assertEqual(d.action, "continue")
+
+    def test_time_budget_explicit_override(self):
+        policy = ControlPolicy.from_settings(
+            {"solver": {"time_budget_seconds": 42}}, "hard"
+        )
+        self.assertEqual(policy.time_budget_seconds, 42)
+
+    def test_soft_time_warning_point(self):
+        policy = ControlPolicy.from_settings({"solver": {}}, "medium")
+        # 默认 0.75 * 1200 = 900s。
+        self.assertEqual(policy.soft_time_warning_seconds(), 900)
+        disabled = ControlPolicy.from_settings(
+            {"solver": {"time_soft_warn_fraction": 0}}, "medium"
+        )
+        self.assertEqual(disabled.soft_time_warning_seconds(), 0.0)
+
+
+class ExploitReuseNoteTests(unittest.TestCase):
+    """skill_load 命中含 CVE 的 reference → 生成"回看逐字复制"提醒（对抗知识可达性丢失）。"""
+
+    def test_cve_reference_produces_reuse_note(self):
+        from solver.agent import SolverAgent
+        note = SolverAgent._exploit_reuse_note(
+            "skill_load",
+            {"name": "web", "resource": "product-playbooks.md"},
+            "... React2Shell CVE-2025-55182 ... payload ...",
+        )
+        self.assertIsNotNone(note)
+        self.assertIn("CVE-2025-55182", note)
+        self.assertIn("逐字复制", note)
+        self.assertIn("scanner", note)
+
+    def test_non_skill_load_or_no_cve_returns_none(self):
+        from solver.agent import SolverAgent
+        # 非 skill_load
+        self.assertIsNone(
+            SolverAgent._exploit_reuse_note("bash", {}, "CVE-2024-27348")
+        )
+        # 无 resource（只加载了入口 index，不钉）
+        self.assertIsNone(
+            SolverAgent._exploit_reuse_note("skill_load", {"name": "web"}, "CVE-2024-27348")
+        )
+        # 内容不含 CVE
+        self.assertIsNone(
+            SolverAgent._exploit_reuse_note(
+                "skill_load", {"name": "web", "resource": "sqli.md"}, "no cve here"
+            )
+        )
+
+    def test_multiple_cves_deduped_and_capped(self):
+        from solver.agent import SolverAgent
+        result = ("CVE-2024-27348 CVE-2024-27348 CVE-2025-1001 CVE-2025-1002 "
+                  "CVE-2025-1003 CVE-2025-1004 CVE-2025-1005")
+        note = SolverAgent._exploit_reuse_note(
+            "skill_load", {"name": "web", "resource": "graph-db.md"}, result
+        )
+        self.assertIsNotNone(note)
+        # 去重后首个只出现一次，且最多列 4 个 + 省略号
+        self.assertEqual(note.count("CVE-2024-27348"), 1)
+        self.assertIn("…", note)
+
 
 class DifficultyMaxRoundsTests(unittest.TestCase):
     """P0: max_rounds 按难度分级"""
@@ -215,6 +321,24 @@ class DifficultyMaxRoundsTests(unittest.TestCase):
             "easy 题默认不查看提示",
             agent._tool_gate("challenge_get_hint", {}),
         )
+        # easy 早期禁止 security_search
+        agent.round = 5
+        agent._last_discovery_round = 5
+        self.assertIn(
+            "security_search",
+            agent._tool_gate("security_search", {"query": "x"}),
+        )
+
+    @patch("solver.agent.ObserverLoop")
+    @patch("solver.agent.OpenAI")
+    @patch("solver.agent.search_tool")
+    def test_c_medium_starts_fast_lane(self, mock_search, mock_openai, mock_observer):
+        from solver.agent import SolverAgent
+        task = "# CTF 题目：c-08\n- 难度：medium\n- 目标地址：http://10.0.1.1"
+        settings = {"llm": {"base_url": "http://x", "api_key": "k"}}
+        agent = SolverAgent(task=task, settings=settings, skills_dir="/skills")
+        self.assertEqual(agent._lane, "fast")
+        self.assertGreater(agent.max_rounds, 70)  # c-type extra budget
 
     @patch("solver.agent.ObserverLoop")
     @patch("solver.agent.OpenAI")
@@ -574,10 +698,49 @@ class AutoExtractTests(unittest.TestCase):
         self.assertIn("flag{test_flag_123}", result)
         self.assertIn("发现疑似 flag", result)
 
+    def test_css_is_not_flagged_as_flag(self):
+        # run c-03 回归：404 页里的 CSS body{...}/h1{...} 不能被误报成 flag
+        from solver.tools.bash_tool import _auto_extract
+        css = "body{color:#000;background:#fff;margin:0}h1{border-right:1px solid #000}"
+        result = _auto_extract(css)
+        self.assertNotIn("发现疑似 flag", result)
+
+    def test_ctf_prefix_flag_still_detected(self):
+        from solver.tools.bash_tool import _auto_extract
+        result = _auto_extract("here is CTF{abcd_efgh}")
+        self.assertIn("发现疑似 flag", result)
+
     def test_extracts_credentials(self):
         from solver.tools.bash_tool import _auto_extract
         result = _auto_extract('DB_PASS="config_password = s3cret123"\ntoken=abc')
         self.assertIn("凭据", result)
+
+    def test_passwd_status_scan_is_not_credential(self):
+        # b-02 回归：路径探测把 /etc/passwd: 200 误报成凭据 ['200']
+        from solver.tools.bash_tool import _auto_extract
+        scan = (
+            "### OA .git & common files ###\n"
+            "/.git/HEAD: 200 len=153 | <html>\n"
+            "/etc/passwd: 200 len=153 | <html>\n"
+            "/.git/HEAD/../../etc/passwd: 200 len=153\n"
+            "/.GIT/HEAD: 403 len=153\n"
+        )
+        result = _auto_extract(scan)
+        self.assertNotIn("凭据", result)
+        self.assertNotIn("['200']", result)
+        self.assertNotIn("发现疑似凭据", result)
+
+    def test_mid_dump_credentials_survive_full_extract(self):
+        from solver.tools.bash_tool import _auto_extract
+        mid = ("noise\n" * 400) + "mysql_password=KeepMeAlive42\n" + ("tail\n" * 400)
+        result = _auto_extract(mid)
+        self.assertIn("KeepMeAlive42", result)
+        self.assertIn("凭据", result)
+
+    def test_http_status_token_value_rejected(self):
+        from solver.tools.bash_tool import _auto_extract
+        result = _auto_extract("auth token: 401\nsecret: 403")
+        self.assertNotIn("凭据", result)
 
     def test_extracts_internal_ip(self):
         from solver.tools.bash_tool import _auto_extract
@@ -590,6 +753,43 @@ class AutoExtractTests(unittest.TestCase):
         result = _auto_extract("Server: GeoServer 2.23.1")
         self.assertIn("geoserver", result)
         self.assertIn("CVE", result)
+
+    def test_cve_hint_deduped_within_attempt(self):
+        import json
+        from pathlib import Path
+        from solver.tools import knowledge_router
+        from solver.tools.bash_tool import _auto_extract
+        from solver.worker_context import RunContext, ctx
+
+        tmp = tempfile.mkdtemp(prefix="cve-dedup-")
+        Path(tmp).joinpath("cve-cheatsheet.json").write_text(
+            json.dumps({
+                "middleware": {
+                    "GeoServer": {
+                        "cves": ["CVE-2024-36401"],
+                        "match": {"body_any": ["geoserver"]},
+                    }
+                }
+            }),
+            encoding="utf-8",
+        )
+        old = os.environ.get("CTF_SKILLS_DIR")
+        os.environ["CTF_SKILLS_DIR"] = tmp
+        knowledge_router._CACHE = None
+        try:
+            base = tempfile.mkdtemp(prefix="cve-dedup-ws-")
+            context = RunContext.create(base, "case", target_url="http://10.0.1.1:80")
+            with ctx.bind(context):
+                first = _auto_extract("Server: GeoServer 2.23.1")
+                second = _auto_extract("Server: GeoServer 2.23.1 again")
+            self.assertIn("本地利用条目", first)
+            self.assertNotIn("本地利用条目", second)
+        finally:
+            knowledge_router._CACHE = None
+            if old is None:
+                os.environ.pop("CTF_SKILLS_DIR", None)
+            else:
+                os.environ["CTF_SKILLS_DIR"] = old
 
     def test_no_findings_returns_empty(self):
         from solver.tools.bash_tool import _auto_extract
@@ -635,6 +835,36 @@ class AutoExtractTests(unittest.TestCase):
 
         self.assertEqual(agent._phase, "INITIAL_ACCESS")
         self.assertEqual(agent._found_internal_ips, set())
+
+
+class RotatedHostMemoryTests(unittest.TestCase):
+    def test_marks_same_subnet_old_ip(self):
+        from solver.tools.memory_tools import _rotated_host_note
+
+        note = _rotated_host_note(
+            "端口 10.0.169.98:7860 是 FastAPI/uvicorn",
+            "10.0.169.97",
+        )
+        self.assertIn("疑似旧实例", note)
+        self.assertIn("10.0.169.97", note)
+        self.assertIn("10.0.169.98", note)
+
+    def test_same_ip_is_not_stale(self):
+        from solver.tools.memory_tools import _rotated_host_note
+
+        self.assertEqual(
+            _rotated_host_note("目标 10.0.169.97:7860 TCP open", "10.0.169.97"),
+            "",
+        )
+
+    def test_other_subnet_not_flagged(self):
+        # 横向移动记录的内网 IP 不应被当成实例轮换
+        from solver.tools.memory_tools import _rotated_host_note
+
+        self.assertEqual(
+            _rotated_host_note("内网可达 172.18.0.5:22", "10.0.169.97"),
+            "",
+        )
 
 
 if __name__ == "__main__":

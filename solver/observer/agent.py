@@ -7,6 +7,7 @@ from openai import OpenAI
 from solver.observer.tools import (
     build_tool_registry,
 )
+from solver.runtime.model_router import ModelRouter, ModelPurpose
 from solver.runtime.llm import assistant_message_dict, completion_kwargs, create_with_retry
 from solver.runtime.claims import ClaimStore
 from solver.runtime.scoped_state import observer_ideas, observer_memories, list_memory_proposals
@@ -16,6 +17,10 @@ from solver.worker_context import ctx as _ctx
 
 OBSERVER_SYSTEM_PROMPT = """你是 CTF 解题 Agent 的 Observer（旁路审查员）。
 
+## 默认姿态（极重要）
+默认输出 `NO_CHANGE`。长推理与 skill_chain/playbook 推进期间，你的纠偏通常是干扰而非帮助。
+优先做 Memory 卫生（合并重复、删除过时 note/failure）；不要发明新攻击方向去打断 Solver。
+
 ## 职责边界
 你只审查当前题目各 Solver attempt 的工具行为，维护当前题目的共享 Memory/Ideas，并在确有必要时发送一条方向性纠偏。Solver 的私有记忆默认不可直接注入其他 Solver；只有验证通过的 evidence proposal 才能 promote 到共享层。
 你不执行目标请求、不提交 flag、不编造工具名，也不替 Solver 做未经验证的技术判断。
@@ -24,30 +29,33 @@ memory_add、memory_list、memory_promote、artifact_list、artifact_approve、c
 challenge_get_hint；不要提及 restart 或其它不存在的接口。
 
 ## 单一审查循环
-1. 先使用用户消息中的 Memory/Ideas、决策控制状态与最近行为摘要；决策状态中的重复计数和版本号优先于你的主观估计，只有存在无法解释的具体矛盾时才读 history。
+1. 先使用用户消息中的 Memory/Ideas、决策控制状态与最近行为摘要；决策状态中的重复计数和版本号优先于你的主观估计。默认不要读 history；截断后的 history 不可信，禁止据此 memory_add 或纠偏。
 2. 以当前运行的实测证据为准。evidence（凭据/有效 flag）不可删除；合并重复的 fact/failure，
    删除已经被新证据替代或明显过时的记录。不要把旧实例 IP、旧凭据、题号经验或历史攻击链当作答案。
 3. 检查已有 idea 是否应更新为 testing/verified/failed。一次 payload 失败只记录边界，不要轻易关闭整条路线。
-4. 只有确认当前 attempt 遗忘了与主线直接相关的已验证事实，或同一请求/方向重复且无新证据，才纠偏。不要因为另一个 attempt 的私有路线不同就强行覆盖当前 Solver。
-5. 没有明确改动时返回 NO_CHANGE；需要纠偏时必须调用 `send_correction`，填写当前 `state_version`、动作、模式、优先级和失效轮数。message 保持 1--3 句话，说明已尝试方向、证据边界和一个新的大方向，
+4. 只有决策控制状态显示明显空转（same_action_streak / same_vector_streak 很高），且确认遗忘了已验证主线事实时，才纠偏。skill_chain 未闭合时禁止纠偏。不要因为另一个 attempt 的私有路线不同就强行覆盖当前 Solver。
+5. 没有明确改动时返回 NO_CHANGE；需要纠偏时必须调用 `send_correction`，填写当前 `state_version`、动作、模式、优先级和失效轮数。message 保持 1--3 句话，说明已尝试边界和一个大方向，
    不给未经验证的具体 payload、固定路径或凭据。
 
+## Memory 写入门
+- 禁止把截断历史、工具 dump、playbook 长文写入 Memory。
+- memory_add 只接受短而可验证的 evidence/fact；不确定就 NO_CHANGE。
+- 看板里标注「不可信/污染」的条目优先 memory_delete，不要据此纠偏。
+
 ## 触发与安全门
-- 同一请求结构反复超过 3 次、同一攻击向量约 8--10 轮没有新证据，或目标明确不可达仍在盲扫：建议切换方向。
-- 看到“可能未利用情报”时，先排除旧地址、已完成步骤和无关关键词；只有当前主线确实需要才提醒。
-- 多 Flag 题：确认 Solver 查询剩余数量并继续下一阶段；不要每次都强制全盘 find、sudo 或内网扫描，
-  只建议与已确认权限/拓扑相关的下一步。
-- 只有工具输出中出现完整的 `XXX{...}` 才算 flag；标题、注释、示例、脚本字符串或自动提取提示不算证据。
-- 不主动建议提前看 hint；是否看 hint 由 Solver 的代码门控决定，提示后的结果必须再次验证。
-- 验证码、二进制、Webshell 等专项只做“减少重复、切换方法、验证结果”的方向性提醒，不替 Solver 猜技术细节。
+- 同一请求结构反复且决策面 streak 已高、或目标明确不可达仍在盲扫：才建议切换方向。
+- 看到“可能未利用情报”时，先排除旧地址、已完成步骤和无关关键词；多数情况忽略。
+- 多 Flag 题：确认 Solver 查询剩余数量并继续下一阶段；不要每次都强制全盘 find、sudo 或内网扫描。
+- 只有工具输出中出现完整的 `XXX{...}` 才算 flag。
+- 不主动建议提前看 hint。
+- 验证码、二进制、Webshell 等专项只做“减少重复”的方向性提醒，不替 Solver 猜技术细节。
 
 ## 合规
 本提示不包含任何题目的历史答案、固定目标地址、固定凭据或可直接复用的历史攻击链。
 观察到当前题已完成或平台返回终止状态时，不再发新的探索指令。
 
 ## 输出
-无需改动时只回复 `NO_CHANGE`；有改动时用 1--3 句话说明更新或纠偏内容。"""
-
+默认只回复 `NO_CHANGE`；确有卫生改动或（且仅当空转已证实）纠偏时用 1--3 句话说明。"""
 
 def _excerpt(text: str, limit: int) -> str:
     text = str(text or "")
@@ -59,8 +67,16 @@ def _excerpt(text: str, limit: int) -> str:
 
 
 def _build_observer_prompt(
-    recent_rounds: list[dict], challenge_dir: Path, attempt_dir: Path | None = None
+    recent_rounds: list[dict],
+    challenge_dir: Path,
+    attempt_dir: Path | None = None,
+    *,
+    observer_mode: str = "advisory",
+    skill_chain_open: bool = False,
 ) -> str:
+    from solver.runtime.observer_policy import is_untrusted_memory, normalize_observer_mode
+
+    mode = normalize_observer_mode(observer_mode)
     memories = observer_memories(challenge_dir)[-12:]
     ideas = observer_ideas(challenge_dir)[-8:]
     proposals = list_memory_proposals(challenge_dir)
@@ -68,6 +84,15 @@ def _build_observer_prompt(
     approved_artifacts = __import__("solver.runtime.artifacts", fromlist=["ArtifactBus"]).ArtifactBus(challenge_dir).list(status="approved", limit=20)
 
     lines = ["## 当前看板状态"]
+    lines.append(
+        f"### Observer 模式\n- mode={mode}"
+        f", skill_chain_open={bool(skill_chain_open)}"
+        "；advisory 下默认 NO_CHANGE，禁止依据截断 history 写入 Memory 或纠偏。"
+    )
+    if skill_chain_open:
+        lines.append(
+            "- ⚠️ skill_chain 未闭合：只做 Memory 卫生，禁止 send_correction。"
+        )
 
     # The deterministic control plane is the source of truth for repetition
     # and strategy mode.  Observer may advise, but must not infer these fields
@@ -96,7 +121,8 @@ def _build_observer_prompt(
             lines.append(f"\n⚠️ **Memory 超限**：非 evidence 条目已达 {len(non_evidence)} 条（上限 10）。"
                          f"请先合并同类项或删除过时条目，再做其他工作。\n")
         for m in memories:
-            lines.append(f"- [{m.kind}] {m.id}: {_excerpt(m.content, 700)}")
+            tag = " [不可信/污染]" if is_untrusted_memory(m.content) else ""
+            lines.append(f"- [{m.kind}]{tag} {m.id}: {_excerpt(m.content, 700)}")
     else:
         lines.append("### Memory（空）")
 
@@ -217,7 +243,8 @@ def _build_observer_prompt(
                     "unused_keywords": keywords,
                 })
 
-        if unused_intel:
+        # advisory 下「未利用情报」极易诱发伪纠偏，默认不注入。
+        if unused_intel and mode == "full":
             lines.append("\n## 可能未利用的情报（仅表示最近审查窗口未命中）")
             for item in unused_intel[:3]:
                 keys_str = ", ".join(item["unused_keywords"][:5])
@@ -226,7 +253,13 @@ def _build_observer_prompt(
             lines.append("")
             lines.append("先排除旧地址、已完成步骤和无关信息；只有确认遗忘时才 send_correction。")
 
-    lines.append("\n请审查以上信息，按 Core Loop 执行。")
+    if mode == "advisory":
+        lines.append(
+            "\n请优先 Memory 卫生；默认 NO_CHANGE。"
+            "仅当决策面 streak 已高且无 skill_chain 压力时才 send_correction。"
+        )
+    else:
+        lines.append("\n请审查以上信息，按 Core Loop 执行。")
     return "\n".join(lines)
 
 
@@ -237,21 +270,32 @@ def _emit(event_type: str, data=None) -> None:
 class ObserverAgent:
     def __init__(self, settings: dict):
         llm_cfg = settings.get("llm", {})
-        self.client = OpenAI(
-            base_url=llm_cfg.get("base_url") or os.environ.get("LLM_BASE_URL", ""),
-            api_key=llm_cfg.get("api_key") or os.environ.get("LLM_API_KEY", ""),
-            timeout=__import__("httpx").Timeout(60.0, connect=10.0),
+        # Observer 统一走 ModelRouter 的 observer_tier 选模型/provider，
+        # 不再自行硬绑 client。thinking 仍由 observer_thinking_enabled 控制
+        # （控制面不烧推理预算）。
+        self._router = ModelRouter.from_settings(
+            settings,
+            timeout_factory=lambda: __import__("httpx").Timeout(60.0, connect=10.0),
         )
+        self.client: OpenAI | None = None
         self.model = llm_cfg.get("observer_model") or llm_cfg.get("default_model") or os.environ.get("LLM_MODEL", "deepseek-v4-flash")
-        self._reasoning_effort = llm_cfg.get("observer_reasoning_effort", "high")
+        self._reasoning_effort = llm_cfg.get("observer_reasoning_effort", "medium")
         self._thinking_enabled = bool(llm_cfg.get("observer_thinking_enabled", False))
         self._max_output_tokens = int(llm_cfg.get("observer_max_output_tokens", 8192))
         self._max_react_rounds = int(llm_cfg.get("observer_max_react_rounds", 2))
 
     def review(self, recent_rounds: list[dict], challenge_dir: Path,
                attempt_dir: Path | None = None,
-               on_correction: callable = None) -> str:
-        user_prompt = _build_observer_prompt(recent_rounds, challenge_dir, attempt_dir)
+               on_correction: callable = None,
+               observer_mode: str = "advisory",
+               skill_chain_open: bool = False) -> str:
+        user_prompt = _build_observer_prompt(
+            recent_rounds,
+            challenge_dir,
+            attempt_dir,
+            observer_mode=observer_mode,
+            skill_chain_open=skill_chain_open,
+        )
 
         tool_registry = build_tool_registry(
             lambda args: _handle_correction(
@@ -267,6 +311,12 @@ class ObserverAgent:
             {"role": "system", "content": OBSERVER_SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ]
+
+        # Observer 走 router 的 observer_tier 选模型/provider；thinking 仍用
+        # observer_thinking_enabled（控制面不烧推理预算）。
+        selection = self._router.resolve(ModelPurpose.OBSERVER)
+        self.model = selection.spec.name
+        self.client = self._router.client_for(selection.spec)
 
         # Observer 是控制面，不应消耗接近 Solver 的推理预算。
         for _ in range(self._max_react_rounds):

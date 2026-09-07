@@ -104,6 +104,38 @@ class RetryLedger:
                 pass
             return state
 
+    def mark_abandoned(
+        self,
+        codes: set[str] | list[str],
+        *,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Permanently skip codes for this benchmark task (e.g. late-game long/hard cut)."""
+        normalized = {str(code).strip() for code in (codes or []) if str(code).strip()}
+        if not normalized:
+            return self.snapshot()
+        with self._locked():
+            state = self._scope_task(self._load())
+            abandoned = set(state.setdefault("abandoned", []))
+            abandoned.update(normalized)
+            state["abandoned"] = sorted(abandoned)
+            for code in normalized:
+                state.setdefault("fail_streak", {}).pop(code, None)
+                if reason:
+                    state.setdefault("abandon_reasons", {})[code] = reason
+            state["updated_at"] = time.time()
+            self._write(state)
+            try:
+                from solver.runtime.state_events import StateEventLog
+                StateEventLog(self.workspace_dir).append(
+                    "scheduler_mark_abandoned",
+                    {"codes": sorted(normalized), "reason": reason},
+                    run_id=self.task_id,
+                )
+            except Exception:
+                pass
+            return state
+
     def should_skip(self, code: str, *, round_num: int) -> bool:
         state = self.snapshot()
         if code in set(state.get("abandoned", [])):

@@ -46,9 +46,9 @@ ENV PYTHONPATH=/opt/ctf-agent
 
 # LLM 网关配置（走 *.tsecbench.gw 时由 apply_llm_gateway 把 host 改写为
 # <host>.tsecbench.gw，key 由网关透传）。
-ENV LLM_BASE_URL=https://api.deepseek.com/v1 \
+ENV LLM_BASE_URL=https://tokenhub.tencentmaas.com/v1 \
     LLM_API_KEY=YOUR_LLM_API_KEY \
-    LLM_MODEL=deepseek-v4-flash \
+    LLM_MODEL=deepseek-v4-flash-0731 \
     LLM_GATEWAY=1
 
 # 阿里云 apt 源（arm64 构建时传入 --build-arg APT_MIRROR=http://ports.ubuntu.com/ubuntu-ports/）
@@ -96,6 +96,11 @@ COPY solver/ /opt/ctf-agent/solver/
 COPY shared/ /opt/ctf-agent/shared/
 COPY prompts/ /opt/ctf-agent/prompts/
 COPY skills/ /opt/ctf-agent/skills/
+
+# 模板配置（无真实 key；key 由平台环境变量注入）。
+# settings.local.json 被 .gitignore 排除，绝不会打入镜像。
+RUN mkdir -p /workspace
+COPY settings.json /workspace/settings.json
 
 # Skills 快捷链接（prompt 里用 /skills/xxx 引用）
 RUN ln -sf /opt/ctf-agent/skills /skills

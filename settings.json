@@ -1,17 +1,56 @@
 {
   "llm": {
-    "base_url": "https://api.deepseek.com/v1",
-    "api_key": "",
-    "default_model": "deepseek-v4-flash",
+    "base_url": "https://tokenhub.tencentmaas.com/v1",
+    "api_key": "sk-0RpIFAcmhuYIIdLKhePbHUVJ3Xy2Dgzd9ijSU7DqojoTBEog",
+    "default_model": "deepseek-v4-flash-0731",
     "pro_model": "deepseek-v4-pro",
-    "observer_model": "deepseek-v4-flash",
-    "reasoning_effort": "high",
+    "fallback_models": [
+      "glm-5.3-flash"
+    ],
+    "observer_model": "deepseek-v4-flash-0731",
+    "reasoning_effort": "medium",
+    "reasoning_effort_cap": "medium",
     "max_output_tokens": 8192,
     "summary_max_output_tokens": 8192,
     "observer_thinking_enabled": false,
-    "observer_reasoning_effort": "high",
+    "observer_reasoning_effort": "medium",
     "observer_max_output_tokens": 8192,
-    "observer_max_react_rounds": 2
+    "observer_max_react_rounds": 2,
+    "providers": {
+      "tokenhub": {
+        "base_url": "https://tokenhub.tencentmaas.com/v1",
+        "api_key": ""
+      },
+      "deepseek": {
+        "base_url": "https://api.deepseek.com/v1",
+        "api_key": ""
+      }
+    },
+    "tiers": {
+      "light": {
+        "model": "deepseek-v4-flash-0731",
+        "provider": "tokenhub",
+        "reasoning_effort": "medium"
+      },
+      "heavy": {
+        "model": "deepseek-v4-pro",
+        "provider": "tokenhub",
+        "reasoning_effort": "high"
+      }
+    },
+    "routing": {
+      "summary_tier": "light",
+      "observer_tier": "light",
+      "fast_lane_tier": "light",
+      "deep_lane_default_tier": "light",
+      "hard_tier": "light",
+      "stuck_escalate_tier": "light",
+      "escalate_rounds": 0,
+      "escalate_max_consecutive": 12,
+      "stuck_no_progress_rounds": 8,
+      "stuck_wrong_submit_streak": 2,
+      "stuck_repeat_action_streak": 4
+    }
   },
   "docker": {
     "image_name": "eva-mimir-solver",
@@ -20,8 +59,18 @@
   },
   "solver": {
     "max_rounds": null,
-    "pro_enabled": true,
+    "max_lanes": null,
+    "time_budget_seconds": null,
+    "time_soft_warn_fraction": 0.75,
+    "pro_enabled": false,
+    "hard_competing_hypotheses": false,
+    "lastmile_codes": [
+      "a-03",
+      "f2-05",
+      "b-02"
+    ],
     "allow_easy_hint": false,
+    "observer_mode": "advisory",
     "observer_correction_max_lag": 3,
     "memory_limit": 10,
     "idea_limit": 8,
@@ -30,6 +79,20 @@
       "action_repeat_threshold": 4,
       "vector_repeat_threshold": 4,
       "inject_switch_for_easy": false
+    },
+    "benchmark_minutes": 360,
+    "salvage": {
+      "benchmark_minutes": 360,
+      "salvage_remaining_min": 140,
+      "critical_remaining_min": 72,
+      "final_remaining_min": 36,
+      "min_retry_round": 2
     }
+  },
+  "rsi": {
+    "enabled": true,
+    "auto_analyze": true,
+    "packs_file": "config/regression_codes.json",
+    "local_timeout_minutes": 120
   }
 }

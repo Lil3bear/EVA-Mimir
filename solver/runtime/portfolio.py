@@ -103,13 +103,26 @@ class PortfolioBudget:
             }
 
 
-# medium 也开启双策略，提高解出概率。
-_MULTI_SOLVE_PREFIXES = {"f1", "c", "e2"}
 # 多阶段渗透（b-、e1-）：多 agent 共享 memory 协作推进各阶段。
 _COLLAB_PREFIXES = {"b", "e1"}
-# 前排 web/misc 家族：简单题也开并行多解（隔离 memory，独立赛跑抢分）。
-# 通用/未知码不在此列，保持 solo 安全默认，避免对琐碎题翻倍 LLM 成本。
-_FRONT_WEB_PREFIXES = ("a-", "c-", "g-", "d-")
+
+# 单 flag 的「产品 Web / 云应用 / 对抗」题：一条 playbook 打穿，开
+# foothold/lateral/source 只会放大方差并抢 lane（a-13/a-18/c-02 教训）。
+_SINGLE_CHAIN_HARD_PREFIXES = {"a", "c", "d", "e2", "e3", "f1", "f2"}
+
+
+def _is_single_chain_hard(challenge) -> bool:
+    """True when hard but one exploit chain — prefer solo + skills over portfolio."""
+    diff = (challenge.difficulty or "").lower()
+    if diff not in ("hard", "difficult"):
+        return False
+    if int(getattr(challenge, "flag_count", 1) or 1) > 1:
+        return False
+    code = (challenge.unique_code or "").lower()
+    prefix = code.split("-")[0] if "-" in code else code[:2]
+    if prefix in _COLLAB_PREFIXES:
+        return False
+    return prefix in _SINGLE_CHAIN_HARD_PREFIXES or prefix.startswith("f")
 
 _AGGRESSIVE = AttemptSpec(
     "aggressive",
@@ -181,16 +194,26 @@ _HARD_SOURCE = AttemptSpec(
 _COMPETING_HYPOTHESES = (_HARD_FOOTHOLD, _HARD_LATERAL, _HARD_SOURCE)
 
 
-def challenge_plan(challenge) -> tuple[tuple[AttemptSpec, ...], str]:
+def challenge_plan(
+    challenge,
+    settings: dict | None = None,
+) -> tuple[tuple[AttemptSpec, ...], str]:
     """Return ``(attempts, memory_scope)`` for one challenge.
 
-    * multi-stage pentest (b-/e1-, ≥ 2 flags)  -> two agents, ``shared`` memory
-      so a fact one agent proves is instantly reusable by the other across
-      stages (jump host -> lateral move -> next flag);
-    * every other web/misc challenge          -> two racing strategies with
-      ``isolated`` memory, so they explore independently and the fastest wins
-      without polluting each other;
-    * attachment-only / unknown targets       -> a single solo agent.
+    并发是稀缺资源（同时运行的 solver 线程数受 LaneBudget 卡在 ≤ LLM 槽位），
+    所以只在"多路真正能提高解出概率"时才申请多路，把额外 lane 让给难题：
+
+    * 多阶段渗透 (b-/e1-, ≥ 2 flags) -> 两个 agent 共享 ``shared`` memory，
+      一个 agent 证明的事实（跳板机 / 横向凭据）立即被另一个复用；
+    * hard 单链产品题 (a-/c-/d-/e2-/e3-/f* 且 flag_count≤1) -> **单 agent**，
+      把预算交给 skill_chain + playbook，不开 foothold/lateral/source
+      （并行假设对 JWT/pydash/Comfy 单链题是方差放大器）；
+    * 其余 hard（多 flag 或未知家族）-> 竞争假设（foothold/lateral/source），
+      private memory，证据经 artifact/promote 受控共享；
+    * 多 flag 题（≥4 flag，非 b/e1）-> 两个隔离策略赛跑，值得翻倍；
+    * 其余 web/misc 单 flag 简单题、附件分析、未知码 -> **单 agent**。
+      简单题单路 30s 内就解，双路只翻倍 LLM 成本并抢占难题的 lane，得不偿失
+      （run-12752：难题尾段被拥挤的 pro solver 互相饿死）。
     """
     code = (challenge.unique_code or "").lower()
     prefix = code.split("-")[0] if "-" in code else code[:2]
@@ -198,34 +221,43 @@ def challenge_plan(challenge) -> tuple[tuple[AttemptSpec, ...], str]:
     hard = diff in ("hard", "difficult")
     multi_flag = challenge.flag_count >= 4
 
+    if bool((settings or {}).get("solver", {}).get("late_game_mode")):
+        # 尾段抢分：一律单 agent，避免多路占 slot；b-* 有部分进展时保留 shared memory。
+        if prefix in _COLLAB_PREFIXES and challenge.correct_flag_count > 0:
+            return (_SOLO, "shared")
+        return (_SOLO, "private")
+
     # 多阶段渗透 / 多 flag pentest：多 agent 协作，共享 memory。
     if prefix in _COLLAB_PREFIXES and (
         multi_flag or hard or challenge.flag_count >= 2
     ):
         return (_TWO_STRATEGY, "shared")
 
-    # hard/瓶颈题：竞争假设（agent-team 式），三个正交假设并行攻坚，
-    # 用 pro 模型稳定深度。memory 私有隔离，结构化证据经 artifact/
-    # memory_promote 受控共享；claim 互斥、谁先解出谁赢。
+    # hard 单链：单 agent + skills（默认）。opt-in 才开竞争假设。
+    if hard and _is_single_chain_hard(challenge):
+        force_compete = bool(
+            (settings or {}).get("solver", {}).get("hard_competing_hypotheses", False)
+        )
+        if force_compete:
+            return (_COMPETING_HYPOTHESES, "private")
+        return (_SOLO, "private")
+
+    # 其余 hard（多 flag / 未知家族）：竞争假设；pro 是否启用看 solver.pro_enabled。
     if hard:
         return (_COMPETING_HYPOTHESES, "private")
 
-    # 多 flag（非 b/e1）和弱中题：隔离双策略赛跑。
-    weak_medium = prefix in _MULTI_SOLVE_PREFIXES and diff == "medium"
-    if multi_flag or weak_medium:
+    # 多 flag（非 b/e1）：隔离双策略赛跑，翻倍成本换更高的多阶段解出率。
+    if multi_flag:
         return (_TWO_STRATEGY, "isolated")
 
-    # 前排 web/misc 简单题（a-/c-/g-/d-）：并行多解，memory 完全隔离。
-    if code.startswith(_FRONT_WEB_PREFIXES) and diff in ("easy", "medium"):
-        return (_TWO_STRATEGY, "isolated")
-
-    # 其余（附件分析 / 未知 / 通用码）：单 agent。
+    # 其余（前排 web/misc 单 flag 简单题 / 附件分析 / 未知码）：单 agent，
+    # 把并发 lane 留给真正需要深度的难题。
     return (_SOLO, "private")
 
 
-def build_portfolio(challenge) -> tuple[AttemptSpec, ...]:
-    return challenge_plan(challenge)[0]
+def build_portfolio(challenge, settings: dict | None = None) -> tuple[AttemptSpec, ...]:
+    return challenge_plan(challenge, settings=settings)[0]
 
 
-def challenge_memory_scope(challenge) -> str:
-    return challenge_plan(challenge)[1]
+def challenge_memory_scope(challenge, settings: dict | None = None) -> str:
+    return challenge_plan(challenge, settings=settings)[1]

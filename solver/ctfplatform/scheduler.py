@@ -22,6 +22,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from solver.runtime.salvage import (
+    filter_challenges_for_phase,
+    salvage_task_banner,
+    sort_challenges_salvage,
+)
 from solver.ctfplatform.policy import sort_challenges as _sort_challenges
 from solver.ctfplatform.scoreboard import Scoreboard
 from solver.ctfplatform.task_builder import (
@@ -46,6 +51,8 @@ from solver.runtime.submission_store import (
     score_belongs_to_current_task,
 )
 from solver.worker_context import RunContext, ctx as _ctx
+from solver.runtime.lane_budget import LaneBudget
+from solver.runtime.llm import llm_concurrency_limit
 from solver.runtime.portfolio import (
     PortfolioBudget,
     build_portfolio,
@@ -61,6 +68,27 @@ _START_RETRY_INTERVAL = 5  # 秒；指数退避后封顶 60 秒
 # close_challenge 失败后的重试参数
 _CLOSE_RETRY_MAX = 3
 _CLOSE_RETRY_INTERVAL = 5  # 秒
+
+# agent.run() 因 LLM 网关抖动失败后的重试参数（避免 retry round rounds=0 白给）
+_AGENT_RUN_RETRY_MAX = 3
+_AGENT_RUN_RETRY_BASE = 8.0  # 秒
+
+
+def pro_model_allowed(solver_cfg: dict, spec_model: str) -> bool:
+    """Whether a portfolio attempt may switch to llm.pro_model.
+
+    * ``false`` / ``0`` — never use pro (even for hard competing hypotheses).
+    * ``true`` / ``hard_only`` — only when ``spec_model == "pro"`` (hard 竞争假设).
+    """
+    if str(spec_model or "").strip() != "pro":
+        return False
+    raw = solver_cfg.get("pro_enabled", "hard_only")
+    if isinstance(raw, bool):
+        return raw
+    token = str(raw).strip().lower()
+    if token in {"0", "false", "no", "off"}:
+        return False
+    return True
 
 
 @dataclass
@@ -125,6 +153,72 @@ def _retry_delay(base: float, attempt: int, *, cap: float = 60.0) -> float:
         return 0.0
     delay = min(float(cap), base * (2 ** max(0, attempt - 1)))
     return delay * random.uniform(0.85, 1.15)
+
+
+def _is_transient_llm_error(exc: BaseException) -> bool:
+    """True when re-running the agent may succeed without changing strategy."""
+    try:
+        from openai import (
+            APIConnectionError,
+            APITimeoutError,
+            InternalServerError,
+            RateLimitError,
+        )
+    except ImportError:
+        APIConnectionError = APITimeoutError = InternalServerError = RateLimitError = ()  # type: ignore
+
+    if isinstance(
+        exc,
+        (APIConnectionError, APITimeoutError, InternalServerError, RateLimitError),
+    ):
+        return True
+    text = str(exc).lower()
+    name = type(exc).__name__.lower()
+    if "apiconnectionerror" in name or "connection error" in text:
+        return True
+    if "timeout" in text and any(token in text for token in ("read", "connect", "timed out")):
+        return True
+    if any(token in text for token in ("rate limit", "too many requests", "429", "502", "503")):
+        return True
+    if any(token in text for token in ("超时", "连接失败", "连接错误", "连接超时")):
+        return True
+    return False
+
+
+def _run_agent_with_retry(
+    agent_factory,
+    *,
+    unique_code: str,
+    deadline: float,
+) -> tuple[Any, int]:
+    """Run one solver attempt; rebuild the agent between transient LLM failures."""
+    last_exc: BaseException | None = None
+    last_rounds = 0
+    for attempt in range(1, _AGENT_RUN_RETRY_MAX + 1):
+        agent = agent_factory()
+        try:
+            agent.run()
+            return agent, int(getattr(agent, "round", 0) or 0)
+        except (TaskNotFound, InvalidState):
+            raise
+        except Exception as exc:
+            last_exc = exc
+            last_rounds = max(last_rounds, int(getattr(agent, "round", 0) or 0))
+            if not _is_transient_llm_error(exc) or attempt >= _AGENT_RUN_RETRY_MAX:
+                raise
+            wait = _retry_delay(_AGENT_RUN_RETRY_BASE, attempt)
+            _emit("agent_run_retry", {
+                "unique_code": unique_code,
+                "attempt": attempt,
+                "max_attempts": _AGENT_RUN_RETRY_MAX,
+                "error": str(exc)[:300],
+                "rounds_before_retry": last_rounds,
+                "wait": round(wait, 2),
+            })
+            _sleep_retry(wait, deadline)
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("agent run retry exhausted without exception")
 
 
 def _is_capacity_invalid_state(error: InvalidState) -> bool:
@@ -195,6 +289,7 @@ class Scheduler:
         prefix_filter: str | None = None,
         only_codes: set[str] | None = None,
         max_parallel: int = DEFAULT_MAX_PARALLEL,
+        max_lanes: int | None = None,
         agent_factory=None,
         start_retry_max: int = _START_RETRY_MAX,
         start_retry_interval: float = _START_RETRY_INTERVAL,
@@ -213,6 +308,14 @@ class Scheduler:
         # 平台最多同时运行 3 个容器；额外的 worker 只会制造
         # max-active 重试和 LLM 争抢，因此在调度器边界强制限幅。
         self.max_parallel = min(3, max(1, int(max_parallel)))
+        # 全局 lane 预算：把"同时运行的 solver 线程数"卡在 ≤ LLM 槽位数，
+        # 避免多题各自 spawn 2~3 个 solver 后在 LLM 信号量上互相排队拖慢。
+        # base = max_parallel（每个容器保底 1 路），extra = total - base
+        # （机会性分配给难题加深）。默认 total = LLM 并发上限。
+        self.lane_budget = LaneBudget(
+            total_lanes=self._resolve_total_lanes(max_lanes, settings),
+            base_lanes=self.max_parallel,
+        )
         self._agent_factory = agent_factory or _default_agent_factory
         self._active_codes: set[str] = set()
         self._active_lock = threading.Lock()
@@ -225,6 +328,71 @@ class Scheduler:
         self.deadline = float(deadline or 0.0)
         self._terminal_error: Exception | None = None
         self._abort_event = threading.Event()
+        self._todo_codes: list[str] = []
+
+    def _preflight_close_slots(self, codes: list[str]) -> None:
+        """Best-effort close before a batch run to free stale platform slots."""
+        closed: list[str] = []
+        for code in codes:
+            try:
+                result = self.client.close_challenge(code)
+                if hasattr(result, "closed") and not result.closed:
+                    continue
+                closed.append(code)
+                with self._active_lock:
+                    self._active_codes.discard(code)
+            except Exception:
+                continue
+        if closed:
+            _emit("scheduler_preflight_close", {"codes": closed, "count": len(closed)})
+
+    def _recover_platform_slots(self, current_code: str) -> None:
+        """Close stale containers from the current batch when start hits max-active."""
+        with self._active_lock:
+            stale = [
+                c for c in self._todo_codes
+                if c not in self._active_codes and c != current_code
+            ]
+        if stale:
+            self._preflight_close_slots(stale[:3])
+
+    def _resolve_total_lanes(self, max_lanes: int | None, settings: dict) -> int:
+        """Total concurrent solver lanes.
+
+        An explicit ``max_lanes`` (or ``solver.max_lanes`` / ``SOLVER_MAX_LANES``)
+        wins; otherwise default to the LLM concurrency so lanes never queue on
+        the LLM gate.  Always ``>= max_parallel`` so every container keeps a
+        guaranteed base lane.  When taken from config we also clamp to the LLM
+        limit for the same anti-queueing reason; an explicit constructor arg is
+        trusted as-is (used by tests / power users).
+        """
+        if max_lanes is not None:
+            return max(self.max_parallel, int(max_lanes))
+        configured = None
+        env_value = os.environ.get("SOLVER_MAX_LANES", "").strip()
+        if env_value:
+            try:
+                configured = int(env_value)
+            except ValueError:
+                configured = None
+        if configured is None:
+            solver_cfg = settings.get("solver", {}) if isinstance(settings, dict) else {}
+            raw = solver_cfg.get("max_lanes")
+            if raw is not None:
+                try:
+                    configured = int(raw)
+                except (TypeError, ValueError):
+                    configured = None
+        llm_limit = llm_concurrency_limit()
+        if configured is None:
+            configured = llm_limit
+        return max(self.max_parallel, min(int(configured), llm_limit))
+
+    def _lane_wait(self) -> float:
+        """Bounded wait for a base lane; never past the run deadline."""
+        if self.deadline:
+            return max(0.0, min(60.0, self.deadline - time.time()))
+        return 60.0
 
     def run_all(self) -> SchedulerReport:
         """主调度循环：VPN 检测 -> 列题 -> 并行攻破。"""
@@ -272,6 +440,27 @@ class Scheduler:
             "completed": sum(1 for c in all_challenges if c.is_completed),
         })
 
+        # 持久化 challenge.json（difficulty/category），供 RSI analyze 读取元数据。
+        # 此前 save_challenge_config 是死代码（无人调用），导致 analyze 拿不到难度。
+        try:
+            from shared.data.store import save_challenge_config
+            from shared.types import ChallengeConfig
+            ws = Path(self.workspace_dir)
+            for c in all_challenges:
+                save_challenge_config(
+                    ws,
+                    ChallengeConfig(
+                        id=c.unique_code,
+                        name=c.unique_code,
+                        category="",
+                        difficulty=c.difficulty,
+                        description=c.description or "",
+                        url="",
+                    ),
+                )
+        except Exception as exc:  # 元数据写入失败不影响解题
+            _emit("challenge_meta_persist_error", {"error": str(exc)})
+
         if self.skip_completed:
             todo = [c for c in all_challenges if not c.is_completed]
         else:
@@ -291,7 +480,40 @@ class Scheduler:
         if self.skip_codes:
             todo = [c for c in todo if c.unique_code not in self.skip_codes]
 
-        todo = _sort_challenges(todo)
+        solver_cfg = self.settings.get("solver") or {}
+        if bool(solver_cfg.get("salvage_only")):
+            focus = {
+                str(code).strip()
+                for code in (solver_cfg.get("salvage_focus_codes") or [])
+                if str(code).strip()
+            }
+            before = len(todo)
+            todo = filter_challenges_for_phase(
+                todo,
+                salvage_only=True,
+                salvage_focus=focus,
+            )
+            if before != len(todo):
+                _emit("salvage_only_filter", {
+                    "phase": solver_cfg.get("salvage_phase", "final"),
+                    "before": before,
+                    "after": len(todo),
+                    "focus": sorted(focus),
+                })
+
+        if bool(solver_cfg.get("late_game_mode")):
+            focus = {
+                str(code).strip()
+                for code in (self.settings.get("solver", {}).get("salvage_focus_codes") or [])
+                if str(code).strip()
+            }
+            todo = sort_challenges_salvage(
+                todo,
+                self.workspace_dir,
+                salvage_focus=focus,
+            )
+        else:
+            todo = _sort_challenges(todo)
         report.skipped = report.total_challenges - len(todo)
 
         # 注册所有待解题目到看板
@@ -304,6 +526,9 @@ class Scheduler:
         if _deadline_reached(self.deadline):
             _emit("scheduler_done", {"reason": "deadline_exceeded"})
             return report
+
+        self._todo_codes = [c.unique_code for c in todo]
+        self._preflight_close_slots(self._todo_codes)
 
         if self.max_parallel <= 1:
             results = self._run_sequential(todo)
@@ -420,10 +645,9 @@ class Scheduler:
 
         return results
 
-    @staticmethod
-    def _should_multi_solve(challenge) -> bool:
+    def _should_multi_solve(self, challenge) -> bool:
         """判断是否对该题启用 Multi-Solver（并行两个不同策略的 Solver）。"""
-        return len(build_portfolio(challenge)) > 1
+        return len(build_portfolio(challenge, self.settings)) > 1
 
     def _build_agent_task(
         self,
@@ -453,6 +677,19 @@ class Scheduler:
             attempt_context=attempt_context,
         )
 
+    def _salvage_banner(self, unique_code: str) -> str:
+        solver = self.settings.get("solver") or {}
+        if not solver.get("late_game_mode"):
+            return ""
+        focus = {
+            str(code).strip()
+            for code in (solver.get("salvage_focus_codes") or [])
+            if str(code).strip()
+        }
+        if unique_code not in focus:
+            return ""
+        return salvage_task_banner(unique_code, self.workspace_dir)
+
     def _attempt_multi_solver(
         self, challenge: Challenge, container_addr: tuple[str, ...],
         challenge_workspace: str, code: str, url: str
@@ -481,14 +718,40 @@ class Scheduler:
             run_id=os.environ.get("CTF_RUN_ID", ""),
         )
 
-        portfolio = build_portfolio(challenge)
-        memory_scope = challenge_memory_scope(challenge)
-        observer_leader = portfolio[0].name
-        portfolio_budget = PortfolioBudget(expected_attempts=len(portfolio))
+        portfolio = build_portfolio(challenge, self.settings)
+        memory_scope = challenge_memory_scope(challenge, self.settings)
+
+        # ━━ Lane 预算：primary 保底 1 路，额外路数机会性申请 ━━
+        # 拿不到额外 lane 时降级为更少并发（仍至少 1 路），把 lane 让给
+        # 其它容器的简单题，避免所有难题一起 spawn 多路互相饿死。
+        primary_lane = self.lane_budget.acquire_primary(timeout=self._lane_wait())
+        extra_lanes = 0
+        for _ in range(max(0, len(portfolio) - 1)):
+            if self.lane_budget.try_acquire_extra():
+                extra_lanes += 1
+            else:
+                break
+        active_specs = portfolio[: 1 + extra_lanes]
+
+        def _release_lanes() -> None:
+            for _ in range(extra_lanes):
+                self.lane_budget.release_extra()
+            if primary_lane:
+                self.lane_budget.release_primary()
+
+        observer_leader = active_specs[0].name
+        portfolio_budget = PortfolioBudget(expected_attempts=len(active_specs))
         _emit("multi_solver_memory_scope", {
             "unique_code": code,
             "memory_scope": memory_scope,
-            "attempts": [spec.name for spec in portfolio],
+            "attempts": [spec.name for spec in active_specs],
+        })
+        _emit("lane_allocation", {
+            "unique_code": code,
+            "desired_attempts": len(portfolio),
+            "granted_lanes": len(active_specs),
+            "extra_lanes": extra_lanes,
+            **self.lane_budget.snapshot(),
         })
 
         def _run_one(spec):
@@ -558,6 +821,9 @@ class Scheduler:
                 success_condition=spec.success_condition,
                 attempt_context=attempt_context,
             ) + "\n\n" + contract.prompt_text()
+            salvage = self._salvage_banner(code)
+            if salvage:
+                task += "\n\n" + salvage
 
             strategy_settings = dict(self.settings)
             solver_cfg = dict(strategy_settings.get("solver", {}))
@@ -566,16 +832,10 @@ class Scheduler:
             solver_cfg["observer_enabled"] = spec.name == observer_leader
             strategy_settings["solver"] = solver_cfg
 
-            # 每个 attempt 可指定独立模型：spec.model="pro" → llm.pro_model
-            # （默认 deepseek-v4-pro，用于 hard 竞争假设攻坚）。
-            # solver.pro_enabled=false 或 LLM_PRO_MODEL 可覆盖全局开关/模型名，
-            # 避免重跑时误烧 pro 额度或指向不存在的模型。
+            # solver.pro_enabled=false 关闭 pro；hard_only（默认）仅 hard 竞争假设启用。
             llm_cfg = dict(strategy_settings.get("llm", {}))
             if spec.model:
-                pro_enabled = str(solver_cfg.get("pro_enabled", True)).strip().lower() not in {
-                    "0", "false", "no", "off",
-                }
-                if spec.model == "pro" and pro_enabled:
+                if spec.model == "pro" and pro_model_allowed(solver_cfg, spec.model):
                     llm_cfg["default_model"] = (
                         llm_cfg.get("pro_model")
                         or os.environ.get("LLM_PRO_MODEL", "").strip()
@@ -613,7 +873,43 @@ class Scheduler:
             agent._portfolio_attempt_id = spec.name
             agent._stop_event = stop_event
 
-            agent.run()
+            def _run_spec() -> Any:
+                nonlocal agent
+                for run_attempt in range(1, _AGENT_RUN_RETRY_MAX + 1):
+                    try:
+                        agent.run()
+                        return agent
+                    except Exception as exc:
+                        if (
+                            not _is_transient_llm_error(exc)
+                            or run_attempt >= _AGENT_RUN_RETRY_MAX
+                        ):
+                            raise
+                        wait = _retry_delay(_AGENT_RUN_RETRY_BASE, run_attempt)
+                        _emit("agent_run_retry", {
+                            "unique_code": code,
+                            "attempt_id": spec.name,
+                            "attempt": run_attempt,
+                            "max_attempts": _AGENT_RUN_RETRY_MAX,
+                            "error": str(exc)[:300],
+                            "wait": round(wait, 2),
+                        })
+                        _sleep_retry(wait, self.deadline)
+                        agent = self._agent_factory(
+                            task=task,
+                            settings=strategy_settings,
+                            skills_dir=self.skills_dir,
+                        )
+                        agent._portfolio_budget = portfolio_budget
+                        agent._portfolio_attempt_id = spec.name
+                        agent._stop_event = stop_event
+                        try:
+                            agent.max_rounds = max(quota, portfolio_budget.total_quota)
+                        except Exception:
+                            pass
+                return agent
+
+            _run_spec()
 
             # 记录结果。rounds 使用两个策略的总消耗，使题目级预算看到
             # Multi-Solver 的真实成本，而不是只记录获胜策略。
@@ -627,7 +923,8 @@ class Scheduler:
                     best_result.success = True
                     best_result.correct_flag_count = challenge.flag_count
 
-        # 两个 Solver 只用 prompt 区分策略，共用同一套预算与一个 Observer。
+        # 各 Solver 只用 prompt 区分策略，共用同一套预算与一个 Observer。
+        # 只启动获得 lane 的 attempt，未获 lane 的假设本轮不并发运行。
         threads = [
             threading.Thread(
                 target=_run_one,
@@ -635,24 +932,27 @@ class Scheduler:
                 name=f"multi-{code}-{spec.name}",
                 daemon=True,
             )
-            for spec in portfolio
+            for spec in active_specs
         ]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            if self.deadline:
-                remaining = max(0.0, self.deadline - time.time())
-                # 给正在收尾的 Solver 少量宽限时间；bash 层会把新命令
-                # 的 timeout 截到同一个 deadline，不会无限挂住调度器。
-                thread.join(timeout=remaining + 5.0)
-            else:
-                thread.join()
-            if thread.is_alive():
-                stop_event.set()
-                _emit("multi_solver_timeout", {
-                    "unique_code": code,
-                    "strategy": thread.name,
-                })
+        try:
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                if self.deadline:
+                    remaining = max(0.0, self.deadline - time.time())
+                    # 给正在收尾的 Solver 少量宽限时间；bash 层会把新命令
+                    # 的 timeout 截到同一个 deadline，不会无限挂住调度器。
+                    thread.join(timeout=remaining + 5.0)
+                else:
+                    thread.join()
+                if thread.is_alive():
+                    stop_event.set()
+                    _emit("multi_solver_timeout", {
+                        "unique_code": code,
+                        "strategy": thread.name,
+                    })
+        finally:
+            _release_lanes()
 
         if terminal_error:
             raise terminal_error[0]
@@ -757,6 +1057,7 @@ class Scheduler:
                     "elapsed_so_far_s": round(_time.time() - _t_start_begin, 2),
                 })
                 if attempt < self.start_retry_max:
+                    self._recover_platform_slots(code)
                     _sleep_retry(wait, self.deadline)
                 else:
                     _emit("challenge_skip", {"unique_code": code, "reason": str(e)})
@@ -773,6 +1074,7 @@ class Scheduler:
                     "elapsed_so_far_s": round(_time.time() - _t_start_begin, 2),
                 })
                 if attempt < self.start_retry_max:
+                    self._recover_platform_slots(code)
                     _sleep_retry(wait, self.deadline)
                 else:
                     _emit("challenge_skip", {"unique_code": code, "reason": str(e)})
@@ -832,6 +1134,7 @@ class Scheduler:
         )
         _ctx.reset()
         _ctx.configure(run_context, self.client)
+        bridge_tools.configure_tsecbench(self.client, code)
 
         # 单线程模式下还是设置环境变量（向后兼容）
         if self.max_parallel <= 1:
@@ -913,27 +1216,42 @@ class Scheduler:
             challenge_workspace,
             attempt_context=run_context,
         ) + "\n\n" + contract.prompt_text()
+        salvage = self._salvage_banner(code)
+        if salvage:
+            task += "\n\n" + salvage
 
+        agent = None
         try:
-            agent = self._agent_factory(
-                task=task,
-                settings=self.settings,
-                skills_dir=self.skills_dir,
-            )
-            if self.max_parallel > 1:
-                # A terminal platform error in one worker asks other workers
-                # to stop at their next round boundary instead of consuming a
-                # full budget after the task has already ended.
-                agent._stop_event = self._abort_event
             _emit("timing_agent_start", {
                 "unique_code": code,
                 "elapsed_since_attempt_begin": round(_time.time() - _t_start_begin, 2),
             })
-            agent.run()
-            result.rounds = agent.round
+            # 单路题占用一个保底 lane，纳入全局并发预算（不申请额外 lane），
+            # 使难题的额外 lane 只在真正空闲时才被让出。
+            def _make_primary_agent():
+                primary = self._agent_factory(
+                    task=task,
+                    settings=self.settings,
+                    skills_dir=self.skills_dir,
+                )
+                if self.max_parallel > 1:
+                    primary._stop_event = self._abort_event
+                return primary
+
+            primary_lane = self.lane_budget.acquire_primary(timeout=self._lane_wait())
+            agent = None
+            try:
+                agent, result.rounds = _run_agent_with_retry(
+                    _make_primary_agent,
+                    unique_code=code,
+                    deadline=self.deadline,
+                )
+            finally:
+                if primary_lane:
+                    self.lane_budget.release_primary()
             result.material_progress_count = int(
                 getattr(agent, "_material_progress_count", 0) or 0
-            )
+            ) if agent is not None else 0
             _emit("timing_agent_done", {
                 "unique_code": code,
                 "rounds": agent.round,
@@ -951,6 +1269,12 @@ class Scheduler:
                 "traceback": traceback.format_exc(),
             })
             result.error = str(e)
+            if agent is not None:
+                result.rounds = max(result.rounds, int(getattr(agent, "round", 0) or 0))
+                result.material_progress_count = max(
+                    result.material_progress_count,
+                    int(getattr(agent, "_material_progress_count", 0) or 0),
+                )
 
         # 刷新一次平台状态，同时用于结果统计。
         try:

@@ -7,6 +7,10 @@
 - 入口通常是 HTTP API（APIGateway / 函数 URL），后端无持久服务器。
 - 常见路径：`/2015-03-31/functions/.../invocations`、`/runtime/`。
 
+> **CloudFunc + JWT（a-18）**：控制台若返回 JWT 且 header 含 `kid:"prod.key"`，
+> **先** `skill_load(web, jwt-attacks.md)` 执行 §5 路径遍历读密钥，再 HS256 伪造；
+> 不要只 load 本文件后盲猜 kid 或空密钥。
+
 ## 核心攻击面（按优先级）
 
 ### 1. 环境变量与临时凭据泄露

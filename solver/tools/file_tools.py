@@ -2,6 +2,7 @@ import os
 import subprocess
 
 from solver.worker_context import ctx as _ctx
+from solver.runtime.workspace_guard import assert_path_allowed, block_foreign_workspace
 
 
 MAX_OUTPUT = 8000
@@ -66,6 +67,9 @@ GREP_TOOL_DEF = {
 
 def read_file(args: dict) -> str:
     path = _resolve_path(args.get("path", ""))
+    blocked = assert_path_allowed(path) or block_foreign_workspace(path, action="读取")
+    if blocked:
+        return blocked
     offset = args.get("offset", 0)
     limit = args.get("limit", None)
 
@@ -91,6 +95,9 @@ def read_file(args: dict) -> str:
 
 def write_file(args: dict) -> str:
     path = _resolve_path(args.get("path", ""))
+    blocked = assert_path_allowed(path) or block_foreign_workspace(path, action="写入")
+    if blocked:
+        return blocked
     content = args.get("content", "")
 
     if not path:
@@ -108,6 +115,9 @@ def write_file(args: dict) -> str:
 def grep(args: dict) -> str:
     pattern = args.get("pattern", "")
     path = _resolve_path(args.get("path", ""))
+    blocked = assert_path_allowed(path) or block_foreign_workspace(path, action="搜索")
+    if blocked:
+        return blocked
     recursive = args.get("recursive", False)
 
     cmd = ["grep", "-n", "--color=never"]

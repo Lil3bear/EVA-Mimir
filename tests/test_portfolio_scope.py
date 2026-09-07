@@ -7,10 +7,17 @@
   * 后排 b-* 多阶段题多 agent 共享 memory 协作。
 """
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
+from solver.runtime.salvage import (
+    collect_salvage_targets,
+    is_long_hard_challenge,
+    salvage_abandoned_codes,
+    sort_challenges_salvage,
+)
 from solver.ctfplatform.policy import sort_challenges
 from solver.ctfplatform.tsecbench_client import Challenge
 from solver.runtime.portfolio import challenge_memory_scope, challenge_plan
@@ -70,6 +77,57 @@ class LayeredOrderingTests(unittest.TestCase):
         self.assertLess(order.index("b-01"), order.index("c-03"))
 
 
+class LateGameSalvageTests(unittest.TestCase):
+    def test_partial_progress_sorted_first(self):
+        fresh = _ch("a-01", difficulty="easy")
+        almost = _ch("b-02", difficulty="hard", flag_count=6, correct_flag_count=2)
+        order = [
+            c.unique_code
+            for c in sort_challenges_salvage([fresh, almost], Path("/tmp/ws"))
+        ]
+        self.assertEqual(order[0], "a-01")
+
+    def test_long_hard_detected(self):
+        self.assertTrue(is_long_hard_challenge(_ch("b-02", difficulty="hard", flag_count=6)))
+        self.assertFalse(is_long_hard_challenge(_ch("a-03", difficulty="easy")))
+
+    def test_salvage_abandoned_easy_and_partial(self):
+        challenges = [
+            _ch("a-03", difficulty="easy"),
+            _ch("b-02", difficulty="hard", flag_count=6, correct_flag_count=1),
+            _ch("c-08", difficulty="hard"),
+        ]
+        salvaged = salvage_abandoned_codes(
+            {"a-03", "b-02", "c-08"}, challenges
+        )
+        self.assertEqual(salvaged, {"a-03", "b-02"})
+        self.assertNotIn("c-08", salvaged)
+
+    def test_collect_salvage_targets_transient(self):
+        ws = Path(tempfile.mkdtemp())
+        code = "a-05"
+        (ws / code).mkdir(parents=True)
+        (ws / code / ".challenge-ledger.json").write_text(
+            json.dumps({
+                "attempts": [{
+                    "rounds": 0,
+                    "new_flags": 0,
+                    "success": False,
+                    "error": "Connection error.",
+                }],
+            }),
+            encoding="utf-8",
+        )
+        ch = _ch(code, difficulty="easy")
+        targets = collect_salvage_targets(
+            [ch],
+            abandoned=set(),
+            fail_streak={},
+            workspace_dir=ws,
+        )
+        self.assertIn(code, targets)
+
+
 class CollaborationModeTests(unittest.TestCase):
     def test_multistage_pentest_uses_shared_memory(self):
         attempts, scope = challenge_plan(
@@ -79,22 +137,64 @@ class CollaborationModeTests(unittest.TestCase):
         self.assertEqual({a.name for a in attempts}, {"aggressive", "steady"})
         self.assertEqual(challenge_memory_scope(_ch("e1-02", flag_count=3)), "shared")
 
-    def test_front_web_simple_uses_isolated_multi(self):
+    def test_front_web_simple_single_flag_stays_solo(self):
+        # 简单单 flag web 题不再双路赛跑：单路 30s 内就解，双路只翻倍 LLM
+        # 成本并抢占难题的并发 lane（run-12752 拥挤根因）。
         for code in ("a-05", "c-07", "g-01", "d-03"):
             attempts, scope = challenge_plan(_ch(code, difficulty="easy"))
-            self.assertEqual(scope, "isolated", code)
-            self.assertEqual(len(attempts), 2, code)
+            self.assertEqual(scope, "private", code)
+            self.assertEqual(len(attempts), 1, code)
 
-    def test_hard_challenge_uses_competing_hypotheses(self):
-        # hard/瓶颈题：三个正交假设（foothold/lateral/source）并行攻坚，
-        # memory 私有隔离（各自独立 context），证据经 artifact/promote 受控共享，
-        # claim 互斥、谁先解出谁赢。
-        attempts, scope = challenge_plan(_ch("a-09", difficulty="hard"))
+    def test_multi_flag_web_still_races_two_strategies(self):
+        # 多 flag（≥4）非 b/e1 题仍值得隔离双路赛跑。
+        attempts, scope = challenge_plan(
+            _ch("a-20", difficulty="medium", flag_count=4)
+        )
+        self.assertEqual(scope, "isolated")
+        self.assertEqual({a.name for a in attempts}, {"aggressive", "steady"})
+
+    def test_hard_single_chain_stays_solo(self):
+        # 单 flag hard Web/产品题：单 agent + skills，不开 foothold/lateral/source。
+        for code in ("a-09", "a-13", "a-18", "c-02", "c-08", "e3-04"):
+            attempts, scope = challenge_plan(_ch(code, difficulty="hard"))
+            self.assertEqual(scope, "private", code)
+            self.assertEqual(len(attempts), 1, code)
+            self.assertEqual(attempts[0].name, "primary", code)
+
+    def test_hard_multi_flag_still_uses_competing_hypotheses(self):
+        attempts, scope = challenge_plan(
+            _ch("a-99", difficulty="hard", flag_count=3)
+        )
         self.assertEqual(scope, "private")
         self.assertEqual(
             {a.name for a in attempts}, {"foothold", "lateral", "source"}
         )
-        self.assertTrue(all(a.model == "pro" for a in attempts))
+
+    def test_hard_competing_opt_in(self):
+        settings = {"solver": {"hard_competing_hypotheses": True}}
+        attempts, scope = challenge_plan(
+            _ch("a-13", difficulty="hard"), settings
+        )
+        self.assertEqual(scope, "private")
+        self.assertEqual(
+            {a.name for a in attempts}, {"foothold", "lateral", "source"}
+        )
+
+    def test_late_game_uses_solo_even_for_hard(self):
+        settings = {"solver": {"late_game_mode": True}}
+        attempts, scope = challenge_plan(_ch("a-09", difficulty="hard"), settings)
+        self.assertEqual(scope, "private")
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0].name, "primary")
+
+    def test_late_game_partial_pentest_keeps_shared(self):
+        settings = {"solver": {"late_game_mode": True}}
+        attempts, scope = challenge_plan(
+            _ch("b-02", difficulty="hard", flag_count=6, correct_flag_count=1),
+            settings,
+        )
+        self.assertEqual(scope, "shared")
+        self.assertEqual(len(attempts), 1)
 
     def test_generic_or_unknown_stays_solo(self):
         for code in ("web-01", "misc-01", "unknown"):

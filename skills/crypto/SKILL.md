@@ -1,3 +1,8 @@
+---
+name: crypto
+description: 处理密码学题：古典密码、RSA、AES、哈希破解、编码转换、数论攻击，以及 LCG/格/差分/侧信道等进阶题型。拿到密文、密钥参数、加密脚本或明显数学结构时使用。
+---
+
 # Crypto 密码学 Skill — CTF Crypto 题全流程指引
 
 ## 适用场景

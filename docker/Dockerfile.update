@@ -1,0 +1,8 @@
+# 基于已恢复的 eva-mimir-solver:latest 增量更新代码（避免拉 ubuntu 超时）
+FROM eva-mimir-solver:latest
+COPY solver/ /opt/ctf-agent/solver/
+COPY shared/ /opt/ctf-agent/shared/
+COPY skills/ /opt/ctf-agent/skills/
+COPY prompts/ /opt/ctf-agent/prompts/
+COPY settings.json /workspace/settings.json
+RUN ln -sf /opt/ctf-agent/skills /skills

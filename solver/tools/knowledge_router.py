@@ -68,12 +68,32 @@ def _fingerprint_products(output: str, context: str) -> set[str]:
 
 
 def _looks_like_web(output_lower: str) -> bool:
-    """Whether a curl output resembles a web/api response (not a refued/error)."""
+    """Whether output resembles a real web/api *response* (not a refused/error).
+
+    Strip curl -v / -sv client-side lines first: otherwise a dead port that
+    RST after ``GET / HTTP/1.1`` still matches ``http/1.`` and fires Gradio
+    weak hints forever (run c-08).
+    """
+    if not output_lower:
+        return False
+    server_lines: list[str] = []
+    for line in output_lower.splitlines():
+        stripped = line.lstrip()
+        # curl -v prefixes: * progress, > request, < response headers
+        if stripped.startswith(("*", ">")):
+            continue
+        if stripped.startswith("<"):
+            server_lines.append(stripped[1:].lstrip())
+            continue
+        server_lines.append(line)
+    body = "\n".join(server_lines).strip()
+    if not body:
+        return False
     markers = (
         "<html", "<!doctype", "<body", "<head", "<div", "<script", "<title",
         "http/1.", "http/2", "content-type", "{", "www",
     )
-    return bool(output_lower) and any(m in output_lower for m in markers)
+    return any(m in body for m in markers)
 
 
 def lookup(output: str, context: str = "") -> str:
@@ -121,26 +141,28 @@ def lookup(output: str, context: str = "") -> str:
 
     lines: list[str] = []
     if hits:
-        lines.append("📌 [本地确定性 CVE 条目]（无需联网搜索，先用 quick_check 验证）")
+        # 顺序即优先级：本地 skill 里已有可直接复用的 payload，评测无外网，
+        # 所以 skill_load 是首选动作；quick_check 只是指纹参考（实例可能不同，
+        # 404/空响应不代表漏洞不存在）；不再注入 security_search —— 离线它只会
+        # 返回"无可靠本地知识"并把模型带偏（见 run c-03：反复搜 + 下载 scanner 超时）。
+        lines.append("📌 [本地利用条目]（本地 skill 已含可用 payload，评测无外网，别搜/别下载外部脚本）")
         for product, e in hits[:3]:
             lines.append(f"### {product}")
             cves = e.get("cves") or []
             if cves:
                 lines.append(f"- CVE: {', '.join(str(c) for c in cves)}")
-            quick = e.get("quick_check")
-            if quick:
-                lines.append(f"- 验证命令: {quick}")
-            verify = e.get("verify") or []
-            if verify:
-                lines.append(f"- 判定: {', '.join(str(v) for v in verify)}")
-            query = e.get("search_query")
-            if query:
-                lines.append(f"- 补充搜索: security_search(\"{query}\")")
             route = _PRODUCT_ROUTES.get(product)
             if route:
                 lines.append(
-                    f'- 下一步必须加载: skill_load(name="{route[0]}", resource="{route[1]}")'
+                    f'- ⭐首选: skill_load(name="{route[0]}", resource="{route[1]}") '
+                    f"→ 回看并逐字复制其中 payload，别凭记忆重写"
                 )
+            quick = e.get("quick_check")
+            if quick:
+                lines.append(f"- 指纹参考（实例可能不同，非命中判据）: {quick}")
+            verify = e.get("verify") or []
+            if verify:
+                lines.append(f"- 命中判据: {', '.join(str(v) for v in verify)}")
     if weak_hits:
         lines.append("🔎 [端口弱信号] 仅凭端口不足以判定，请先验证产品指纹再查 CVE：")
         for product, e in weak_hits[:3]:

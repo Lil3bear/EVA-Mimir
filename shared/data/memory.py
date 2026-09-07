@@ -188,6 +188,32 @@ def add_memory(challenge_dir: Path, kind: str, content: str,
     return entry
 
 
+def restore_memory(challenge_dir: Path, entry: dict) -> bool:
+    """按原样重建一条之前删除的记忆（保留 id 与 created_at）。
+
+    供 rollback 使用：以原始 memory_id 恢复，保证审计链的 id 稳定，
+    而不是像 add_memory_with_status 那样生成一个新 id。
+    """
+    try:
+        restored = MemoryEntry(
+            id=str(entry.get("id") or f"mem_{os.urandom(4).hex()}"),
+            kind=str(entry.get("kind", "note")),
+            content=str(entry.get("content", "")),
+            created_at=float(entry.get("created_at") or time.time()),
+            refs=list(entry.get("refs") or []),
+            source=str(entry.get("source", "rollback")),
+            attempt_id=str(entry.get("attempt_id", "")),
+        )
+    except Exception:
+        return False
+    entries_dir = _entries_dir(challenge_dir)
+    entries_dir.mkdir(parents=True, exist_ok=True)
+    with _file_lock(_lock_path(challenge_dir)):
+        filename = f"{int(restored.created_at * 1000)}-{restored.id}.json"
+        _atomic_write(entries_dir / filename, restored.__dict__)
+    return True
+
+
 def list_memory(challenge_dir: Path, limit: int = None) -> list[MemoryEntry]:
     entries_dir = _entries_dir(challenge_dir)
     if not entries_dir.exists():

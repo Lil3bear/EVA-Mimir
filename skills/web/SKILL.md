@@ -26,6 +26,7 @@ description: 处理 HTTP/Web 入口的 CTF 题。发现 HTTP 响应、Web 框架
 | `X-Powered-By: ThinkPHP` | ThinkPHP | 5.x RCE |
 | `Set-Cookie: rememberMe=deleteMe` | Shiro | 默认密钥反序列化 |
 | `Set-Cookie: session=eyJ` | Flask session | flask-unsign 破解密钥 |
+| HTML 含 `PyDash` / 描述含 pydash/原型链 | PyDash 污染 | `prototype-pollution-pydash.md` |
 | 响应含 `?cmd=`/`?ip=`/`?host=` | 命令注入 | `;id` `\|id` `$(id)` 全试 |
 | 响应含 `?url=`/`?fetch=` | SSRF | `file:///etc/passwd` + `http://127.0.0.1` |
 | 响应含 `.php` + `file=` 参数 | 文件包含 | php://filter 读源码 |
@@ -36,9 +37,9 @@ description: 处理 HTTP/Web 入口的 CTF 题。发现 HTTP 响应、Web 框架
 | `.git/HEAD` 返回 `ref: refs/heads/` | Git 泄露 | git-dumper 拉源码审计 |
 | `robots.txt` 含隐藏路径 | 目录信息 | 逐个访问被禁路径 |
 | 响应含 `upload` / 文件上传表单 | 文件上传 | 上传 webshell |
-| `Authorization: Bearer eyJ` | JWT | 解码→alg→none/弱密钥 |
+| `Authorization: Bearer eyJ` / `kid=prod.key` | JWT | `jwt-attacks.md`（优先 kid=静态文件伪造） |
 | HTML 含 `phpinfo()` | PHP 信息泄露 | 看 disable_functions/版本 |
-| 描述/页面含 `CloudFunc`/`云函数`/`serverless`/`Lambda` | Serverless 云函数 | `skill_load(name="cloud", resource="serverless.md")` |
+| 描述/页面含 `CloudFunc`/`云函数`/`serverless`/`Lambda` | Serverless 云函数 | **先** `jwt-attacks.md`（若有 JWT/kid）；再 `cloud/serverless.md` |
 
 ## 路由
 
@@ -49,6 +50,7 @@ description: 处理 HTTP/Web 入口的 CTF 题。发现 HTTP 响应、Web 框架
 | PHP 源码 / `highlight_file` / MD5 比较 / 文件上传 | `php-exploitation.md` 或 `php-payload-builder.md` |
 | Java 序列化 / Spring / Struts / FastJSON / Tomcat | `java-exploitation.md` |
 | JWT / OAuth token / 签名算法 | `jwt-attacks.md` |
+| PyDash / 原型链污染 / parse_path 绕过 | `prototype-pollution-pydash.md` |
 | SSRF / URL 过滤绕过 / 云元数据 | `ssrf.md` |
 | SQL 注入 / XSS / 文件包含 / 命令注入等通用漏洞 | `common-vulnerabilities.md` |
 | 需要目录扫描 / 指纹识别 / 技术栈判断 | `reconnaissance.md` |
@@ -57,7 +59,9 @@ description: 处理 HTTP/Web 入口的 CTF 题。发现 HTTP 响应、Web 框架
 
 ## 关键原则
 - **找到任意 `XXX{...}` 立即提交**，不要因为格式"看起来不对"跳过。
+- **活路置顶**：reference 里标了 `✅/最短成功链` 的先做；标 `低效路径` 的各试 ≤1 次即转回活路（勿写成绝对死路）。
 - 同一 URL/参数重复尝试不超过 3 次。
 - 搜索结果/模型给出的数值类 payload 必须 bash 本地验证。
 - 目标不可达时：第 3 次起停止访问，改调 `challenge_get_state`，不猜端口不扫网段。
 - 多服务同主机：不要只挖一个入口，对每个端口独立指纹。
+- CloudFunc/JWT：以 `jwt-attacks.md` 为准；`payloads/json-web-token.md` 只做穷举语料。

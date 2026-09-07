@@ -23,6 +23,18 @@ _PENTEST_EXTRA = {"easy": 40, "medium": 120, "hard": 80, "difficult": 80}
 _CTYPE_EXTRA = {"easy": 30, "medium": 60, "hard": 40, "difficult": 40}
 _OBSERVER_INTERVALS = {"easy": 15, "medium": 12, "hard": 8, "difficult": 8}
 _DEFAULT_SWITCH_AFTER = {"easy": 10, "medium": 12, "hard": 12, "difficult": 12}
+# 单题墙钟止损（秒）。轮次预算无法反映真实耗时：一轮可能 10s，也可能因一条
+# 长 bash 或一次大 LLM 调用耗 5min。一道题只要每隔几轮制造点"微进展"就能一直
+# 重置 idle 计数，把整场时间烧光而不解出（run: b-02/c-01/c-02 长时间占槽仍无
+# flag）。墙钟预算是与轮次/idle 正交的硬止损，对所有难度与 lane 生效，防单题
+# 独吞全场时间；预算内正常解题不受影响，仅截断病态长尾。
+_TIME_BUDGETS = {"easy": 600, "medium": 1200, "hard": 1800, "difficult": 1800}
+_UNKNOWN_TIME_BUDGET = 1200
+_PENTEST_TIME_EXTRA = 900  # 多阶段渗透合理地更久（侦察→立足→横向）
+_CTYPE_TIME_EXTRA = 600
+# 软预警：达到墙钟预算的该比例时注入一次"收敛/提交已验证 flag"提示，给
+# "速度 vs 准确"一个缓冲，而不是到点才硬停。<=0 或 >=1 关闭软预警。
+_TIME_SOFT_WARN_FRACTION = 0.75
 # stop_after 必须与 max_rounds 成比例。hard 多阶段题前几十轮还在侦察，
 # 过紧的 stop_after 会在拿到 flag 前就 force_stop（run-12020 b-02 回退根因）。
 _DEFAULT_STOP_AFTER = {"easy": 20, "medium": 30, "hard": 48, "difficult": 48}
@@ -77,6 +89,8 @@ class ControlPolicy:
     difficulty: str = ""
     fast_lane_rounds: int = 0
     min_strategy_failures_before_stop: int = 2
+    time_budget_seconds: float = 0.0
+    soft_warn_fraction: float = _TIME_SOFT_WARN_FRACTION
 
     @classmethod
     def from_settings(
@@ -110,6 +124,30 @@ class ControlPolicy:
             stop_after += _STOP_CTYPE_EXTRA
 
         fast_default = 0 if pentest or ctype else _FAST_LANE_ROUNDS.get(difficulty, 0)
+
+        time_budget = _TIME_BUDGETS.get(difficulty, _UNKNOWN_TIME_BUDGET)
+        if pentest:
+            time_budget += _PENTEST_TIME_EXTRA
+        if ctype:
+            time_budget += _CTYPE_TIME_EXTRA
+
+        def budget_setting(name: str, default: float) -> float:
+            # 缺省用难度默认；显式配 0/负数即关闭止损；正数覆盖。
+            if name not in solver:
+                return float(default)
+            try:
+                value = float(solver.get(name))
+            except (TypeError, ValueError):
+                return float(default)
+            return max(0.0, value)
+
+        try:
+            warn_fraction = float(
+                solver.get("time_soft_warn_fraction", _TIME_SOFT_WARN_FRACTION)
+            )
+        except (TypeError, ValueError):
+            warn_fraction = _TIME_SOFT_WARN_FRACTION
+
         return cls(
             max_rounds=positive_setting("max_rounds", base),
             switch_after=positive_setting(
@@ -128,7 +166,15 @@ class ControlPolicy:
             min_strategy_failures_before_stop=positive_setting(
                 "min_strategy_failures_before_stop", 2
             ),
+            time_budget_seconds=budget_setting("time_budget_seconds", time_budget),
+            soft_warn_fraction=warn_fraction,
         )
+
+    def soft_time_warning_seconds(self) -> float:
+        """墙钟软预警触发点（秒）；<=0 表示不预警。"""
+        if self.time_budget_seconds <= 0 or not (0.0 < self.soft_warn_fraction < 1.0):
+            return 0.0
+        return self.time_budget_seconds * self.soft_warn_fraction
 
     @property
     def allows_no_progress_intervention(self) -> bool:
@@ -146,6 +192,7 @@ class ControlPolicy:
         switch_already_requested: bool = False,
         hint_focus_exhausted: bool = False,
         same_action_streak: int = 0,
+        elapsed_seconds: float = 0.0,
     ) -> ControlDecision:
         """Return the sole policy decision for lane/switch/no-progress stop.
 
@@ -159,6 +206,18 @@ class ControlPolicy:
         lane_entered_round = max(0, int(lane_entered_round))
         progress_anchor = max(int(last_progress_round), lane_entered_round)
         idle_rounds = max(0, round_num - progress_anchor)
+
+        # 墙钟硬止损：与轮次/idle/难度正交的安全阀，优先于所有其它判定。
+        # 即便是 easy 的"永不因 idle 放弃"不变式，也不能让单题无限吃时间——
+        # 到点即停，把剩余时间让给其它题（deadline 之外的第二道闸）。
+        elapsed_seconds = max(0.0, float(elapsed_seconds))
+        if self.time_budget_seconds > 0 and elapsed_seconds >= self.time_budget_seconds:
+            return ControlDecision(
+                action=ControlAction.STOP.value,
+                reason="time_budget_exhausted",
+                failure_scope=FailureScope.TASK.value,
+                idle_rounds=idle_rounds,
+            )
 
         if (
             lane == LaneMode.FAST.value

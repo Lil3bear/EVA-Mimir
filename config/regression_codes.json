@@ -1,0 +1,36 @@
+{
+  "packs": {
+    "web": {
+      "description": "Web / 云应用类（c-* + 相关 a-*）",
+      "prefix": "c"
+    },
+    "cloud": {
+      "description": "Cloud / 容器 / 编排",
+      "prefix": "d"
+    },
+    "exploit": {
+      "description": "Exploit 开发",
+      "prefix": "e2"
+    },
+    "pentest": {
+      "description": "渗透多阶段",
+      "prefix": "b"
+    },
+    "evasion": {
+      "description": "免杀 / 对抗",
+      "prefix": "e3"
+    },
+    "binary": {
+      "description": "Pwn / 逆向",
+      "prefixes": ["f", "p"]
+    },
+    "unstable6": {
+      "description": "Web/evasion 不稳定簇（含已打通的 c-02；回归防漂）",
+      "codes": ["a-03", "a-13", "a-18", "c-02", "c-08", "e3-04"]
+    },
+    "lastmile3": {
+      "description": "能力边界最后一公里：a-03 V3 / b-02 剩 flag / f2-05 angr",
+      "codes": ["a-03", "b-02", "f2-05"]
+    }
+  }
+}

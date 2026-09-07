@@ -22,9 +22,12 @@ from solver.ctfplatform.scheduler import (
     SchedulerReport,
     SchedulerResult,
     _build_task_from_challenge,
+    _is_transient_llm_error,
     _retry_delay,
+    _run_agent_with_retry,
     _sort_challenges,
 )
+from solver.ctfplatform.task_builder import workspace_resume_note
 
 
 def _make_challenge(
@@ -83,6 +86,54 @@ class RetryPolicyTests(unittest.TestCase):
         self.assertEqual(_retry_delay(2, 3), 8)
         self.assertEqual(_retry_delay(30, 4, cap=60), 60)
         self.assertEqual(_retry_delay(0, 5), 0)
+
+    def test_transient_llm_error_detection(self):
+        from openai import APIConnectionError
+
+        self.assertTrue(_is_transient_llm_error(APIConnectionError(request=None)))
+        self.assertTrue(_is_transient_llm_error(RuntimeError("Connection error.")))
+        self.assertFalse(_is_transient_llm_error(ValueError("bad flag")))
+
+    @patch("solver.ctfplatform.scheduler._sleep_retry")
+    @patch("solver.ctfplatform.scheduler._emit")
+    def test_run_agent_with_retry_recovers_transient_failure(self, _emit, _sleep):
+        calls = {"n": 0}
+
+        class _Agent:
+            round = 0
+
+            def run(self):
+                calls["n"] += 1
+                self.round = calls["n"]
+                if calls["n"] == 1:
+                    raise RuntimeError("Connection error.")
+                return None
+
+        agent, rounds = _run_agent_with_retry(
+            lambda: _Agent(),
+            unique_code="a-03",
+            deadline=0.0,
+        )
+        self.assertEqual(rounds, 2)
+        self.assertEqual(calls["n"], 2)
+        _emit.assert_called()
+        _sleep.assert_called_once()
+
+    def test_workspace_resume_note_after_long_failed_attempt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / ".challenge-ledger.json"
+            ledger.write_text(json.dumps({
+                "version": 1,
+                "attempts": [{
+                    "rounds": 32,
+                    "success": False,
+                    "error": "Connection error.",
+                }],
+            }), encoding="utf-8")
+            note = workspace_resume_note(tmp)
+            self.assertIn("续跑提示", note)
+            self.assertIn("32", note)
+            self.assertIn("连接抖动", note)
 
 
 class SortChallengesTests(unittest.TestCase):
@@ -247,7 +298,8 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(report.attempted, 1)
         self.assertEqual(report.solved, 1)
         client.start_challenge.assert_called_once_with("web-01")
-        client.close_challenge.assert_called_once_with("web-01")
+        self.assertGreaterEqual(client.close_challenge.call_count, 1)
+        client.close_challenge.assert_any_call("web-01")
         mock_agent.run.assert_called_once()
         # 确认 factory 被调用时传入了正确的 task
         call_kwargs = mock_factory.call_args
@@ -272,7 +324,7 @@ class SchedulerTests(unittest.TestCase):
         ).run_all()
 
         self.assertEqual(report.solved, 1)
-        # c-前缀属于前排 web/misc 家族，现在走隔离多解（两个策略各跑一次）。
+        # c-07 是简单单 flag 题：现在走单路 solo，把并发 lane 让给难题。
         mock_agent.run.assert_called()
         self.assertIn("10.0.0.2:23", mock_factory.call_args.kwargs["task"])
 
@@ -292,7 +344,8 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(report.attempted, 1)
         self.assertEqual(report.failed, 1)
         self.assertIn("active limit", report.results[0].error)
-        client.close_challenge.assert_not_called()
+        # preflight_close may best-effort close before start retries
+        client.start_challenge.assert_called()
 
     def test_unexpected_error_after_start_still_closes_challenge(self):
         challenge = _make_challenge("hard-01", difficulty="hard")
@@ -327,6 +380,7 @@ class SchedulerTests(unittest.TestCase):
             settings={"llm": {}, "solver": {}},
             agent_factory=factory,
             workspace_dir=self._tmpdir,
+            max_lanes=9,
         )
         workspace = os.path.join(self._tmpdir, challenge.unique_code)
 
@@ -360,6 +414,7 @@ class SchedulerTests(unittest.TestCase):
             },
             agent_factory=factory,
             workspace_dir=self._tmpdir,
+            max_lanes=9,
         )
         workspace = os.path.join(self._tmpdir, challenge.unique_code)
 
@@ -392,6 +447,7 @@ class SchedulerTests(unittest.TestCase):
             },
             agent_factory=factory,
             workspace_dir=self._tmpdir,
+            max_lanes=9,
         )
         workspace = os.path.join(self._tmpdir, challenge.unique_code)
 
@@ -405,6 +461,39 @@ class SchedulerTests(unittest.TestCase):
 
         models = [s["llm"]["default_model"] for s in created_settings]
         self.assertEqual(models, ["deepseek-v4-flash"] * 3)
+
+    def test_multi_solver_pro_hard_only_enables_pro(self):
+        """solver.pro_enabled=hard_only 时，hard 竞争假设使用 pro_model。"""
+        challenge = _make_challenge("hard-01", difficulty="hard")
+        client = self._make_mock_client([challenge])
+        created_settings = []
+
+        def factory(**kwargs):
+            created_settings.append(kwargs["settings"])
+            return MagicMock(solved=False, round=1)
+
+        scheduler = Scheduler(
+            client,
+            settings={
+                "llm": {"default_model": "deepseek-v4-flash", "pro_model": "deepseek-v4-pro"},
+                "solver": {"pro_enabled": "hard_only"},
+            },
+            agent_factory=factory,
+            workspace_dir=self._tmpdir,
+            max_lanes=9,
+        )
+        workspace = os.path.join(self._tmpdir, challenge.unique_code)
+
+        scheduler._attempt_multi_solver(
+            challenge,
+            ("10.0.0.2:8080",),
+            workspace,
+            challenge.unique_code,
+            "10.0.0.2:8080",
+        )
+
+        models = [s["llm"]["default_model"] for s in created_settings]
+        self.assertEqual(models, ["deepseek-v4-pro"] * 3)
 
     @patch("solver.agent.ObserverLoop")
     @patch("solver.agent.OpenAI")
@@ -443,6 +532,7 @@ class SchedulerTests(unittest.TestCase):
             },
             agent_factory=factory,
             workspace_dir=self._tmpdir,
+            max_lanes=9,
         )
         workspace = os.path.join(self._tmpdir, challenge.unique_code)
 
@@ -672,7 +762,7 @@ class ParallelSchedulerTests(unittest.TestCase):
                 current = call_count
 
             if current == 2:
-                agent.run.side_effect = RuntimeError("LLM API 超时")
+                agent.run.side_effect = RuntimeError("fatal solver bug")
             agent.round = 1
             return agent
 
@@ -688,7 +778,7 @@ class ParallelSchedulerTests(unittest.TestCase):
         self.assertEqual(report.attempted, 3)
         errors = [r for r in report.results if r.error]
         self.assertGreaterEqual(len(errors), 1)
-        self.assertEqual(client.close_challenge.call_count, 3)
+        self.assertGreaterEqual(client.close_challenge.call_count, 3)
 
     def test_sequential_fallback(self):
         """max_parallel=1 时走顺序模式。"""

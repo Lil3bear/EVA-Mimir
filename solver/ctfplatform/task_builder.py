@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 from solver.ctfplatform.policy import infer_challenge_type
@@ -16,11 +18,47 @@ _DESCRIPTION_REFERENCE_HINTS = (
     (("jwt", "token", "签名", "oauth"), "JWT/签名 → 必须 skill_load(name=\"web\", resource=\"jwt-attacks.md\")"),
     (("授权", "license", "serial", "序列号", "校验器"), "授权/序列号 → 必须 skill_load(name=\"reverse\", resource=\"embedded-license.md\")"),
     (("云函数", "serverless", "cloudfunc", "lambda"), "Serverless → 必须 skill_load(name=\"cloud\", resource=\"serverless.md\")"),
+    (("资产管理系统", "报销", "报表"), "资产系统 → 先分流：有 cookie=Flask session；Sanic|/src=pydash；无 cookie+/login500=登录绕过+报表/搜索注入。必须 skill_load(web, common-vulnerabilities.md) §2，勿枚举路径"),
+    (("虚拟机", "字节码", "bytecode", "自制指令", "自制虚拟机"), "VM/字节码 → 必须 skill_load(name=\"reverse\", resource=\"vm-and-firmware.md\")；公式被删则 angr，勿盲猜提交"),
     (("ssrf", "内网探测", "资产探测", "请求伪造", "同步数据", "合作伙伴", "追踪 api", "导入", "抓取"), "SSRF/URL 请求 → 必须 skill_load(name=\"web\", resource=\"ssrf.md\")"),
     (("xxe", "xml", "实体注入", "图片", "svg"), "XXE/文件上传 → 必须 skill_load(name=\"payloads\", resource=\"xxe-injection.md\") 和 skill_load(name=\"payloads\", resource=\"upload-insecure-files.md\")"),
     (("上传", "upload", "附件", "头像"), "文件上传 → 必须 skill_load(name=\"payloads\", resource=\"upload-insecure-files.md\")"),
     (("图数据库", "hugegraph", "neo4j", "关联检索", "gremlin"), "图数据库 → 必须 skill_load(name=\"web\", resource=\"graph-db.md\")"),
+    (("pydash", "原型链", "parse_path", "八进制", "pollution challenge"), "PyDash 污染 → 必须 skill_load(name=\"web\", resource=\"prototype-pollution-pydash.md\")"),
+    (("comfyui", "comfy ui", "8188"), "ComfyUI → 必须 skill_load(name=\"web\", resource=\"product-playbooks.md\") §6.5"),
+    (("langflow",), "Langflow → 必须 skill_load(name=\"web\", resource=\"product-playbooks.md\") §6.9/§6.10"),
+    (("gradio", "7860"), "Gradio → 必须 skill_load(name=\"web\", resource=\"product-playbooks.md\") §6.7/§6.8"),
+    (("检测对抗", "绕过检测", "杀软", "免杀", "waf", "注入检测"), "检测对抗 → 必须 skill_load(name=\"evasion\")，/check 类题读 process-injection-bypass.md"),
+    (("kubernetes", "k8s", "容器编排", "docker compose"), "容器/编排 → 必须 skill_load(name=\"cloud\")"),
 )
+
+def workspace_resume_note(challenge_workspace: str) -> str:
+    """Hint when a prior attempt left durable evidence but did not solve."""
+    path = Path(challenge_workspace) / ".challenge-ledger.json"
+    if not path.is_file():
+        return ""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        attempts = data.get("attempts") or []
+        if not attempts:
+            return ""
+        last = attempts[-1]
+        rounds = int(last.get("rounds") or 0)
+        if rounds < 8 or last.get("success"):
+            return ""
+        err = str(last.get("error") or "").lower()
+        transient = any(token in err for token in ("connection", "timeout", "rate limit"))
+        lines = [
+            "\n## 续跑提示",
+            f"本题工作区已有 **{len(attempts)}** 次 attempt（上一轮 {rounds} 轮未通关）。",
+            "优先：`memory_list` → 读 `execution-journal` → 复用已验证 exploit 脚本；",
+            "不要从目录枚举或全端口扫描重来。",
+        ]
+        if transient:
+            lines.append("上一轮因 LLM/连接抖动中断，本轮从已有证据继续。")
+        return "\n".join(lines)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return ""
 
 
 def _reference_hints(description: str) -> list[str]:
@@ -56,6 +94,16 @@ def build_task_from_challenge(
         )
         for hint in _reference_hints(challenge.description):
             lines.append(f"- 📚 {hint}")
+        # CloudFunc 描述会命中 serverless，但 JWT kid=prod.key 必须 jwt-attacks 优先。
+        desc_lower = (challenge.description or "").lower()
+        if any(k in desc_lower for k in ("cloudfunc", "serverless", "云函数")) and any(
+            k in desc_lower for k in ("jwt", "token", "认证", "登录", "网关")
+        ):
+            lines.append(
+                "- 📚 CloudFunc+JWT：拿到 `kid=prod.key` 后 **先** "
+                "skill_load(web, jwt-attacks.md) §5（优先 kid=../css/reset.css，"
+                "再 php-fpm FastCGI），再视情况 load serverless.md"
+            )
     if profile.product_hint:
         lines.append(
             f"- 🔎 端口产品候选：{profile.product_hint}。"
@@ -115,5 +163,9 @@ class TaskBuilder:
                 f"\n本 Attempt 私有工作目录：{attempt_context.attempt_dir}"
                 f"\n题目共享 Memory/Ideas 目录：{attempt_context.challenge_dir}"
             )
+
+        resume = workspace_resume_note(challenge_workspace)
+        if resume:
+            task += resume
 
         return task + self.load_experience(challenge.unique_code, self.skills_dir)

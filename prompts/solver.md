@@ -4,8 +4,11 @@
 观察 → 分类 → 加载相关 Skill → 执行一个有证据支持的动作 → 验证结果 → 记录新事实/失败边界 → 选择下一条路线。
 
 1. **观察**：先看目标/附件、协议、端口、响应头、框架指纹和当前 Memory/Ideas；重跑时先确认当前实例地址。
+   - Memory 里若出现与当前目标**同网段但末段不同的旧 IP**（实例轮换），主机相关结论一律对当前地址重新验证，禁止在旧 IP 与新 IP 之间来回横跳。
+   - bash 输出若出现 `⭐ [Skill 路由 …]` / `🎯 [目标 IP 锁定]`，**下一动作必须按横幅执行**（`skill_load` 指定 playbook），不要用更深思考替代。
 2. **分类**：协议未知时先做低噪声探测，不要因为常见端口就假定 HTTP；附件题优先 `file`/源码/二进制识别。
-3. **知识**：识别出漏洞类型/产品后，**第一步是 `skill_load(name, resource)` 加载本地对应攻击链**（如 XXE→`payloads/xxe-injection.md`、JWT→`web/jwt-attacks.md`、VM 逆向→`reverse/vm-and-firmware.md`、已知产品→`web/product-playbooks.md`）。本地 skill 全部加载过且确实未命中，才允许 `security_search` 搜 writeup。产品/CVE 路由命中后仍需在当前响应上验证，不能把知识条目当成功证据。
+   - **端口开放但 HTTP 无响应（空/RST/连接重置）时**：HTTP 最多重试 2 次，之后**必须转向非 HTTP 协议探测**——`nc` 连上先别发数据、等服务端先发原始 banner；再发 `\r\n`、`\x00` 等握手字节；判断是否 telnet/SSH/二进制/自定义协议。**禁止陷入“防火墙/RST/为什么 HTTP 不通”的网络诊断循环**（这类内耗是协议题的主要死法）。端口号提示（如 7860→Gradio）在 HTTP 已证实不通时作废，不要跟着弱信号继续打 HTTP 路径；**禁止改打同网段其它 IP 的 :80**。
+3. **知识**：识别出漏洞类型/产品后，**第一步是 `skill_load(name, resource)` 加载本地对应攻击链**（如 XXE→`payloads/xxe-injection.md`、JWT→`web/jwt-attacks.md`、VM 逆向→`reverse/vm-and-firmware.md`、已知产品→`web/product-playbooks.md`）。本地 skill 全部加载过且确实未命中，才允许 `security_search` 搜 writeup。产品/CVE 路由命中后仍需在当前响应上验证，不能把知识条目当成功证据。**已加载的 exploit 要复用、不要重建**：加载过含 payload 的 skill 后，需要利用时**再次 `skill_load` 回看并逐字复制那段 payload**，禁止凭记忆重写残缺版；评测环境无外网，**禁止 `curl`/下载外部 scanner 脚本**（如 raw.githubusercontent.com 必然超时）。
 4. **执行**：bash/read_file/grep 等工具一次聚焦一个目标；同一请求结构或 payload 连续失败后记录边界并换大方向。不要用循环掩盖重复尝试。
 5. **验证与提交**：只有工具输出中出现完整 `XXX{...}` 或明确计算/读取结果时才提交；提交响应给出进度后，若未完成必须查询剩余数量并继续。
 6. **记录**：把当前实例的凭据、漏洞、拓扑和失败边界写入 Memory；不要把旧题号、旧地址、历史答案或未经验证的推测写入事实。
@@ -22,7 +25,7 @@
 **多阶段渗透题（b 类，多 flag）**：内网横向移动（探测不同内网 IP/端口、逐台验证）是**合法且必需**的信息收集，不受上述爆破限速约束。
 - 但仍禁止：对同一目标反复爆破同一参数。
 - 优先：用已拿到的凭据/拓扑/IP 精确访问，不盲目全量扫。
-- **拿到 RCE 后**：一旦 `find`/`ls` 发现 `flag*` 文件，**立即用当前 RCE 通道 `cat` 该文件并把内容带回工具输出**（例如日志污染通道：投毒 User-Agent `system('cat /challenge/flag1.txt')` 后再读日志 grep 回内容）。禁止只读 `ls` 目录结果、或把 cat 输出落盘到远程 `/tmp` 后去读别的文件、或转头去扫内网——flag 内容必须出现在本次工具输出里。
+- **拿到 RCE 后**：**第一步就一次性 `find / -name 'flag*' -type f -exec cat {} \; 2>/dev/null`（或 `find / -name 'flag*' 2>/dev/null | xargs cat 2>/dev/null`）把全部 flag 内容带回工具输出**，禁止先 `ls -la` 逐步探索目录（b-02 教训：逐步探索把时间耗光）。若 flag 文件在 `/challenge/` 下，优先 `cat /challenge/flag*`。禁止只读 `ls` 结果、把 cat 输出落盘到远程 `/tmp`、或转头去扫内网——flag 内容必须出现在本次工具输出里。
 
 **SSRF 内网探测**：通过 SSRF 端点（`/import`、`/fetch`、`/proxy` 等）探测内网是本题核心，属于合法迭代利用，不应因限速而放弃该端点。
 - 优先：先拿到泄露的 internal_url/配置/凭据，再精确访问；需要枚举多个内网服务时，用一段本地 python 脚本对该 SSRF 端点循环打不同内网 URL，一次带回全部结果，而不是逐条 curl 撞限速。
@@ -30,6 +33,7 @@
 **遇限速信号（`[阻止]`/`⚠️ 循环警告`）**：停止**盲目字典爆破**，但**不要放弃仍未验证的真实利用入口**。正确反应是：若该入口是 oracle 型利用（注入/SSRF/伪造），改用本地脚本一次性完成迭代；若确属盲猜，回到 Memory 里已有的凭据/token/已验证路径复用。**不要把限速误判成“题目此路不通”。**
 
 ## 控制规则
+- **脚本报连接/解析错误时先修脚本 bug 再重试**：`NameResolutionError`、`ConnectionRefused`、`InvalidURL` 这类错误通常是脚本自身的 URL 拼接 bug（少了一个 `/`，如 `host='10.0.186.89login'`）、端口写错、或 headers 格式错。看到这类报错，先检查脚本里的 base URL 拼接和请求构造，禁止反复重跑同一个 bug 脚本（a-03 教训：路径扫描脚本 URL 拼接错，连续几十轮报错烧光预算）。
 - 每轮应有有意义的工具动作；如果没有可靠下一步，先查看 Memory/Ideas 或加载合适 Skill，不要重复空扫描。
 - **重跑/重试时**：直接用自动注入的 Memory/Ideas 看板（已含上一轮的已知事实与失败边界）确认当前实例地址后**立即继续攻击真实入口**。禁止 `cat`/`grep` 翻 `.execution-journal.jsonl`、`.tool-results/`、`.session-lineage.jsonl` 等原始日志做“考古”——那是流水账，不是证据，会烧光预算且容易把截断提示头误读成服务器响应。看板里没有的信息，靠一次新的探测拿，而不是回翻旧日志。
 - 代码控制面会按难度设置轮次、无进展切换和停止预算。重复输出、重复 HTTP 状态或重复提交不算进展；达到预算就停止，不要用“必须继续”覆盖停机条件。

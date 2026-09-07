@@ -12,8 +12,8 @@ decrypted = bytes(e ^ key[i % len(key)] for i, e in enumerate(encrypted))
 print(decrypted)
 
 # 如果密钥未知，尝试已知明文攻击
-# 假设 flag 以 "flag{" 开头
-known = b"flag{"
+# ⚠️ 前缀可能是大写 FLAG{ 或小写 flag{（f2-01 教训），先探测两种：
+known = b"flag{"   # 先试小写；若解出的 key 片段不合理，换 b"FLAG{" 再试
 key_fragment = bytes(e ^ k for e, k in zip(encrypted[:5], known))
 print("Possible key fragment:", key_fragment)
 ```

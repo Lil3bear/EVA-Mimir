@@ -4,6 +4,7 @@ import re
 import threading
 from pathlib import Path
 
+from solver.ctfplatform.policy import infer_challenge_type
 from solver.worker_context import ctx as _ctx
 from shared.jsonl import write_line
 
@@ -85,16 +86,30 @@ class ObserverLoop:
         self._allow_strong_intervention = bool(
             settings.get("solver", {}).get("observer_strong_intervention", True)
         )
+        from solver.runtime.observer_policy import normalize_observer_mode
+
+        self._observer_mode = normalize_observer_mode(
+            settings.get("solver", {}).get("observer_mode", "advisory")
+        )
+        if self._observer_mode == "off":
+            self.enabled = False
+        self._skill_chain_open = False
         self._round_logs: list[dict] = []
         self._current_round: dict | None = None
         self._lock = threading.Lock()
         self._review_thread: threading.Thread | None = None
+        default_every = 10 if self._observer_mode == "advisory" else 6
         try:
             self.review_every = max(
-                1, int(settings.get("solver", {}).get("observer_every_rounds", 6))
+                1,
+                int(
+                    settings.get("solver", {}).get(
+                        "observer_every_rounds", default_every
+                    )
+                ),
             )
         except (TypeError, ValueError):
-            self.review_every = 6
+            self.review_every = default_every
         # 内容指纹去重：相同方向的纠偏只发一次，不限轮次
         self._sent_correction_fps: set[str] = set()
         # 无进展检测：记录上次审查时 ideas 的 active 状态快照
@@ -106,6 +121,10 @@ class ObserverLoop:
         self._VECTOR_CYCLE_THRESHOLD = 4  # 第 4 轮前强制切换已连续失败的方向
         self._run_context = _ctx.snapshot()
         self._client = _ctx.client
+
+    def set_runtime_gates(self, *, skill_chain_open: bool = False) -> None:
+        """Agent 每轮刷新：知识链未闭合时压制纠偏。"""
+        self._skill_chain_open = bool(skill_chain_open)
 
     def trigger_now(self, reason: str = "", extra_context: str = "") -> None:
         """立即触发一次 Observer 审查（不等周期）。"""
@@ -228,7 +247,10 @@ class ObserverLoop:
         )
 
         if self.on_correction:
-            if self._should_send_correction(message, round_num):
+            decision = self._load_decision()
+            if self._should_send_correction(
+                message, round_num, strong_intervention=True, decision=decision
+            ):
                 self.on_correction(message, round_num)
 
         # 同时触发 Observer 审查，让它结合 Memory/Ideas 做更智能的纠偏
@@ -297,7 +319,33 @@ class ObserverLoop:
             return Path(_ctx.attempt_dir)
         return ObserverLoop._get_challenge_dir()
 
-    def _should_send_correction(self, content: str, current_round: int) -> bool:
+    def _should_send_correction(
+        self,
+        content: str,
+        current_round: int,
+        *,
+        strong_intervention: bool = False,
+        decision: dict | None = None,
+    ) -> bool:
+        from solver.runtime.observer_policy import correction_allowed
+
+        allowed, reason = correction_allowed(
+            mode=self._observer_mode,
+            decision=decision,
+            skill_chain_open=self._skill_chain_open,
+            strong_intervention=strong_intervention,
+        )
+        if not allowed:
+            write_line({
+                "type": "observer_correction_suppressed",
+                "data": {
+                    "reason": reason,
+                    "round": current_round,
+                    "mode": self._observer_mode,
+                    "strong": strong_intervention,
+                },
+            })
+            return False
         # 只做内容指纹去重，不限轮次 cooldown
         # 相同方向的纠偏只发一次，不同方向不管多近都允许发
         fp = hashlib.md5(content.encode()).hexdigest()[:8]
@@ -305,6 +353,13 @@ class ObserverLoop:
             return False
         self._sent_correction_fps.add(fp)
         return True
+
+    def _load_decision(self, root: Path | None = None) -> dict:
+        try:
+            from solver.runtime.strategy_controller import load_decision_summary
+            return load_decision_summary(root or self._get_attempt_dir()) or {}
+        except Exception:
+            return {}
 
     def _check_progress(self, challenge_dir: Path, current_round: int) -> None:
         """
@@ -361,14 +416,14 @@ class ObserverLoop:
             "",
         ]
         if evidence or facts:
-            lines.append("## 已验证事实（禁止丢失，直接复用，不要再重新探测）")
+            lines.append("## 已验证事实（优先复用；实例漂移时先复核 IP/路径）")
             for m in evidence[-6:]:
                 lines.append(f"  - [evidence] {m.content}")
             for m in facts[-6:]:
                 lines.append(f"  - [fact] {m.content}")
             lines.append("")
         if failures or failed:
-            lines.append("## 失败边界（禁止重复，再试即浪费轮次）")
+            lines.append("## 失败边界（新证据/新实例下可再试；勿当绝对死路）")
             for m in failures[-5:]:
                 lines.append(f"  - {m.content}")
             for i in failed:
@@ -376,11 +431,23 @@ class ObserverLoop:
                 lines.append(f"  - {i.content}{result_str}")
             lines.append("")
         lines.append("## 关键约定（满足条件立即执行，不要继续当前循环）")
-        lines.append(
-            "  - 本平台 flag 都在 `/challenge/flag*.txt`：一旦拿到任意文件读取/LFI/路径穿越/RCE，"
-            "第一时间 `cat /challenge/flag1.txt`（或 flag.txt/flag2.txt），把内容带回工具输出；"
-            "禁止只读 `ls`、禁止把内容写到远程 /tmp 后去读别的文件。"
+        code = str(
+            getattr(getattr(self, "_run_context", None), "unique_code", "") or ""
         )
+        profile = infer_challenge_type(code)
+        if profile.primary_skill == "reverse":
+            # 逆向/固件题：flag 是算出来的 key/授权码，不是文件读取。
+            lines.append(
+                "  - 本题是逆向/固件校验：flag 是**算出来的 key/授权码**，不在"
+                "`/challenge/flag*.txt`。禁止瞎猜 key 或反复盲提交；回到 `strings`/"
+                "`objdump`/反汇编定位校验逻辑，用 z3 或本地脚本求解正确 key 后再提交。"
+            )
+        else:
+            lines.append(
+                "  - 本平台 flag 都在 `/challenge/flag*.txt`：一旦拿到任意文件读取/LFI/路径穿越/RCE，"
+                "第一时间 `cat /challenge/flag1.txt`（或 flag.txt/flag2.txt），把内容带回工具输出；"
+                "禁止只读 `ls`、禁止把内容写到远程 /tmp 后去读别的文件。"
+            )
         lines.append(
             "  - 已拿到凭据/webshell 时，直接复用它们推进，不要回头重新枚举入口。"
         )
@@ -396,7 +463,10 @@ class ObserverLoop:
         )
 
         message = "\n".join(lines)
-        if self._should_send_correction(message, current_round):
+        decision = self._load_decision()
+        if self._should_send_correction(
+            message, current_round, strong_intervention=True, decision=decision
+        ):
             if self.on_correction:
                 self.on_correction(message, current_round)
 
@@ -406,13 +476,16 @@ class ObserverLoop:
         if not self.enabled:
             return
         current_round = rounds[-1]["round"] if rounds else 0
+        decision = self._load_decision(attempt_dir)
 
         def guarded_correction(content) -> None:
             if not self.enabled:
                 return
             advice_round = int(getattr(content, "reviewed_round", current_round) or 0)
             rendered = content.render() if hasattr(content, "render") else str(content)
-            if self._should_send_correction(rendered, advice_round):
+            if self._should_send_correction(
+                rendered, advice_round, decision=decision
+            ):
                 if self.on_correction:
                     try:
                         self.on_correction(content, advice_round)
@@ -421,7 +494,7 @@ class ObserverLoop:
             else:
                 write_line({
                     "type": "observer_correction_suppressed",
-                    "data": {"reason": "cooldown_or_duplicate", "round": advice_round},
+                    "data": {"reason": "policy_or_duplicate", "round": advice_round},
                 })
 
         try:
@@ -433,6 +506,8 @@ class ObserverLoop:
                     challenge_dir=challenge_dir,
                     attempt_dir=attempt_dir,
                     on_correction=guarded_correction,
+                    observer_mode=self._observer_mode,
+                    skill_chain_open=self._skill_chain_open,
                 )
         except Exception as e:
             write_line({"type": "observer_error", "data": {"msg": str(e)}})

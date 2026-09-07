@@ -19,6 +19,7 @@ description: 处理二进制逆向/固件分析题：ELF/PE 逆向、加密算�
 | 加密/编码算法还原 | `algorithms.md` |
 | 需要 patch 二进制绕过检测 | `binary-patching.md` |
 | 固件、VM、自制格式 | `vm-and-firmware.md` |
+| putc 只吐 `.` / 组合公式被混淆删除 | **同上** → 停手推 op，按需 `pip install angr` |
 | 授权引擎/许可证/序列号校验 | `embedded-license.md` |
 | 卡住时的通用解题策略 | `solve-strategies.md` |
 

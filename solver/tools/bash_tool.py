@@ -7,7 +7,8 @@ from collections import Counter
 from urllib.parse import urlsplit
 
 from solver.worker_context import ctx as _ctx
-from solver.tools import knowledge_router
+from solver.tools import knowledge_router, skill_router
+from solver.runtime.workspace_guard import block_foreign_workspace, tool_results_dir
 
 # 常量
 _DEDUP_WINDOW = 10
@@ -290,6 +291,10 @@ def execute(args: dict) -> str:
     if not cmd:
         return "[错误] 命令不能为空"
 
+    blocked = block_foreign_workspace(cmd, action="执行跨题")
+    if blocked:
+        return blocked
+
     # 将全局 benchmark deadline 传递到工具层，避免一个 600 秒脚本
     # 越过总时限。没有 deadline 的本地 Bridge 模式保持旧行为。
     import time
@@ -403,13 +408,32 @@ def execute(args: dict) -> str:
     except Exception as e:
         output = f"[错误] 执行失败：{e}"
 
+    # 关键情报必须在截断前从完整输出抽取，否则中间段 password/flag 会丢。
+    extract_prefix = _auto_extract(output, cmd)
+    board_warn = ""
+    try:
+        from solver.runtime.stage_board import rescan_warning
+
+        if _ctx.challenge_dir and _ctx.challenge_dir != "/workspace":
+            board_warn = rescan_warning(_ctx.challenge_dir, cmd)
+    except Exception:
+        board_warn = ""
+
     if len(output) > MAX_OUTPUT:
         saved_path = _save_full_output(cmd, output)
+        total_bytes = len(output)
         tail = output[-3000:]
         head = output[:500]
+        extract_note = ""
+        if extract_prefix.strip():
+            extract_note = (
+                "[提示] 上方自动提取基于完整输出（含被截断的中间段）；"
+                "勿把 HTTP 状态码当凭据。\n"
+            )
         output = (
-            f"[输出过长（{len(output)} 字节），已截断]\n"
+            f"[输出过长（{total_bytes} 字节），已截断]\n"
             f"[完整结果已保存至：{saved_path}，可用 bash 工具执行 grep/cat 查询]\n"
+            f"{extract_note}"
             f"[开头 500 字节]\n{head}\n"
             f"... (省略中间部分) ...\n"
             f"[末尾 3000 字节]\n{tail}"
@@ -443,14 +467,12 @@ def execute(args: dict) -> str:
         # 连接成功，重置该 host 的失败计数
         _ctx.host_fail_counter[host] = 0
 
-    return repeat_warn + approach_warn + conn_warn + _auto_extract(output, cmd) + output
+    return repeat_warn + approach_warn + board_warn + conn_warn + extract_prefix + output
 
 
 def _save_full_output(cmd: str, output: str) -> str:
     import time, hashlib
-    # 每题独立的 tool-results 目录（并行安全）
-    base_dir = _ctx.attempt_dir if (_ctx.attempt_dir and _ctx.attempt_dir != "/workspace") else "/root/workspace"
-    results_dir = os.path.join(base_dir, ".tool-results")
+    results_dir = tool_results_dir()
     os.makedirs(results_dir, exist_ok=True)
     ts = int(time.time() * 1000)
     slug = hashlib.md5(cmd.encode()).hexdigest()[:8]
@@ -470,6 +492,55 @@ _MIDDLEWARE_KEYWORDS = [
     "1panel", "comfyui", "comfyui-manager", "ofbiz",
 ]
 
+# 凭据键：禁止被路径片段命中（/etc/passwd: 200）。
+_CRED_KEY_RE = (
+    r"(?<![A-Za-z0-9/.])"
+    r"(?:password|passwd|pwd|token|secret|api[_-]?key|apikey|"
+    r"db_pass|mysql_pwd|mysql_password)"
+)
+_CRED_ASSIGN_RE = re.compile(
+    _CRED_KEY_RE + r"""\s*[=:]\s*['"]?([^\s'"<>\\]{3,60})""",
+    re.IGNORECASE,
+)
+_BAD_CRED_VALUES = frozenset({
+    "true", "false", "null", "none", "undefined", "nil",
+    "password", "passwd", "secret", "token", "changeme",
+    "****", "xxxxxx", "placeholder",
+})
+
+
+def _credential_value_ok(value: str, *, full_match: str = "") -> bool:
+    """Filter status-code / path-scan false positives from credential hints."""
+    v = str(value or "").strip().strip("'\"")
+    if len(v) < 3 or len(v) > 60:
+        return False
+    if v.lower() in _BAD_CRED_VALUES:
+        return False
+    if re.fullmatch(r"\d{3}", v):
+        code = int(v)
+        if 100 <= code <= 599:
+            return False
+    if v.startswith(("/", "<", "{")) or "://" in v:
+        return False
+    if re.fullmatch(r"len=\d+", v, re.I):
+        return False
+    # 扫描行：`/etc/passwd: 200 len=153` / `path: 403 len=`
+    ctx = str(full_match or "")
+    if re.search(rf":\s*{re.escape(v)}\s+len\s*=", ctx, re.I):
+        return False
+    if re.search(r"/\s*etc\s*/\s*passwd", ctx, re.I):
+        return False
+    return True
+
+
+def _extract_credential_values(output: str) -> list[str]:
+    found: list[str] = []
+    for match in _CRED_ASSIGN_RE.finditer(output or ""):
+        value = match.group(1)
+        if _credential_value_ok(value, full_match=match.group(0)):
+            found.append(value.strip().strip("'\""))
+    return found
+
 
 def _auto_extract(output: str, command: str = "") -> str:
     """
@@ -482,22 +553,47 @@ def _auto_extract(output: str, command: str = "") -> str:
 
     findings: list[str] = []
 
-    # 1. flag 格式字符串
-    flags = re.findall(r'[A-Za-z0-9_]+\{[^}]{4,80}\}', output)
+    # 1. flag 格式字符串。平台统一 flag{...}（兼容 ctf{...}）。
+    # 只匹配 flag/ctf 前缀，避免把 CSS/代码里的 xxx{...} 误报成 flag
+    # （run c-03：body{color:#000;background:#fff} 被误当 flag，污染每条输出、
+    # 还可能诱发错误提交烧掉提交额度）。
+    flags = re.findall(r'(?i)\b(?:flag|ctf)\{[^}]{3,80}\}', output)
     if flags:
-        # 去重
         unique_flags = list(dict.fromkeys(flags))
-        findings.append(f"⚡ 发现疑似 flag：{unique_flags[:3]}，立即用 challenge_submit_flag 提交！")
+        from solver.runtime.submit_verify import is_decoy_flag_context
+
+        decoy = any(is_decoy_flag_context(output, flag) for flag in unique_flags)
+        if decoy:
+            findings.append(
+                "⚠️ [诱饵警告] /challenge/flag*.txt 批量扫描或异常协议输出中的 flag "
+                "通常是诱饵，禁止直接提交；请走已验证的漏洞链。"
+            )
+        else:
+            findings.append(
+                f"⚡ 发现疑似 flag：{unique_flags[:3]}，立即用 challenge_submit_flag 提交！"
+            )
 
     # 2. 凭据（password/token/secret/key = xxx）
-    cred_patterns = re.findall(
-        r'(?:password|passwd|pwd|token|secret|api_key|apikey|db_pass|mysql_pwd)'
-        r'\s*[=:]\s*[\'"]?([^\s\'"<>]{3,60})',
-        output, re.IGNORECASE
-    )
+    # 禁止把 /etc/passwd: 200 或扫描行 status code 当成口令。
+    cred_patterns = _extract_credential_values(output)
     if cred_patterns:
         unique_creds = list(dict.fromkeys(cred_patterns))[:5]
         findings.append(f"🔑 发现疑似凭据：{unique_creds}，立即尝试用这些凭据登录/连接！")
+        try:
+            if _ctx.challenge_dir and _ctx.challenge_dir != "/workspace":
+                from solver.runtime.stage_board import land_credentials
+
+                landed = land_credentials(
+                    _ctx.challenge_dir,
+                    unique_creds,
+                    producer_attempt=getattr(_ctx, "attempt_id", "primary") or "primary",
+                )
+                if landed:
+                    findings.append(
+                        f"📌 已落地 {len(landed)} 条凭据到阶段看板（截断后仍可读 artifact_list）。"
+                    )
+        except Exception:
+            pass
 
     # 3. 内网 IP
     internal_ips = re.findall(
@@ -513,18 +609,53 @@ def _auto_extract(output: str, command: str = "") -> str:
                       and ip != target_host]
         if unique_ips:
             findings.append(f"🌐 发现内网 IP：{unique_ips[:5]}，可能需要横向移动！")
+            try:
+                if _ctx.challenge_dir and _ctx.challenge_dir != "/workspace":
+                    from solver.runtime.stage_board import land_hosts
+
+                    landed = land_hosts(
+                        _ctx.challenge_dir,
+                        unique_ips[:8],
+                        producer_attempt=getattr(_ctx, "attempt_id", "primary") or "primary",
+                    )
+                    if landed:
+                        findings.append(
+                            f"📌 已落地 {len(landed)} 台 host 到阶段看板；下一跳用已有凭据，禁止全盘重扫。"
+                        )
+            except Exception:
+                pass
 
     # 4. 中间件/框架识别 → 确定性 CVE 路由（本地表命中直接注入，不靠模型回忆）
+    # 同 attempt 内同一条 hint 只注入一次，避免每条 curl 都刷屏（c-03/c-08）。
     cve_hint = knowledge_router.lookup(output, context=command)
     if cve_hint:
-        findings.append(cve_hint)
+        seen = getattr(_ctx, "seen_knowledge_hints", None)
+        if seen is None:
+            _ctx.seen_knowledge_hints = set()
+            seen = _ctx.seen_knowledge_hints
+        key = cve_hint.strip()
+        if key not in seen:
+            seen.add(key)
+            findings.append(cve_hint)
+
+    # 5. 非 CVE 指纹 → skill playbook 路由（JWT kid / Gradio 白名单 / ComfyUI / 协议题）
+    skill_hint = skill_router.lookup(output, context=command)
+    if skill_hint:
+        seen = getattr(_ctx, "seen_knowledge_hints", None)
+        if seen is None:
+            _ctx.seen_knowledge_hints = set()
+            seen = _ctx.seen_knowledge_hints
+        skey = skill_hint.strip()
+        if skey not in seen:
+            seen.add(skey)
+            findings.append(skill_hint)
     else:
         output_lower = output.lower()
         detected_mw = [mw for mw in _MIDDLEWARE_KEYWORDS if mw in output_lower]
-        if detected_mw:
+        if detected_mw and not cve_hint:
             findings.append(
                 f"🔍 识别到中间件：{detected_mw[:3]}"
-                f"（本地 CVE 表未命中，可用 security_search 补充，结果必须 bash 验证）"
+                f"（本地 CVE 表未命中，先用 skill_load 查 playbook，禁止 security_search）"
             )
 
     if not findings:

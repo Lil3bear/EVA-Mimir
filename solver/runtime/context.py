@@ -162,6 +162,10 @@ class WorkerContext(threading.local):
         self.recent_fingerprints: list[str] = []
         self.approach_counter: Counter = Counter()
         self.host_fail_counter: Counter = Counter()
+        # Per-attempt dedup for knowledge_router banners injected into bash
+        # output.  Re-injecting the same CVE/port hint every curl (c-03/c-08)
+        # crowds out real response bytes and steers the model toward search.
+        self.seen_knowledge_hints: set[str] = set()
         self.observer_trigger_callback = None
 
 

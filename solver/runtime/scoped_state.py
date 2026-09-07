@@ -231,14 +231,48 @@ def promote_memory_proposal(challenge_dir: str | Path, proposal_id: str) -> str:
     if data.get("status") != "pending":
         return f"[共享证据] proposal 状态为 {data.get('status', 'unknown')}，未处理"
 
+    kind = str(data.get("kind", "fact"))
+    content = str(data.get("content", "")).strip()
+    from solver.runtime.observer_policy import memory_write_allowed
+
+    allowed, gate_reason = memory_write_allowed(content, kind=kind or "fact")
+    if not allowed:
+        data["status"] = "rejected"
+        data["rejected_at"] = time.time()
+        data["reject_reason"] = f"pollution_gate:{gate_reason}"
+        tmp = path.with_suffix(f".{os.getpid()}.{time.time_ns()}.tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+        return (
+            f"[拒绝] proposal {proposal_id} 含污染内容（{gate_reason}），未 promote。"
+        )
+
     entry, created = memory_store.add_memory_with_status(
         shared_root(challenge_dir),
-        kind=str(data.get("kind", "fact")),
-        content=str(data.get("content", "")),
+        kind=kind,
+        content=content,
         refs=list(data.get("refs") or []),
         source="observer-approved",
         attempt_id=str(data.get("source_attempt", "")),
     )
+    # Record the promote as a structured, rollback-able refinement event.
+    if created:
+        try:
+            from solver.runtime.harness import RefinementLog
+            RefinementLog(challenge_dir).append({
+                "action": "promote",
+                "kind": str(data.get("kind", "fact")),
+                "memory_id": entry.id,
+                "scope": "challenge_shared",
+                "reason": f"observer approved proposal {proposal_id}",
+                "root": str(shared_root(challenge_dir)),
+                "before": None,
+                "after": entry.__dict__,
+                "source": "observer-approved",
+                "attempt_id": str(data.get("source_attempt", "")),
+            })
+        except Exception:
+            pass
     data["status"] = "approved"
     data["approved_at"] = time.time()
     data["approved_memory_id"] = entry.id

@@ -14,7 +14,9 @@ for f in flag:
     s.add(f >= 32, f <= 126)
 
 # 添加前缀约束（如 flag{）
-s.add(flag[0] == ord('f'))
+# ⚠️ 前缀可能是大写 FLAG{（f2-01 教训）：若按小写 flag{ 约束无解，改用大写 FLAG{ 再试；
+#    更稳妥：先不加前缀约束，只约束可打印，解出后肉眼识别。
+s.add(flag[0] == ord('f'))   # 小写假设；无解时改 ord('F')
 s.add(flag[1] == ord('l'))
 s.add(flag[2] == ord('a'))
 s.add(flag[3] == ord('g'))

@@ -239,9 +239,70 @@ def _challenge_dir() -> str:
     return d
 
 
+def _snapshot_platform_progress() -> dict:
+    """Best-effort platform flag progress for the active challenge."""
+    code = _current_unique_code()
+    if not code or _ctx.client is None:
+        return {
+            "available": False,
+            "correct": -1,
+            "total": -1,
+            "code": code,
+            "completed": False,
+        }
+    try:
+        state = _request_backend("challenge_get_state", {"unique_code": code})
+        if state.get("challenges"):
+            return {
+                "available": False,
+                "correct": -1,
+                "total": -1,
+                "code": code,
+                "completed": False,
+            }
+        return {
+            "available": True,
+            "correct": int(state.get("correct_flag_count", 0)),
+            "total": int(state.get("flag_count", 0) or 1),
+            "code": str(state.get("name") or state.get("unique_code") or code),
+            "completed": bool(state.get("is_completed")),
+        }
+    except (TaskNotFound, InvalidState):
+        raise
+    except Exception:
+        return {
+            "available": False,
+            "correct": -1,
+            "total": -1,
+            "code": code,
+            "completed": False,
+        }
+
+
+def _submit_verified(
+    before: dict,
+    after: dict,
+    api_data: dict,
+) -> bool:
+    """Confirm the platform actually advanced for this challenge."""
+    if not before.get("available") or not after.get("available"):
+        return bool(api_data.get("correct"))
+    expected = (_current_unique_code() or "").strip().lower()
+    actual = str(after.get("code", "")).strip().lower()
+    if expected and actual and actual != expected:
+        return False
+    if after.get("completed"):
+        return True
+    try:
+        return int(after.get("correct", 0)) > int(before.get("correct", 0))
+    except (TypeError, ValueError):
+        return bool(api_data.get("correct"))
+
+
 def submit_flag(args: dict) -> str:
     flag = args.get("flag", "").strip()
     writeup = args.get("writeup", "")
+    before_progress = _snapshot_platform_progress()
 
     def submit_once() -> dict:
         try:
@@ -299,6 +360,34 @@ def submit_flag(args: dict) -> str:
         )
 
     data = outcome.response or {}
+    if data.get("correct"):
+        after_progress = _snapshot_platform_progress()
+        if not _submit_verified(before_progress, after_progress, data):
+            wrong = outcome.wrong_count
+            warn = ""
+            if wrong >= 3:
+                warn = (
+                    f"\n⚠️ 已累计提交 {wrong} 个错误 flag。"
+                    "立即停止猜 flag，回到题目逻辑重新分析，找到确定证据后再提交。"
+                )
+            mismatch = ""
+            if (
+                before_progress.get("available")
+                and after_progress.get("available")
+                and (_current_unique_code() or "").strip().lower()
+                != str(after_progress.get("code", "")).strip().lower()
+            ):
+                mismatch = (
+                    f"平台状态题号不匹配（期望 {_current_unique_code()}，"
+                    f"实际 {after_progress.get('code')}）。"
+                )
+            return (
+                f"[✗] Flag 提交未计分：{flag}。"
+                f"{mismatch or '平台进度未增加（常见于 /challenge/flag*.txt 诱饵或跨题污染）。'}"
+                "请从已验证的漏洞链获取 flag 后再提交。"
+                f"{warn}{persistence_warning}"
+            )
+    board_note = ""
     if challenge_dir and data:
         try:
             stage_state = StageLedger(challenge_dir).record_submission(
@@ -315,6 +404,22 @@ def submit_flag(args: dict) -> str:
                 attempt_id=getattr(_ctx, "attempt_id", "primary"),
                 run_id=getattr(_ctx, "run_id", ""),
             )
+            if data.get("correct"):
+                try:
+                    from solver.runtime.stage_board import land_flag_progress, board_snapshot
+
+                    land_flag_progress(
+                        challenge_dir,
+                        correct=int(stage_state.get("correct_flags") or data.get("correct_flag_count") or 0),
+                        total=int(stage_state.get("total_flags") or data.get("total_flag_count") or 0),
+                        matched_index=data.get("matched_flag_index"),
+                        producer_attempt=getattr(_ctx, "attempt_id", "primary") or "primary",
+                    )
+                    snap = board_snapshot(challenge_dir)
+                    if snap:
+                        board_note = "\n" + snap
+                except Exception:
+                    board_note = ""
         except Exception as exc:
             # Submission remains authoritative; ledger is a coordination aid.
             data.setdefault("stage_ledger_warning", str(exc))
@@ -336,9 +441,16 @@ def submit_flag(args: dict) -> str:
         suffix = f"，本次得分 {score}" if score is not None else ""
         progress = f"（进度 {correct}/{total}）"
         if completed:
-            return f"[✓] Flag 提交正确：{flag}{suffix}{progress} 🎉 全部 Flag 已找到，题目完成！{persistence_warning}"
+            return (
+                f"[✓] Flag 提交正确：{flag}{suffix}{progress} "
+                f"🎉 全部 Flag 已找到，题目完成！{persistence_warning}{board_note}"
+            )
         else:
-            return f"[✓] Flag 提交正确：{flag}{suffix}{progress} 还有剩余 Flag，请继续寻找！{persistence_warning}"
+            return (
+                f"[✓] Flag 提交正确：{flag}{suffix}{progress} "
+                f"还有剩余 Flag，请继续寻找！下一跳从阶段看板出发，禁止对已知 host 全盘重扫。"
+                f"{persistence_warning}{board_note}"
+            )
     else:
         wrong = outcome.wrong_count
         warn = ""
@@ -385,6 +497,15 @@ def get_state(args: dict) -> str:
     ]
     if stage_line:
         lines.append(stage_line)
+    if challenge_dir:
+        try:
+            from solver.runtime.stage_board import board_snapshot
+
+            snap = board_snapshot(challenge_dir)
+            if snap:
+                lines.append(snap)
+        except Exception:
+            pass
     if data.get("is_completed"):
         lines.append("状态：✅ 已完成（全部 Flag 已提交）")
     else:

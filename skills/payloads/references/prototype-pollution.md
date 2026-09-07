@@ -1,5 +1,9 @@
 # Prototype Pollution
 
+> **路由警告（防自污染）**：本题若是 **Python/PyDash/Sanic**（HTML 含 PyDash、描述含 pydash），
+> **必须** `skill_load(web, prototype-pollution-pydash.md)`，**不要**用本文件。
+> 本文件是 **JavaScript / Node.js** `Object.prototype` 污染语料；错栈加载会把可解题带歪。
+
 > Prototype pollution is a type of vulnerability that occurs in JavaScript when properties of Object.prototype are modified. This is particularly risky because JavaScript objects are dynamic and we can add properties to them at any time. Also, almost all objects in JavaScript inherit from Object.prototype, making it a potential attack vector.
 
 ## Summary

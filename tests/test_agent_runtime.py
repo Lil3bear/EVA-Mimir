@@ -119,8 +119,17 @@ class DeepSeekTransportTests(unittest.TestCase):
         self.assertEqual(kwargs["max_tokens"], 65536)
         self.assertEqual(kwargs["extra_body"]["thinking"], {"type": "enabled"})
         # reasoning_effort 必须是顶层字段（extra_body 传法 tokenhub 不生效）
-        self.assertEqual(kwargs["reasoning_effort"], "high")
+        self.assertEqual(kwargs["reasoning_effort"], "medium")
         self.assertNotIn("reasoning_effort", kwargs["extra_body"])
+
+    def test_reasoning_effort_cap_clamps_high(self):
+        kwargs = completion_kwargs(
+            model="deepseek-v4-flash",
+            messages=[],
+            reasoning_effort="high",
+            reasoning_effort_cap="medium",
+        )
+        self.assertEqual(kwargs["reasoning_effort"], "medium")
 
     def test_generic_request_keeps_tool_choice(self):
         kwargs = completion_kwargs(
@@ -138,7 +147,23 @@ class DeepSeekTransportTests(unittest.TestCase):
             thinking_enabled=False,
         )
 
-        self.assertEqual(kwargs["extra_body"], {"thinking": {"type": "disabled"}})
+        self.assertEqual(kwargs["extra_body"]["thinking"], {"type": "disabled"})
+        self.assertNotIn("reasoning_effort", kwargs)
+
+    def test_glm_structure_call_uses_auto_and_forced_thinking(self):
+        """GLM-5.3-flash 兜底：结构调用 tool_choice=auto，thinking 不可 disabled。"""
+        kwargs = completion_kwargs(
+            model="glm-5.3-flash",
+            messages=[{"role": "user", "content": "task"}],
+            tools=[{"type": "function"}],
+            tool_choice="required",  # 调用方即便传 required 也要降级为 auto
+            reasoning_effort="medium",
+            thinking_enabled=False,  # 调用方即便想关也必须 enabled
+        )
+        self.assertEqual(kwargs["tool_choice"], "auto")
+        self.assertEqual(kwargs["extra_body"]["thinking"], {"type": "enabled"})
+        self.assertEqual(kwargs["reasoning_effort"], "high")  # medium → high
+        self.assertNotIn("disabled", str(kwargs.get("extra_body")))
 
     def test_tool_call_message_keeps_reasoning_and_non_null_content(self):
         message = SimpleNamespace(
@@ -203,7 +228,6 @@ class SecuritySearchTests(unittest.TestCase):
     def tearDown(self):
         search_tool._search_client = None
         search_tool._search_model = ""
-        search_tool._search_source = ""
 
     def test_deepseek_search_disables_thinking(self):
         captured = {}
@@ -219,7 +243,6 @@ class SecuritySearchTests(unittest.TestCase):
             chat=SimpleNamespace(completions=SimpleNamespace(create=create))
         )
         search_tool._search_model = "deepseek-v4-flash"
-        search_tool._search_source = "deepseek"
 
         result = search_tool._search_llm("unknown benchmark task")
 
@@ -238,7 +261,6 @@ class SecuritySearchTests(unittest.TestCase):
             )
         )
         search_tool._search_model = "deepseek-v4-flash"
-        search_tool._search_source = "deepseek"
 
         result = search_tool._search_llm("specific challenge title")
 
@@ -457,6 +479,111 @@ class FlagEvidenceGateTests(unittest.TestCase):
     def test_compaction_summary_counts_as_evidence(self):
         agent = self._make_agent([], compaction_summary="已获取 flag{old_flag_9}，来自 /flag.txt")
         self.assertTrue(agent._flag_has_evidence("flag{old_flag_9}"))
+
+
+class ModelFailoverTests(unittest.TestCase):
+    """同 key 模型故障切换：主模型瞬时错误耗尽后切备用模型，成功后本场粘住。"""
+
+    def _agent(self, fallback):
+        agent = SolverAgent.__new__(SolverAgent)
+        agent._model_failover = list(fallback)
+        agent._preferred_model = None
+        agent.round = 1
+        agent._last_main_tier = "light"
+        agent._difficulty = "medium"
+        agent._current_lane = lambda: "fast"
+        agent._model_stuck_signal = lambda: False
+        # router.resolve → 固定返回 primary spec
+        spec = SimpleNamespace(
+            name="primary-model",
+            provider=SimpleNamespace(key="tokenhub"),
+            is_deepseek_v4=True,
+            max_output_tokens=8192,
+            reasoning_effort="medium",
+            thinking_enabled=True,
+        )
+        sel = SimpleNamespace(spec=spec, tier="light", reason="test")
+        agent._router = SimpleNamespace(resolve=lambda *a, **k: sel)
+        return agent
+
+    def test_failover_switches_and_sticks(self):
+        agent = self._agent(["backup-model"])
+        seen = []
+
+        def fake_retry(model_name, spec):
+            seen.append(model_name)
+            if model_name == "primary-model":
+                raise APITimeoutError(request=httpx.Request("POST", "http://llm.test"))
+            return SimpleNamespace(choices=[SimpleNamespace(message="ok")])
+
+        agent._retry_completion_for_model = fake_retry
+        resp = agent._create_turn_response()
+        self.assertEqual(resp.choices[0].message, "ok")
+        self.assertEqual(seen, ["primary-model", "backup-model"])
+        # 粘住健康模型：下一轮直接用 backup
+        self.assertEqual(agent._preferred_model, "backup-model")
+        seen.clear()
+        agent._create_turn_response()
+        self.assertEqual(seen, ["backup-model"])
+
+    def test_no_fallback_reraises(self):
+        agent = self._agent([])
+
+        def fake_retry(model_name, spec):
+            raise APITimeoutError(request=httpx.Request("POST", "http://llm.test"))
+
+        agent._retry_completion_for_model = fake_retry
+        with self.assertRaises(APITimeoutError):
+            agent._create_turn_response()
+
+    def test_deadline_timeout_does_not_failover(self):
+        agent = self._agent(["backup-model"])
+        seen = []
+
+        def fake_retry(model_name, spec):
+            seen.append(model_name)
+            raise TimeoutError("benchmark deadline exceeded")
+
+        agent._retry_completion_for_model = fake_retry
+        with self.assertRaises(TimeoutError):
+            agent._create_turn_response()
+        # 只试主模型，不切备用（deadline 是全场耗尽，不是端点抖动）
+        self.assertEqual(seen, ["primary-model"])
+
+
+class LlmBudgetAndBackpressureTests(unittest.TestCase):
+    """慢轮超时收紧 + API 抖动背压。"""
+
+    def test_budget_aware_timeout_tightens(self):
+        from solver.runtime.llm import budget_aware_timeout
+
+        self.assertEqual(budget_aware_timeout(0), 120.0)
+        soon = time.time() + 60
+        self.assertLessEqual(budget_aware_timeout(soon), 60.0)
+        self.assertGreaterEqual(budget_aware_timeout(soon), 20.0)
+
+    def test_budget_aware_attempts_drop(self):
+        from solver.runtime.llm import budget_aware_attempts
+
+        self.assertEqual(budget_aware_attempts(0, default=3), 3)
+        self.assertEqual(budget_aware_attempts(time.time() + 50, default=3), 1)
+        self.assertEqual(budget_aware_attempts(time.time() + 120, default=3), 2)
+
+    def test_adaptive_gate_holds_slots_on_timeout(self):
+        from solver.runtime.llm import AdaptiveLLMGate
+
+        gate = AdaptiveLLMGate(4)
+        self.assertEqual(gate.snapshot()["held"], 0)
+        gate.note_failure(
+            APITimeoutError(request=httpx.Request("POST", "http://llm.test")),
+            latency_s=30.0,
+        )
+        snap = gate.snapshot()
+        self.assertTrue(snap["degraded"])
+        self.assertEqual(snap["held"], 2)
+        self.assertEqual(snap["effective"], 2)
+        gate.note_success(1.0)
+        self.assertEqual(gate.snapshot()["held"], 0)
 
 
 class ApproachBudgetTests(unittest.TestCase):

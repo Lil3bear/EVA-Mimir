@@ -192,7 +192,7 @@ def _build_task(config: ChallengeConfig, workspace_dir: Path, solver_settings: d
     active_ideas = [i for i in ideas if i.status != "failed"]
 
     if failed_ideas:
-        lines.append(f"\n## ⛔ 已确认失败的攻击方向（禁止重复，直接跳过）")
+        lines.append(f"\n## ⚠ 先前未成功方向（新证据/新实例下可再试；勿当绝对死路）")
         for i in failed_ideas:
             result_str = f"（{i.result}）" if i.result else ""
             lines.append(f"- {i.content}{result_str}")

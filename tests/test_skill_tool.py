@@ -79,6 +79,29 @@ class KnowledgeRouterTests(unittest.TestCase):
         self.assertIn("CVE-2024-1561", out)
         self.assertIn("curl file=", out)
 
+    def test_hit_does_not_push_security_search(self):
+        # run c-03 回归：命中条目不再注入 security_search（离线无用且带偏），
+        # 且 quick_check 只作指纹参考、不作命中判据。
+        out = knowledge_router.lookup("<title>Gradio</title>")
+        self.assertNotIn("security_search", out)
+        self.assertNotIn("补充搜索", out)
+        self.assertIn("skill_load", out)
+
+    def test_curl_verbose_echo_is_not_web_response(self):
+        # run c-08 回归：curl -sv 在 RST 前会打印 "GET / HTTP/1.1"，
+        # 不能据此触发端口弱信号（Gradio@7860 等）。
+        verbose_rst = (
+            "* Connected to 10.0.169.97 (10.0.169.97) port 7860\n"
+            "> GET / HTTP/1.1\n"
+            "> Host: 10.0.169.97:7860\n"
+            "* Recv failure: Connection reset by peer\n"
+        )
+        self.assertFalse(knowledge_router._looks_like_web(verbose_rst.lower()))
+        self.assertEqual(
+            knowledge_router.lookup(verbose_rst, "curl -sv http://10.0.169.97:7860/"),
+            "",
+        )
+
     def test_no_hit(self):
         self.assertEqual(knowledge_router.lookup("normal page"), "")
 
@@ -146,6 +169,104 @@ class KnowledgeRouterTests(unittest.TestCase):
         knowledge_router._CACHE = None
         self.assertIn("CVE-X", knowledge_router.lookup("x-demo banner"))
         self.assertIn("CVE-X", knowledge_router.lookup("plain", "GET /special HTTP/1.1"))
+
+
+class SkillRouterTests(unittest.TestCase):
+    def test_jwt_kid_routes_to_jwt_attacks(self):
+        from solver.tools import skill_router
+
+        out = skill_router.lookup(
+            'header={"alg":"HS256","kid":"prod.key"}',
+            "python decode jwt",
+        )
+        self.assertIn("JWT kid", out)
+        self.assertIn("jwt-attacks.md", out)
+
+    def test_flask_login_500_routes_to_session_playbook(self):
+        from solver.tools import skill_router
+
+        out = skill_router.lookup(
+            "HTTP/1.1 500 INTERNAL SERVER ERROR\nServer: gunicorn\n",
+            "curl -s -i http://10.0.186.88:80/login",
+        )
+        self.assertIn("资产管理系统", out)
+        self.assertIn("common-vulnerabilities.md", out)
+        self.assertIn("SQLi", out)
+
+    def test_langflow_routes_before_gradio(self):
+        from solver.tools import skill_router
+
+        out = skill_router.lookup(
+            '{"paths":{"/api/v1/webhook/{flow_id_or_name}":{}}}',
+            "curl http://10.0.186.88:7860/openapi.json",
+        )
+        self.assertIn("Langflow", out)
+        self.assertNotIn("Gradio 4.x", out)
+
+    def test_comfyui_routes_to_playbook(self):
+        from solver.tools import skill_router
+
+        out = skill_router.lookup(
+            "ComfyUI",
+            "curl http://10.0.1.1:8188/api/manager/version",
+        )
+        self.assertIn("ComfyUI", out)
+        self.assertIn("product-playbooks.md", out)
+
+    def test_target_ip_drift_warning(self):
+        from solver.tools import skill_router
+        from solver.worker_context import RunContext, ctx
+
+        base = tempfile.mkdtemp(prefix="skill-route-")
+        context = RunContext.create(base, "c-08", target_url="http://10.0.181.73:7860")
+        with ctx.bind(context):
+            out = skill_router.lookup(
+                "ok",
+                "curl -s http://10.0.181.74:80/login",
+            )
+        self.assertIn("目标 IP 锁定", out)
+        self.assertIn("10.0.181.73", out)
+
+    def test_ssrf_routes_to_playbook(self):
+        from solver.tools import skill_router
+
+        out = skill_router.lookup(
+            "curl http://127.0.0.1/admin",
+            "metadata",
+        )
+        self.assertIn("SSRF", out)
+        self.assertIn("ssrf.md", out)
+
+    def test_check_endpoint_routes_to_evasion(self):
+        from solver.tools import skill_router
+
+        out = skill_router.lookup(
+            'curl -X POST http://x/check -d "code=..."',
+            "triggered 3 rules",
+        )
+        self.assertIn("检测对抗", out)
+        self.assertIn("process-injection-bypass.md", out)
+
+    def test_pydash_routes_to_playbook(self):
+        from solver.tools import skill_router
+
+        out = skill_router.lookup(
+            "PyDash Pollution Challenge",
+            "import pydash\nfrom sanic import Sanic",
+        )
+        self.assertIn("PyDash", out)
+        self.assertIn("prototype-pollution-pydash.md", out)
+
+    def test_engineering_error_oracle_sdist(self):
+        from solver.tools import skill_router
+
+        out = skill_router.lookup(
+            "ERROR: does not appear to be a Python project: "
+            "neither 'setup.py' nor 'pyproject.toml' found",
+            "pip install file:///ComfyUI/input/evil.tar.gz",
+        )
+        self.assertIn("sdist", out)
+        self.assertIn("setup.py sdist", out)
 
 
 class RepositorySkillIntegrityTests(unittest.TestCase):
@@ -216,9 +337,15 @@ class RepositorySkillIntegrityTests(unittest.TestCase):
             for product, keyword in keyword_by_product.items():
                 if product.lower() in hint.lower():
                     # 解析 hint 里的 reference 路径
-                    match = re.search(r"(web|cloud|pentest|reverse)/([a-z0-9-]+\.md)", hint)
+                    match = re.search(
+                        r"(web|cloud|pentest|reverse)/([a-z0-9-]+\.md)|product-playbooks",
+                        hint,
+                    )
                     self.assertIsNotNone(match, f"端口 {port} 的 hint 缺少 reference 路径")
-                    path = self.root / match.group(1) / "references" / match.group(2)
+                    if match.group(1):
+                        path = self.root / match.group(1) / "references" / match.group(2)
+                    else:
+                        path = self.root / "web" / "references" / "product-playbooks.md"
                     self.assertTrue(path.exists(), f"缺少 {path}")
                     content = path.read_text(encoding="utf-8", errors="replace").lower()
                     self.assertIn(keyword, content, f"端口 {port} → {path} 不含 {product} 内容")

@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-from shared.data import memory as mem_store, ideas as idea_store
+from shared.data import ideas as idea_store
 from solver.tools.registry import ToolRegistry, ToolSpec
 from solver.worker_context import ctx as _ctx
 from solver.runtime.claims import ClaimStore
@@ -16,6 +16,7 @@ from solver.runtime.scoped_state import (
     promote_memory_proposal,
     shared_root,
 )
+from solver.runtime.harness import RefinementLog
 
 
 def _challenge_dir() -> Path:
@@ -65,7 +66,10 @@ MEMORY_ADD_TOOL_DEF = {
     "type": "function",
     "function": {
         "name": "memory_add",
-        "description": "新增一条 Memory 记录。",
+        "description": (
+            "新增一条 Memory 记录。reason 必须写明实测证据依据；"
+            "没有工具输出证据的猜测不得写入。"
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -74,8 +78,12 @@ MEMORY_ADD_TOOL_DEF = {
                     "enum": ["fact", "evidence", "failure", "note"],
                 },
                 "content": {"type": "string"},
+                "reason": {
+                    "type": "string",
+                    "description": "为什么值得沉淀：引用工具输出/实测证据",
+                },
             },
-            "required": ["kind", "content"],
+            "required": ["kind", "content", "reason"],
         },
     },
 }
@@ -84,13 +92,17 @@ MEMORY_DELETE_TOOL_DEF = {
     "type": "function",
     "function": {
         "name": "memory_delete",
-        "description": "删除一条过时或错误的 Memory 记录（填 id 前缀即可）。",
+        "description": (
+            "删除一条过时或错误的 Memory 记录（填 id 前缀即可）。"
+            "evidence 类不可删除；reason 必须说明为何过时/被替代。"
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "memory_id": {"type": "string", "description": "Memory 记录的 id 或 id 前缀"},
+                "reason": {"type": "string", "description": "删除依据（过时/被新证据替代）"},
             },
-            "required": ["memory_id"],
+            "required": ["memory_id", "reason"],
         },
     },
 }
@@ -159,14 +171,54 @@ MEMORY_UPDATE_TOOL_DEF = {
         "description": (
             "更新一条已有 Memory 记录的内容。当新发现与旧记录矛盾时，"
             "优先用此工具纠正旧条目，而不是新增一条矛盾记录。"
+            "reason 必须引用推翻旧记录的新证据。"
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "memory_id": {"type": "string", "description": "Memory 记录的 id 或 id 前缀"},
                 "content": {"type": "string", "description": "更新后的内容"},
+                "reason": {"type": "string", "description": "更新依据（新证据）"},
             },
-            "required": ["memory_id", "content"],
+            "required": ["memory_id", "content", "reason"],
+        },
+    },
+}
+
+REFINEMENT_LIST_TOOL_DEF = {
+    "type": "function",
+    "function": {
+        "name": "refinement_list",
+        "description": (
+            "列出 Memory 看板的 refinement 历史（create/update/delete/promote 及回滚），"
+            "用于在回滚前定位 refinement_id。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "最多返回条数，默认 15"},
+            },
+        },
+    },
+}
+
+MEMORY_ROLLBACK_TOOL_DEF = {
+    "type": "function",
+    "function": {
+        "name": "memory_rollback",
+        "description": (
+            "回滚一次 Memory refinement（撤销 create/update/delete/promote）。"
+            "evidence 类不可回滚。先用 refinement_list 找到 refinement_id。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "refinement_id": {
+                    "type": "string",
+                    "description": "refinement 事件 id 或 id 前缀（见 refinement_list）",
+                },
+            },
+            "required": ["refinement_id"],
         },
     },
 }
@@ -263,6 +315,8 @@ OBSERVER_TOOL_DEFS = [
     MEMORY_DELETE_TOOL_DEF,
     MEMORY_UPDATE_TOOL_DEF,
     MEMORY_PROMOTE_TOOL_DEF,
+    REFINEMENT_LIST_TOOL_DEF,
+    MEMORY_ROLLBACK_TOOL_DEF,
     ARTIFACT_APPROVE_TOOL_DEF,
     ARTIFACT_LIST_TOOL_DEF,
     COMMAND_PUBLISH_TOOL_DEF,
@@ -281,6 +335,8 @@ def build_tool_registry(send_correction) -> ToolRegistry:
         ToolSpec(MEMORY_DELETE_TOOL_DEF, memory_delete),
         ToolSpec(MEMORY_UPDATE_TOOL_DEF, memory_update),
         ToolSpec(MEMORY_PROMOTE_TOOL_DEF, memory_promote),
+        ToolSpec(REFINEMENT_LIST_TOOL_DEF, refinement_list),
+        ToolSpec(MEMORY_ROLLBACK_TOOL_DEF, memory_rollback),
         ToolSpec(ARTIFACT_APPROVE_TOOL_DEF, artifact_approve),
         ToolSpec(ARTIFACT_LIST_TOOL_DEF, artifact_list),
         ToolSpec(COMMAND_PUBLISH_TOOL_DEF, command_publish),
@@ -306,7 +362,9 @@ def read_file(args: dict) -> str:
             prefix = ""
         content = prefix + "".join(lines)
         if len(content) > 12000:
-            content = "[历史输出过长，仅保留末尾 12000 字符]\n" + content[-12000:]
+            from solver.runtime.observer_policy import TRUNCATION_MARKERS
+
+            content = f"{TRUNCATION_MARKERS[0]} 12000 字符]\n" + content[-12000:]
         return content
     except FileNotFoundError:
         return f"[错误] 文件不存在：{path}"
@@ -335,11 +393,24 @@ def memory_list(args: dict) -> str:
 def memory_add(args: dict) -> str:
     kind = args.get("kind", "note")
     content = args.get("content", "").strip()
+    reason = args.get("reason", "").strip()
     if not content:
         return "[错误] content 不能为空"
-    entry, created = mem_store.add_memory_with_status(
-        shared_root(_challenge_dir()), kind=kind, content=content, source="observer-approved",
-        attempt_id=_ctx.attempt_id,
+    if not reason:
+        return "[错误] review gate：reason 不能为空，必须写明实测证据依据"
+    from solver.runtime.observer_policy import memory_write_allowed
+
+    allowed, gate_reason = memory_write_allowed(content, kind=str(kind or "note"))
+    if not allowed:
+        return (
+            f"[拒绝] Memory 写入被污染门控拦截（{gate_reason}）。"
+            "截断历史、过长 dump、playbook 粘贴不得写入 Memory；"
+            "只记录短而可验证的 evidence/fact。"
+        )
+    log = RefinementLog(_challenge_dir())
+    entry, created, _ = log.refine_add(
+        shared_root(_challenge_dir()), kind=kind, content=content,
+        source="observer-approved", attempt_id=_ctx.attempt_id, reason=reason,
     )
     if not created:
         return f"[Memory] 已存在，未新增 [{entry.kind}] {entry.id}: {entry.content}"
@@ -348,17 +419,88 @@ def memory_add(args: dict) -> str:
 
 def memory_delete(args: dict) -> str:
     memory_id = args.get("memory_id", "")
-    ok = mem_store.delete_memory(shared_root(_challenge_dir()), memory_id)
+    reason = args.get("reason", "").strip()
+    if not reason:
+        return "[错误] review gate：reason 不能为空，必须说明删除依据"
+    log = RefinementLog(_challenge_dir())
+    ok, _ = log.refine_delete(
+        shared_root(_challenge_dir()), memory_id=memory_id, reason=reason
+    )
     return f"[Memory] {'已删除' if ok else '未找到'} {memory_id}"
 
 
 def memory_update(args: dict) -> str:
     memory_id = args.get("memory_id", "")
     content = args.get("content", "").strip()
+    reason = args.get("reason", "").strip()
     if not content:
         return "[错误] content 不能为空"
-    ok = mem_store.update_memory(shared_root(_challenge_dir()), memory_id, content=content)
+    if not reason:
+        return "[错误] review gate：reason 不能为空，必须引用新证据"
+    from solver.runtime.observer_policy import memory_write_allowed
+
+    allowed, gate_reason = memory_write_allowed(content, kind="fact")
+    if not allowed:
+        return (
+            f"[拒绝] Memory 更新被污染门控拦截（{gate_reason}）。"
+            "截断历史 / playbook dump 不得写回 Memory。"
+        )
+    log = RefinementLog(_challenge_dir())
+    ok, _ = log.refine_update(
+        shared_root(_challenge_dir()), memory_id=memory_id, content=content, reason=reason
+    )
     return f"[Memory] {'已更新' if ok else '未找到'} {memory_id}"
+
+
+def refinement_list(args: dict) -> str:
+    limit = int(args.get("limit", 15) or 15)
+    events = RefinementLog(_challenge_dir()).list(limit=limit)
+    if not events:
+        return "[Refinements] 暂无记录"
+    rolled_back = {
+        e.get("rollback_of")
+        for e in events
+        if e.get("action") == "rollback"
+    }
+    lines = ["[Refinement 历史]"]
+    for e in events:
+        if e.get("action") == "rollback":
+            lines.append(f"- {e.get('id')} rollback → {e.get('rollback_of')}")
+            continue
+        mark = " (已回滚)" if e.get("id") in rolled_back else ""
+        lines.append(
+            f"- {e.get('id')} [{e.get('action')}/{e.get('kind')}] "
+            f"{e.get('memory_id')} scope={e.get('scope')}{mark}: "
+            f"{_excerpt(e.get('reason', ''), 200)}"
+        )
+    return "\n".join(lines)
+
+
+def memory_rollback(args: dict) -> str:
+    refinement_id = str(args.get("refinement_id", "")).strip()
+    if not refinement_id:
+        return "[错误] refinement_id 不能为空（先用 refinement_list 查历史）"
+    result = RefinementLog(_challenge_dir()).rollback(refinement_id)
+    if not result.get("ok"):
+        return f"[Refinements] 回滚失败：{result.get('error')}"
+    try:
+        StateEventLog(_challenge_dir()).append(
+            "memory_rolled_back",
+            {
+                "refinement_id": refinement_id,
+                "action": result.get("action"),
+                "memory_id": result.get("memory_id"),
+            },
+            attempt_id=_ctx.attempt_id,
+            run_id=getattr(_ctx, "run_id", ""),
+        )
+    except Exception:
+        pass
+    return (
+        f"[Refinements] 已回滚 {refinement_id}"
+        f"（{result.get('action')} {result.get('memory_id')}），"
+        f"tombstone={result.get('tombstone_id')}"
+    )
 
 
 def idea_list(args: dict) -> str:

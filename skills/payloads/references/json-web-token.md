@@ -1,5 +1,11 @@
 # JWT - JSON Web Token
 
+> ⚠️ **权威源分工**：本文件是 PayloadsAllTheThings JWT 原始语料，作为**穷举参考**
+> （完整 CVE 列表、工具语法、labs）。CTF 实战的**攻击流程、决策顺序与本赛题特有
+> 技巧**（如 `kid=../css/reset.css`、php-fpm FastCGI、nginx `/keys/` 403 绕过）以
+> `web/references/jwt-attacks.md` 为准；两者冲突时以 jwt-attacks.md 为准，新增实战
+> 技巧也写进那一份，避免两处漂移。**不要**在本文件里另写 CloudFunc 主链。
+
 > JSON Web Token (JWT) is an open standard (RFC 7519) that defines a compact and self-contained way for securely transmitting information between parties as a JSON object. This information can be verified and trusted because it is digitally signed.
 
 ## Summary

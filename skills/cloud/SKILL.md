@@ -1,3 +1,8 @@
+---
+name: cloud
+description: 处理云安全攻防题：云元数据服务(IMDS)利用、IAM/STS 提权、S3/对象存储配置错误、容器逃逸、Kubernetes 利用。发现 AWS/Azure/GCP 端点、云 SDK、S3 桶、metadata 服务(169.254.169.254)时使用。
+---
+
 # 云安全攻击 Skill — CTF 云攻防题全流程指引
 
 ## 适用场景

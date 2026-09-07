@@ -1,3 +1,8 @@
+---
+name: pwn
+description: 处理二进制漏洞利用题：栈溢出、堆利用、格式化字符串、ROP 链、ret2libc/ret2shellcode、整数溢出。拿到 ELF/PE 可执行文件或服务且需构造内存利用时使用。
+---
+
 # Pwn / 二进制漏洞利用 Skill — CTF Binary 题全流程指引
 
 ## 适用场景

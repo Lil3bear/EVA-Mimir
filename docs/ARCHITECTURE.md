@@ -72,22 +72,60 @@ Solver B 可消费已验证证据
 - `command` 让 Observer 可以定向调度（assign/pause/fork/close）；
 - `stage_ledger` 让多 Flag 题的阶段进度共享、不存 flag 原文。
 
-### hard/瓶颈题：竞争假设（agent-team 式）
+### hard 题：默认单链单 agent；竞争假设仅限多入口
 
-hard/difficult 题由 `portfolio.py` 生成三个正交竞争假设并行攻坚：
+**默认（当前 settings）**：`pro_enabled=false`，`hard_competing_hypotheses=false`。
+
+- hard **单 flag** 的 a-/c-/d-/e2-/e3-/f* → **单 agent + skill_chain/playbook**
+  （不开 foothold/lateral/source；单链 Web 产品题开并行假设会放大方差、抢 lane）
+- hard 且 `flag_count > 1`，或显式 `hard_competing_hypotheses=true` → 竞争假设：
 
 ```text
 foothold（Web 初始入口）   ─┐
-lateral（SSRF/内网/凭据复用）─┼─> 各自独立 context，claim 互斥
-source（源码/配置泄露）     ─┘    谁先解出谁赢（stop_event）
+lateral（SSRF/内网/凭据复用）─┼─> 仅多 flag hard / opt-in
+source（源码/配置泄露）     ─┘
 ```
 
-- 每个 attempt 的 `model="pro"` → 切换到 `llm.pro_model`（默认 `deepseek-v4-pro`）；
-  用 `solver.pro_enabled=false` 或环境变量 `LLM_PRO_MODEL` 覆盖。
-- `memory_scope="private"`：原始思路/失败流水默认互不可见；结构化证据经
-  `artifact_publish → artifact_approve`（或 `memory_share → memory_promote`）受控共享。
-- 一个 challenge 只选一个 Observer（当前为 foothold）作为控制面，避免多个
-  Observer 并发修改共享看板。
+- attempt 的 `model="pro"` **仅当** `solver.pro_enabled` 为 `true`/`hard_only` 时
+  才会切到 `llm.pro_model`；当前默认 **关闭**，全部走 flash/medium。
+- `memory_scope="private"`：原始思路默认互不可见；结构化证据经
+  `artifact_publish → artifact_approve` 受控共享。
+- 多 Solver 时一个 challenge 只选一个 Observer 作为控制面。
+
+### 稳定模型拓扑（勿再漂移）
+
+```text
+主路径（light / hard / summary / observer）
+  → deepseek-v4-flash-0731（tokenhub 同 key）
+兜底结构调用（llm.fallback_models）
+  → glm-5.3-flash（仅主路径瞬时错误耗尽后切换；tool_choice=auto + thinking enabled）
+heavy / escalate
+  → 配置保留但 escalate_rounds=0，默认不启用
+```
+
+主路径与兜底**必须是不同模型**：若 `tiers.light` 写成 glm，则 failover 到 glm 无效。
+GLM 专用于结构/工具调用兜底，不要当默认主模型（除非显式改拓扑并清空/更换 fallback）。
+
+### 知识注入（避免多套指纹表）
+
+```text
+bash 输出
+  ├─ knowledge_router  → CVE/产品 cheatsheet（只注入、不硬拦；步骤须 ⊆ playbook 成功链）
+  ├─ skill_chain       → 指纹表（唯一真相）→ 强制 skill_load + 歪路 gate
+  └─ skill_router      → 链横幅（委托 skill_chain）+ IP 漂移 / URL bug / 工程错误 oracle
+agent Memory pin       → 把已触发链钉进 Memory，不是第四套指纹
+```
+
+**工程错误 oracle（稳定「可解工程题」的关键）**：工具 stderr 命中已知失败类
+（如 pip `neither setup.py nor pyproject.toml`、uv 不认 `--no-build-isolation`、
+`/api/manager/reboot` 405）时，直接给出**下一步动作**，禁止用「死路」语言封死备选。
+产品玩法以 playbook「最短成功链」为准；cheatsheet 不得主推已被实测证伪的链（如 Comfy `git_url`）。
+
+### 控制面主路径（其余为增强）
+
+**主路径**：`scheduler/policy` → `agent` 工具门控（含 `skill_chain`）→ `skills/` playbook。  
+**增强层（保留、勿再加厚）**：claims / artifacts / commands / lineage /
+decision_state / strategy_controller / salvage。归因时先查主路径。
 
 ---
 
@@ -97,6 +135,20 @@ source（源码/配置泄露）     ─┘    谁先解出谁赢（stop_event）
 
 - **tier**：难度升序（简单后难 easy → medium → hard）；同难度内再把耗时长、易占满 worker slot 的 pentest/pwn/reverse 家族（b/e/f）推迟到尾部；
 - **ROI**：同类内按"期望分 / 成本"排序。
+
+**Lane 与工具门控**（`agent.py`）：
+
+- **Fast Lane**：easy + medium（含 c-* 综合服务）；单 agent、少 Observer；`security_search` 前 15 轮禁止；
+- **Deep Lane**：hard/difficult、多阶段渗透（b-*）；可换向/止损；
+  **当前 `pro_enabled=false`**，即使开竞争假设也不会切 pro 模型；
+- **hint**：easy 默认拒绝；hard 更早门槛；卡死才解锁；
+- medium c-* 卡死时经 `fast_lane_rounds`（默认 30 轮）升级到 Deep，而非开局 Deep。
+
+**尾段抢分**（**360min** benchmark，`solver/runtime/salvage.py`）：
+
+- **salvage**（≤140min 剩余）→ **critical**（≤72min）→ **final**（≤36min，仅 easy/salvage）
+- 切断长难题 `mark_abandoned`；`collect_salvage_targets` 捞波动/方向错的简单题
+- 触发条件：360 墙钟 **或** 缩放后的 run deadline，取更早者
 
 这解决了"b 类多阶段题一开始就占满全部并行 slot、导致 a 类快速题排队"的问题（run-12717 的根因）。
 
@@ -119,16 +171,38 @@ source（源码/配置泄露）     ─┘    谁先解出谁赢（stop_event）
 2. **跨进程持久化**：retry/abandon/cooldown 不依赖进程内存，重启后不重复启动死路。
 3. **任务隔离**：benchmark task 身份（URL+token 的 hash）变化时，自动清理旧任务的 shared/attempts/恢复状态。
 4. **Solver 结束自动释放 claim**：避免 baseline 重跑时旧 claim 残留导致"方向被自己占用"。
+5. **并行 workspace 隔离**（`solver/runtime/workspace_guard.py`）：bash/read/write/grep 禁止访问 sibling 题目目录；`.tool-results` 固定在本题 attempt 下。
+6. **提交后平台校验**（`bridge_tools.submit_flag`）：API 返回 correct 后再次 `get_state`，进度未涨则 `[✗] 未计分`，agent 不会因诱饵 flag 假 solved。
+7. **Routing 强制 medium-only**（`enforce_medium_only_routing`）：配置面也写成 `hard_tier=light` / `escalate_rounds=0`，与运行时一致；`SOLVER_HIGH_TIER=1` 才允许 heavy。
+8. **知识链硬门**（`skill_chain`）：指纹命中后未 load 对应 playbook 前，拒绝 `security_search` 与明确歪路 bash；**只拦批量爆破等死胡同，不拦 playbook 合法登录表单**。
+9. **失败 idea 软提示**：重试轮不把旧失败写成绝对禁令；含过期 IP 的失败方向自动忽略，减轻实例漂移回归。
+10. **单链 hard 单 agent** + `pro_enabled=false` / `hard_competing_hypotheses=false`：避免多 lane 抢配额导致偶发深度不够。
+11. **Last-mile 保护**：`solver.lastmile_codes`（a-03/f2-05/b-02）在 salvage/critical **不**被 cut abandon；有部分分的题永不砍；仅 `final` 才放弃 0 分 lastmile。RSI pack `lastmile3` 专测这三题。
+12. **同 key 模型故障切换**（`llm.fallback_models`，默认 `glm-5.3-flash`）：主模型连续瞬时错误耗尽重试后切备用；切成功本场粘住。GLM 结构调用单独处理：`tool_choice=auto`（不用 `required`）、`thinking` 只发 `enabled`（5.3 禁 disabled）、`reasoning_effort` 映射到 low/high/max。
+13. **慢轮保护**：按剩余墙钟收紧单请求超时与重试次数（`budget_aware_timeout` / `budget_aware_attempts`）；API 超时/限流在 failover 耗尽后**回滚本轮并 nudge**，不把题目终态结束。
+14. **自适应背压**（`AdaptiveLLMGate`）：检测到超时/429/5xx 时临时扣留一半 LLM 槽位，降低并发给每个请求更多余量；成功后立即恢复。
+15. **Observer advisory 默认**（`solver.observer_mode=advisory`）：默认 `NO_CHANGE`；纠偏仅在决策面 streak 证明空转时放行；`skill_chain` 未闭合时压制纠偏；截断 history / playbook dump 不得 `memory_add`；看板污染条目标为不可信。设 `full` 可恢复旧强干预，`off` 完全关闭。
+17. **Memory/Skill 防自污染**：写入门控拦截截断 dump / playbook 长文；Solver 状态快照过滤不可信条目；失败方向软提示（含过期 IP 忽略）；`skill_chain` 为指纹真源、`skill_router` 只做旁路横幅；RSI refinements 只记账不运行时改写 skills。配置面钉死 medium-only + glm 兜底 + `observer_mode=advisory`。
 
 ---
 
 ## 测试
 
 ```text
-227 passed
+unittest: tests/test_portfolio_scope.py + tests/test_skill_chain.py + SkillRouterTests
 ```
 
-覆盖：分层隔离、claim 互斥与过期接管、artifact pending/approved 生命周期、lineage 回放与篡改检测、retry 跨进程恢复、Observer 命令定向、题目排序分级、防爆破分题型等。
+覆盖：分层隔离、单链 hard 单 agent、claim 互斥、artifact 生命周期、retry、题目排序、skill 路由与知识链门控等。
+
+---
+
+## RSI 本地迭代
+
+全量 benchmark 之前，用 **回归 pack** 验证架构与 skills，见 [RSI.md](./RSI.md)：
+
+- `config/regression_codes.json` — 按维度题单（含 `unstable6`）
+- `scripts/rsi_local.sh` — 本地跑 pack + 生成 `workspace/rsi-report.md`
+- `solver/rsi/` — pack 解析、跑后分析、skill 改动账本
 
 ---
 
@@ -137,7 +211,10 @@ source（源码/配置泄露）     ─┘    谁先解出谁赢（stop_event）
 | 取舍 | 理由 |
 |---|---|
 | 默认私有、受控共享 | 多 Solver 共享整段思路会导致 A/B 题知识污染、错误方向互相传染 |
+| hard 单链默认单 agent | foothold/lateral/source 对 JWT/pydash/Comfy 单链题是方差放大器 |
 | 事件源 + 投影 | 多套状态文件各自写会漂移；append-only 事件源可审计可回放 |
 | 确定性控制面 | LLM 自己判断"要不要停"不可靠；停机/换向/预算必须由代码决定 |
 | 结构化命令而非自然语言纠偏 | 自然语言纠偏无法确认、无法定向、无法过期 |
 | 按 tier 分级而非按难度 | 静态难度标签 ≠ 实际解题成本；tier+ROI 更贴近"先拿分"目标 |
+| skill_chain 唯一指纹表 | 避免 skill_router / Memory pin 各写一套指纹导致 playbook 漂移 |
+| cheatsheet ⊆ 成功链 + 错误 oracle | 防止注入证伪主链；工程题靠真实 stderr 纠偏，不靠绝对禁令 |

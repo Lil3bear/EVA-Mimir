@@ -1,25 +1,47 @@
 {
   "llm": {
-    "base_url": "https://api.deepseek.com/v1",
+    "base_url": "https://tokenhub.tencentmaas.com/v1",
     "api_key": "replace-me",
-    "default_model": "deepseek-v4-flash",
-    "observer_model": "deepseek-v4-flash",
-    "reasoning_effort": "high",
-    "max_output_tokens": 8192,
-    "summary_max_output_tokens": 8192,
-    "observer_reasoning_effort": "high",
+    "default_model": "deepseek-v4-flash-0731",
+    "pro_model": "deepseek-v4-pro",
+    "fallback_models": ["glm-5.3-flash"],
+    "observer_model": "deepseek-v4-flash-0731",
+    "observer_thinking_enabled": false,
+    "observer_reasoning_effort": "medium",
     "observer_max_output_tokens": 8192,
     "observer_max_react_rounds": 2,
-    "observer_thinking_enabled": false
+    "reasoning_effort": "medium",
+    "reasoning_effort_cap": "medium",
+    "max_output_tokens": 8192,
+    "summary_max_output_tokens": 8192,
+    "providers": {
+      "tokenhub": {"base_url": "https://tokenhub.tencentmaas.com/v1", "api_key": ""},
+      "deepseek": {"base_url": "https://api.deepseek.com/v1", "api_key": ""}
+    },
+    "tiers": {
+      "light": {"model": "deepseek-v4-flash-0731", "provider": "tokenhub", "reasoning_effort": "medium"},
+      "heavy": {"model": "deepseek-v4-pro", "provider": "tokenhub", "reasoning_effort": "high"}
+    },
+    "routing": {
+      "summary_tier": "light",
+      "observer_tier": "light",
+      "fast_lane_tier": "light",
+      "deep_lane_default_tier": "light",
+      "hard_tier": "light",
+      "stuck_escalate_tier": "light",
+      "escalate_rounds": 0,
+      "escalate_max_consecutive": 12,
+      "stuck_no_progress_rounds": 8,
+      "stuck_wrong_submit_streak": 2,
+      "stuck_repeat_action_streak": 4
+    }
   },
   "solver": {
     "max_parallel": 1,
-    "allow_easy_hint": false,
-    "decision_control": {
-      "enabled": true,
-      "action_repeat_threshold": 4,
-      "vector_repeat_threshold": 4,
-      "inject_switch_for_easy": false
-    }
+    "observer_mode": "advisory",
+    "pro_enabled": false,
+    "hard_competing_hypotheses": false,
+    "lastmile_codes": ["a-03", "f2-05", "b-02"],
+    "skip_codes": []
   }
 }

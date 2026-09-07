@@ -37,23 +37,38 @@ def apply_llm_gateway(url: str, environ: Mapping[str, str] | None = None) -> str
     return urlunparse(parsed._replace(scheme="http", netloc=f"{host}{port}"))
 
 
+def _deep_merge(base: dict, overlay: dict) -> dict:
+    """Recursively merge overlay onto base (overlay wins on conflicts)."""
+    merged = dict(base)
+    for key, value in overlay.items():
+        if (
+            key in merged
+            and isinstance(merged[key], dict)
+            and isinstance(value, dict)
+        ):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
 def load_settings(
     paths: Sequence[str | Path] = DEFAULT_SETTINGS_PATHS,
     environ: Mapping[str, str] | None = None,
 ) -> dict:
     env = os.environ if environ is None else environ
+    # Merge all existing files: later paths in DEFAULT_SETTINGS_PATHS win
+    # (settings.json base → settings.local.json overlay).
+    existing = [Path(p) for p in paths if Path(p).is_file()]
     settings: dict = {}
-    for candidate in map(Path, paths):
-        if not candidate.is_file():
-            continue
+    for candidate in reversed(existing):
         try:
             loaded = json.loads(candidate.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError(f"无法加载配置文件 {candidate}: {exc}") from exc
         if not isinstance(loaded, dict):
             raise ValueError(f"配置文件 {candidate} 的根节点必须是 JSON object")
-        settings = loaded
-        break
+        settings = _deep_merge(settings, loaded)
 
     llm = _section(settings, "llm")
     _apply_env(llm, env, {
@@ -64,6 +79,13 @@ def load_settings(
     })
     if llm.get("base_url"):
         llm["base_url"] = apply_llm_gateway(str(llm["base_url"]), env)
+    # providers 的 base_url 同样走网关改写，否则 tiers 指向的 provider
+    # 会绕过 .tsecbench.gw 直连，在托管沙箱里必然超时。
+    providers = llm.get("providers")
+    if isinstance(providers, dict):
+        for spec in providers.values():
+            if isinstance(spec, dict) and spec.get("base_url"):
+                spec["base_url"] = apply_llm_gateway(str(spec["base_url"]), env)
 
     search_llm = _section(settings, "search_llm")
     _apply_env(search_llm, env, {
@@ -77,6 +99,38 @@ def load_settings(
     solver = _section(settings, "solver")
     _apply_int_env(solver, env, "SOLVER_MAX_ROUNDS", "max_rounds")
     _apply_int_env(solver, env, "SOLVER_OBSERVER_EVERY", "observer_every_rounds")
+
+    rsi = _section(settings, "rsi")
+    if env.get("SOLVER_RSI_PACK"):
+        rsi["active_pack"] = env["SOLVER_RSI_PACK"].strip()
+    return enforce_medium_only_routing(settings)
+
+
+def enforce_medium_only_routing(settings: dict) -> dict:
+    """Force medium-only routing, unless SOLVER_HIGH_TIER=1 allows heavy/high tiers."""
+    llm = settings.setdefault("llm", {})
+    routing = llm.setdefault("routing", {})
+    allow_high = os.environ.get("SOLVER_HIGH_TIER") == "1"
+    corrected = (
+        not allow_high
+        and (
+            str(routing.get("hard_tier", "light")) != "light"
+            or int(routing.get("escalate_rounds", 0) or 0) > 0
+            or str(routing.get("stuck_escalate_tier", "light")) != "light"
+        )
+    )
+    if not allow_high:
+        routing["hard_tier"] = "light"
+        routing["stuck_escalate_tier"] = "light"
+        routing["escalate_rounds"] = 0
+    routing.setdefault("fast_lane_tier", "light")
+    routing.setdefault("deep_lane_default_tier", "light")
+    routing.setdefault("summary_tier", "light")
+    routing.setdefault("observer_tier", "light")
+    llm.setdefault("reasoning_effort", "medium")
+    llm.setdefault("reasoning_effort_cap", "medium")
+    if corrected:
+        settings["_routing_corrected"] = True
     return settings
 
 
