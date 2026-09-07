@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-OVPN_FILE="${1:-/Users/mz/Downloads/task_IJvW1n1x7FsX_vpn_config.ovpn}"
+OVPN_FILE="${1:-/Users/mz/Downloads/task_5wIQEtrzHd7o_vpn_config.ovpn}"
 CONTAINER_NAME="tsec-vpn"
 IMAGE_NAME="eva-openvpn-client"
 VPN_CHECK_URL="http://10.0.100.58"
