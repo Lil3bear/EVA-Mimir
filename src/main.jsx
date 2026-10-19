@@ -93,6 +93,17 @@ async function api(url, options = {}) {
     throw Object.assign(new Error(data.error || "请求失败"), { log: data.log });
   return data;
 }
+function MemberPresence() {
+  const [state,setState]=useState(null);
+  useEffect(()=>{
+    let active=true;
+    const beat=async()=>{try {const res=await fetch("/api/session/presence",{method:"POST"});if(!res.ok)throw Error();const data=await res.json();if(active)setState(data);}catch{if(active)setState(null);}};
+    beat();const timer=setInterval(beat,20000);
+    return()=>{active=false;clearInterval(timer);};
+  },[]);
+  return <span className="member-presence" title={state?.members.map(m=>m.name).join("、") || "连接中"}>{state?`在线 ${state.count} 人`:"在线人数连接中"}</span>;
+}
+
 function ExecutionQueueStatus() {
   const [state,setState]=useState(null);
   const [error,setError]=useState("");
@@ -414,7 +425,7 @@ function PDFView({
   );
 }
 
-function App() {
+function App({member}) {
   const commentSubmission = useRef(null);
   const [detailsError,setDetailsError] = useState("");
   const [health, setHealth] = useState(null),
@@ -737,6 +748,7 @@ function App() {
         </div>
         <div className="header-actions">
           <ExecutionQueueStatus />
+          <MemberPresence />
           <a className="icon-button" href="/guide/index.html" target="_blank" rel="noreferrer" aria-label="图文使用指南" title="图文使用指南"><BookOpen size={17}/></a>
           <button
             className="quiet"
@@ -753,7 +765,7 @@ function App() {
             label="模型设置"
             onClick={() => setModal("settings")}
           />
-          <span className="avatar">M</span>
+          <span className="avatar" title={member?.name || "本机使用者"}>{member?.name?.slice(0,1) || "L"}</span>
           {health?.shared && <IconButton icon={LogOut} label="退出登录" onClick={async()=>{await api("/logout",{method:"POST"}); location.reload();}}/>}
         </div>
       </header>
@@ -1179,10 +1191,10 @@ function App() {
                         <span
                           className={`comment-avatar ${c.author === "ai" ? "ai" : ""}`}
                         >
-                          {c.author === "ai" ? <Sparkles size={13} /> : "M"}
+                          {c.author === "ai" ? <Sparkles size={13} /> : c.actor?.name?.slice(0,1) || "?"}
                         </span>
                         <strong>
-                          {c.author === "ai" ? "AI Reviewer" : "我"}
+                          {c.author === "ai" ? "AI Reviewer" : c.actor?.name || "历史共享账号"}
                         </strong>
                         <span className={`severity ${c.severity}`}>
                           {
@@ -2073,7 +2085,7 @@ function App() {
                   <strong>
                     v{project.history.length - i} · {r.label}
                   </strong>
-                  <small>{new Date(r.time).toLocaleString("zh-CN")}</small>
+                  <small>{new Date(r.time).toLocaleString("zh-CN")} · {r.initiatedBy?.name || "历史共享账号 / 系统"}</small>
                   <small>{r.provenance?.model|| (r.provenance?.kind==="manual"?"手动编辑":r.provenance?.kind==="restore"?"恢复版本":"旧记录，模型未记录")}{r.gitCommit?` · Git ${r.gitCommit.slice(0,10)}`:""}</small>
                 </div>
                 {r.gitCommit && <IconButton icon={GitCompareArrows} label="查看此版本 Git 差异" disabled={!!busy} onClick={()=>act("读取 Git 差异",async()=>setHistoryDiff(await api(`${base}/history/${r.id}/diff`)))}/>}
@@ -2173,13 +2185,14 @@ function App() {
 }
 
 function SessionGate() {
-  const [session,setSession] = useState(null), [username,setUsername] = useState("team"), [password,setPassword] = useState(""), [error,setError] = useState(""), [pending,setPending] = useState(false);
+  const [session,setSession] = useState(null), [username,setUsername] = useState(""), [password,setPassword] = useState(""), [error,setError] = useState(""), [pending,setPending] = useState(false);
+  const [register,setRegister]=useState(false),[displayName,setDisplayName]=useState(""),[invitePassword,setInvitePassword]=useState("");
   useEffect(()=>{api("/session").then(setSession).catch(e=>setError(e.message));},[]);
-  useEffect(()=>{const expired=()=>setSession({authenticated:false,shared:true});window.addEventListener("autopaperreview-session-expired",expired);return()=>window.removeEventListener("autopaperreview-session-expired",expired);},[]);
+  useEffect(()=>{const expired=()=>setSession(s=>({...s,authenticated:false,shared:true}));window.addEventListener("autopaperreview-session-expired",expired);return()=>window.removeEventListener("autopaperreview-session-expired",expired);},[]);
   if (!session || !session.authenticated) return <main className="login-page"><BookOpen size={32}/><h1>Autopaperreview</h1><form onSubmit={async e=>{
     e.preventDefault(); setPending(true); setError("");
-    try {await api("/session",{method:"POST",body:{username,password}}); setPassword(""); setSession({authenticated:true,shared:true});} catch(e) {setError(e.message);} finally {setPending(false);}
-  }}><label>用户名<input autoComplete="username" value={username} onChange={e=>setUsername(e.target.value)} required/></label><label>密码<input type="password" autoComplete="current-password" value={password} onChange={e=>setPassword(e.target.value)} required/></label>{error && <p className="warning-text" role="alert">{error}</p>}<button className="primary" disabled={pending || !session}>{pending ? "正在登录" : "登录"}</button></form><p>私有团队工作区 · 成员共享项目与模型额度</p></main>;
-  return <App/>;
+    try {const result=await api("/session",{method:"POST",body:{username,password,register,displayName,invitePassword}}); setPassword("");setInvitePassword("");setSession(result);} catch(e) {setError(e.message);} finally {setPending(false);}
+  }}><label>个人用户名<input autoComplete="username" value={username} onChange={e=>setUsername(e.target.value)} required/></label>{register&&<label>显示姓名<input value={displayName} maxLength={40} onChange={e=>setDisplayName(e.target.value)} required/></label>}<label>个人密码<input type="password" autoComplete={register?"new-password":"current-password"} minLength={register?12:undefined} value={password} onChange={e=>setPassword(e.target.value)} required/></label>{register&&<label>团队邀请密码<input type="password" autoComplete="off" value={invitePassword} onChange={e=>setInvitePassword(e.target.value)} required/></label>}{error && <p className="warning-text" role="alert">{error}</p>}<button className="primary" disabled={pending || !session}>{pending ? "正在处理" : register?"创建个人账号":"登录"}</button>{session?.memberAccounts&&<button type="button" className="quiet" onClick={()=>{setRegister(!register);setError("");}}>{register?"返回登录":"首次使用：创建个人账号"}</button>}</form><p>私有团队工作区 · 成员共享项目与模型额度</p></main>;
+  return <App member={session.member}/>;
 }
 createRoot(document.getElementById("root")).render(<SessionGate />);

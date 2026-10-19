@@ -38,11 +38,14 @@ export function experienceStore(directory) {
     return result;
   }
   return {
+    recordOperation(projectId,revision,context) {
+      return enqueue([{key:`operation:${randomUUID()}`,kind:"operation",projectId,revision,...context}]);
+    },
     record(project) {
       const common = {projectId:project.id, project:project.name};
       const items = (project.comments || []).map(c => ({...common,
         key:`${project.id}:comment:${c.id}`, kind:"comment", commentId:c.id,
-        author:c.author, body:c.body, quote:c.quote, file:c.file, page:c.page,
+        author:c.author, actor:c.actor, updatedBy:c.updatedBy, body:c.body, quote:c.quote, file:c.file, page:c.page,
         created:c.created, sourceRevision:c.pdfRevision, status:c.status,
         addressed:Boolean(c.addressed), archivedAt:c.archivedAt || null,
         addressedRevision:c.addressedRevision || null}));

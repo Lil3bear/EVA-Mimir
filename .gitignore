@@ -19,3 +19,5 @@ execution-queue/
 *.key
 tokenhub.json
 deepseek-official.json
+members.json
+members.json.tmp

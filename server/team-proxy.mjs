@@ -5,6 +5,7 @@ import path from "node:path";
 import {createGzip} from "node:zlib";
 import express from "express";
 import {installAccess} from "./access.mjs";
+import {actorHeader} from "./actor.mjs";
 import {revisionPDFCache} from "./pdf-cache.mjs";
 import {PullQueue,installPullWorker,installPullBrowser} from "./pull-queue.mjs";
 
@@ -25,6 +26,7 @@ function proxy(req, res, target, token, sharedHealth=false) {
   // Only the authenticated gateway may cross this boundary; browser identities never reach native clients.
   if (headers.origin) headers.origin = target.origin;
   if (token) headers["x-team-bridge-token"] = token;
+  if(token) {delete headers["x-workspace-actor"];Object.assign(headers,actorHeader(req.actor,req.method,req.originalUrl,token));}
   const upstream = http.request({hostname:target.hostname, port:target.port, method:req.method, path:req.originalUrl, headers}, response => {
     if (sharedHealth && req.method === "GET" && req.originalUrl === "/api/health" && response.statusCode === 200) {
       let body="";
@@ -93,7 +95,7 @@ export function remoteTeamGateway({target, token, access, privateHost, frontendD
   if(queue)installPullWorker(app,queue,token);
   // Do not parse manuscript/ZIP bodies: they must stream byte-for-byte to the one workspace.
   app.use("/api/session", express.json({limit:"8kb"}));
-  installAccess(app,access);
+  installAccess(app,{...access,membersFile:access.membersFile || (queueDir?path.join(queueDir,"members.json"):undefined)});
   if(queue)installPullBrowser(app,queue);
   if(pdfCacheDir&&!queue)app.use(revisionPDFCache({directory:pdfCacheDir,target:destination,token}));
   if(frontendDir) {

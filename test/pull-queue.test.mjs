@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import {mkdtemp,rm,writeFile} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import path from "node:path";
-import {randomUUID,createHmac} from "node:crypto";
+import {randomUUID} from "node:crypto";
 import http from "node:http";
 import {PullQueue} from "../server/pull-queue.mjs";
 import {executeDelivery} from "../server/pull-worker.mjs";
@@ -13,7 +13,7 @@ import {passwordHash} from "../server/access.mjs";
 async function directory(t){const d=await mkdtemp(path.join(tmpdir(),"pull-test-"));t.after(()=>rm(d,{recursive:true,force:true}));return d;}
 const input=()=>({method:"POST",url:"/api/projects/example/jobs",headers:{"content-type":"application/json"},body:Buffer.from('{"consent":true}').toString("base64")});
 function fetchHTTP(url,{method="GET",headers={},body}={}) {
-  return new Promise((resolve,reject)=>{const req=http.request(url,{method,headers},res=>{const chunks=[];res.on("data",c=>chunks.push(c));res.on("end",()=>resolve({status:res.statusCode,json:async()=>JSON.parse(Buffer.concat(chunks))}));});req.on("error",reject);req.end(body);});
+  return new Promise((resolve,reject)=>{const req=http.request(url,{method,headers},res=>{const chunks=[];res.on("data",c=>chunks.push(c));res.on("end",()=>resolve({status:res.statusCode,headers:res.headers,json:async()=>JSON.parse(Buffer.concat(chunks))}));});req.on("error",reject);req.end(body);});
 }
 test("ten submissions survive restart, claims do not collide, duplicates cannot change content",async t=>{
   const dir=await directory(t);let queue=new PullQueue(dir);
@@ -51,7 +51,9 @@ test("gateway authenticates browser and worker separately and delivers through o
   const server=app.listen(0,"127.0.0.1");await new Promise(r=>server.once("listening",r));
   t.after(()=>{server.closeAllConnections();server.close();});
   const base=`http://127.0.0.1:${server.address().port}`;
-  const expiry=String(Date.now()+60000),cookie=`autopaperreview_session=${expiry}.${createHmac("sha256",secret).update(expiry).digest("hex")}`;
+  const login=await fetchHTTP(base+"/api/session",{method:"POST",headers:{Host:"papers.example","content-type":"application/json"},body:JSON.stringify({username:"alice",password:"personal-secret-123",register:true,displayName:"Alice",invitePassword:"secret"})});
+  assert.equal(login.status,200);
+  const cookie=login.headers["set-cookie"][0].split(";")[0];
   const headers={Host:"papers.example",Cookie:cookie,"content-type":"application/json"};
   assert.equal((await fetchHTTP(base+"/api/execution-queue",{headers:{Host:"papers.example"}})).status,401);
   assert.equal((await fetch(base+"/__executor/claim",{method:"POST",headers,body:'{"worker":"one"}'})).status,401);
@@ -63,6 +65,7 @@ test("gateway authenticates browser and worker separately and delivers through o
     if(!request)await new Promise(r=>setTimeout(r,10));
   }
   assert.ok(request);assert.equal(request.headers.cookie,undefined);
+  assert.equal(request.actor.name,"Alice");
   await fetch(base+"/__executor/result/"+request.id,{method:"POST",headers:workerHeaders,body:JSON.stringify({worker:"one",response:{status:202,headers:{"content-type":"application/json"},body:Buffer.from('{"job":{"id":"ok"}}').toString("base64")}})});
   const result=await pending;assert.equal(result.status,202);assert.equal((await result.json()).job.id,"ok");
 });

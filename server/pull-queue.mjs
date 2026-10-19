@@ -114,7 +114,7 @@ export function installPullBrowser(app,queue) {
     if(!["GET","HEAD","POST","PUT","PATCH","DELETE"].includes(req.method))return res.sendStatus(405);
     const headers={};
     for(const key of ["content-type","range","x-workspace-view","if-none-match"])if(req.headers[key])headers[key]=req.headers[key];
-    const row=queue.enqueue({method:req.method,url:req.originalUrl,headers,body:Buffer.isBuffer(req.body)?req.body.toString("base64"):""},req.headers["x-execution-request-id"]);
+    const row=queue.enqueue({method:req.method,url:req.originalUrl,actor:req.actor,headers,body:Buffer.isBuffer(req.body)?req.body.toString("base64"):""},req.headers["x-execution-request-id"]);
     const deadline=Date.now()+35000;
     while(!res.destroyed&&Date.now()<deadline) {
       const current=queue.entries.get(row.id);

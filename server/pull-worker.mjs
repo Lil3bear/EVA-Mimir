@@ -1,6 +1,7 @@
 import {readFile,writeFile,rename,mkdir,open,rm,readdir,stat} from "node:fs/promises";
 import path from "node:path";
 import {gzipSync} from "node:zlib";
+import {actorHeader} from "./actor.mjs";
 
 async function save(file,value) {
   await writeFile(file+".tmp",JSON.stringify(value),{mode:0o600});
@@ -8,7 +9,7 @@ async function save(file,value) {
   await rename(file+".tmp",file);
   const folder=await open(path.dirname(file),"r");try{await folder.sync();}finally{await folder.close();}
 }
-export async function executeDelivery(request,{directory,target,fetcher=fetch}) {
+export async function executeDelivery(request,{directory,target,fetcher=fetch,token}) {
   if(!/^[a-f0-9-]{36}$/.test(request.id)||!/^\/api\//.test(request.url)||request.url.includes("\\")||request.url.startsWith("//")||/^\/api\/(session|logout)(?:[/?]|$)/.test(request.url))throw Error("Invalid execution request");
   const origin=new URL(target);
   if(origin.protocol!=="http:"||!["localhost","127.0.0.1","[::1]"].includes(origin.hostname))throw Error("Local executor target must be loopback");
@@ -25,6 +26,7 @@ export async function executeDelivery(request,{directory,target,fetcher=fetch}) 
   let response;
   try {
     const headers={};for(const key of ["content-type","range","x-workspace-view","if-none-match"])if(request.headers?.[key])headers[key]=request.headers[key];
+    Object.assign(headers,actorHeader(request.actor,request.method,request.url,token));
     const result=await fetcher(new URL(request.url,origin),{method:request.method,headers,body:["GET","HEAD"].includes(request.method)?undefined:Buffer.from(request.body,"base64"),signal:AbortSignal.timeout(600000),redirect:"error"});
     let bytes=Buffer.from(await result.arrayBuffer());
     if(request.url==="/api/health"&&result.status===200)bytes=Buffer.from(JSON.stringify({...JSON.parse(bytes),shared:true,localExecution:true,pullExecution:true}));
@@ -57,7 +59,7 @@ export async function runPullWorker({origin,token,target,directory,worker="works
     try {
       const {request}=await post("/__executor/claim",{worker});
       if(request) {
-        const response=await executeDelivery(request,{directory,target});
+        const response=await executeDelivery(request,{directory,target,token});
         await post("/__executor/result/"+request.id,{worker,response});
         if(request.readOnly)await rm(path.join(directory,request.id+".json"),{force:true});
         else await save(path.join(directory,request.id+".json"),{id:request.id,response,acknowledged:Date.now()});

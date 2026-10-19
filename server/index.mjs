@@ -33,6 +33,8 @@ import { overleafCredentials } from "./overleaf-credentials.mjs";
 import {recordSourceCommit,sourceCommitDiff} from "./source-history.mjs";
 import {commentSnapshot,archiveAppliedComments} from "./comment-log.mjs";
 import { installAccess } from "./access.mjs";
+import {verifiedActor} from "./actor.mjs";
+import {AsyncLocalStorage} from "node:async_hooks";
 import { createReviewerRouter } from "./reviewer.mjs";
 import { installPeerReviewRoutes } from "./peer-review.mjs";
 import { installFigureRoutes } from "./figure-routes.mjs";
@@ -47,7 +49,18 @@ const httpServer = createHTTPServer(app);
 app.disable("x-powered-by");
 app.use(express.json({ limit: "4mb" }));
 installAccess(app, {port, shared:process.env.SHARED_MODE === "1", origin:process.env.PUBLIC_ORIGIN,
-  passwordHash:process.env.TEAM_PASSWORD_HASH, secret:process.env.SESSION_SECRET, username:process.env.TEAM_USERNAME});
+  passwordHash:process.env.TEAM_PASSWORD_HASH, secret:process.env.SESSION_SECRET, username:process.env.TEAM_USERNAME,
+  membersFile:process.env.SHARED_MODE === "1" ? path.join(dataRoot,"members.json") : undefined});
+const bridgeIdentitySecret = await readFile(process.env.TEAM_BRIDGE_CONFIG || path.join(homedir(),".config/autopaperreview/team-bridge.json"),"utf8").then(s=>JSON.parse(s).token).catch(e=>{if(e.code==="ENOENT")return null;throw e;});
+const actorContext = new AsyncLocalStorage();
+app.use((req,res,next)=>{
+  if(req.headers["x-workspace-actor"]) {
+    const actor=verifiedActor(req.headers["x-workspace-actor"],req.method,req.originalUrl,bridgeIdentitySecret);
+    if(!actor)return res.status(401).json({error:"成员身份验证失败，未执行请求"});
+    req.actor=actor;
+  }
+  actorContext.run({actor:req.actor,method:req.method,url:req.path},next);
+});
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 30 * 1024 * 1024, files: 1 },
@@ -123,6 +136,8 @@ const recordExperience = (p) => experience.record(p).catch(() => console.error("
 const saveProject = async (p) => {
   await atomicJSON(projectFile(p.id), p);
   await recordExperience(p);
+  const context=actorContext.getStore();
+  if(context && !["GET","HEAD"].includes(context.method))await experience.recordOperation(p.id,p.revision,context).catch(()=>console.error("Experience operation log update failed"));
 };
 const syncTokens = overleafCredentials(process.env.OVERLEAF_CREDENTIAL_DIR || path.join(homedir(), ".config", "autopaperreview", "overleaf-credentials"));
 const jobs = new Jobs({
@@ -196,6 +211,7 @@ async function snapshot(p, files, label, compiled, metadata={}) {
     parent:p.revision||null,
     provenance:metadata.provenance||{kind:"manual"},
     restoredFrom:metadata.restoredFrom||null,
+    initiatedBy:actorContext.getStore()?.actor || null,
   };
   rev.gitCommit=await recordSourceCommit(pid(p.id),rev,p.sourceGit.head);
   if(metadata.provenance?.proposalId){const proposal=p.proposals.find(x=>x.id===metadata.provenance.proposalId);if(proposal)proposal.gitCommit=rev.gitCommit;}
@@ -206,7 +222,7 @@ async function snapshot(p, files, label, compiled, metadata={}) {
     p.log = compiled.log;
   }
   p.revision = rev.id;
-  p.history.unshift({ id: rev.id, time: rev.time, label,gitCommit:rev.gitCommit,parent:rev.parent,provenance:rev.provenance,restoredFrom:rev.restoredFrom });
+  p.history.unshift({ id: rev.id, time: rev.time, label,gitCommit:rev.gitCommit,parent:rev.parent,provenance:rev.provenance,restoredFrom:rev.restoredFrom,initiatedBy:actorContext.getStore()?.actor });
   p.sourceGit.head=rev.gitCommit;
   p.updated = rev.time;
   await saveProject(p);
@@ -522,8 +538,8 @@ async function sendProject(res, p) {
     body.reportCount = p.reports.length;
     body.proposals = [];
     body.reports = [];
-    body.history = p.history.map(({id,time,label,gitCommit,parent,restoredFrom,provenance}) => ({
-      id,time,label,gitCommit,parent,restoredFrom,
+    body.history = p.history.map(({id,time,label,gitCommit,parent,restoredFrom,provenance,initiatedBy}) => ({
+      id,time,label,gitCommit,parent,restoredFrom,initiatedBy,
       provenance:provenance ? {kind:provenance.kind,model:provenance.model,provider:provenance.provider} : null,
     }));
   } else body.detailsLoaded = true;
@@ -841,6 +857,7 @@ app.post(
       ...input,
       id: randomUUID(),
       author: "you",
+      actor: req.actor,
       status: "open",
       created: new Date().toISOString(),
     });
@@ -857,6 +874,7 @@ app.patch(
     if (!c) throw new Error("批注不存在");
     const input=z.object({status:z.enum(["open","resolved"]),retry:z.boolean().default(false),archived:z.literal(false).optional()}).parse(req.body);
     c.status=input.status;
+    c.updatedBy=req.actor;
     if(input.status==="open")c.addressed=false;
     if(input.archived===false){c.archivedAt=null;c.archiveProposalId=null;c.archiveRestoredAt=new Date().toISOString();}
     c.resolvedAt=input.status==="resolved"?new Date().toISOString():null;

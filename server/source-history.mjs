@@ -23,7 +23,7 @@ export async function recordSourceCommit(directory,revision,parent) {
     }
     await git([...base,"update-index","-z","--index-info"],{index,input:entries.join("")});
     const tree=(await git([...base,"write-tree"],{index})).toString().trim();
-    const metadata={revision:revision.id,parentRevision:revision.parent||null,time:revision.time,label:revision.label,main:revision.main,engine:revision.engine,provenance:revision.provenance||null,restoredFrom:revision.restoredFrom||null};
+    const metadata={revision:revision.id,parentRevision:revision.parent||null,time:revision.time,label:revision.label,main:revision.main,engine:revision.engine,provenance:revision.provenance||null,restoredFrom:revision.restoredFrom||null,initiatedBy:revision.initiatedBy||null};
     const commit=(await git([...base,"-c","user.name=Autopaperreview","-c","user.email=autopaperreview@localhost","commit-tree",tree,...(parent?["-p",parent]:[])],{input:`${revision.label}\n\n${JSON.stringify(metadata)}\n`})).toString().trim();
     await git([...base,"update-ref",ref,commit]);
     await git([...base,"update-ref","refs/heads/history",commit]);
