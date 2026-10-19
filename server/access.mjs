@@ -2,6 +2,12 @@ import { createHmac, randomBytes, scryptSync, timingSafeEqual } from "node:crypt
 import {existsSync, readFileSync, mkdirSync, writeFileSync, renameSync} from "node:fs";
 import path from "node:path";
 
+export function actorHeader(actor,method,url,secret) {
+  if(!actor || !secret)return {};
+  const value=Buffer.from(JSON.stringify({actor,method,url,time:Date.now()})).toString("base64url");
+  return {"x-workspace-actor":`${value}.${createHmac("sha256",secret).update(value).digest("hex")}`};
+}
+
 export function passwordHash(password, salt = randomBytes(16).toString("hex")) {
   return `${salt}:${scryptSync(password,salt,32).toString("hex")}`;
 }

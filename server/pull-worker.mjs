@@ -26,7 +26,7 @@ export async function executeDelivery(request,{directory,target,fetcher=fetch,to
   let response;
   try {
     const headers={};for(const key of ["content-type","range","x-workspace-view","if-none-match"])if(request.headers?.[key])headers[key]=request.headers[key];
-    Object.assign(headers,actorHeader(request.actor,request.method,request.url,token));
+    Object.assign(headers,actorHeader(request.actor || {id:"legacy-team",name:"历史共享账号"},request.method,request.url,token));
     const result=await fetcher(new URL(request.url,origin),{method:request.method,headers,body:["GET","HEAD"].includes(request.method)?undefined:Buffer.from(request.body,"base64"),signal:AbortSignal.timeout(600000),redirect:"error"});
     let bytes=Buffer.from(await result.arrayBuffer());
     if(request.url==="/api/health"&&result.status===200)bytes=Buffer.from(JSON.stringify({...JSON.parse(bytes),shared:true,localExecution:true,pullExecution:true}));

@@ -7,6 +7,8 @@ import express from "express";
 import {installAccess,passwordHash} from "../server/access.mjs";
 import {actorHeader,verifiedActor} from "../server/actor.mjs";
 import {experienceStore} from "../server/experience.mjs";
+import {executeDelivery} from "../server/pull-worker.mjs";
+import {randomUUID} from "node:crypto";
 
 test("personal accounts persist, reject shared login and spoofing, deduplicate presence",async t=>{
   const directory=await mkdtemp(path.join(tmpdir(),"members-"));
@@ -32,6 +34,11 @@ test("personal accounts persist, reject shared login and spoofing, deduplicate p
   assert.equal((await (await request("session/presence",{},cookies[0])).json()).count,1);
   assert.equal((await (await request("session/presence",{},cookies[1])).json()).count,2);
   assert.equal((await request("session/presence",{})).status,401);
+  const now=Date.now;
+  try {
+    Date.now=()=>now()+76000;
+    assert.equal((await (await request("session/presence",{},cookies[1])).json()).count,1);
+  } finally {Date.now=now;}
   assert.equal((await request("session",{username:"alice",password:"wrong"})).status,401);
   const restarted=await serve();
   assert.equal((await (await restarted("session",undefined,cookies[0])).json()).member.id,ids[0]);
@@ -41,6 +48,10 @@ test("personal accounts persist, reject shared login and spoofing, deduplicate p
   assert.deepEqual(verifiedActor(header,"POST","/api/projects/p/comments",secret),actor);
   assert.equal(verifiedActor(header,"POST","/api/projects/other/comments",secret),null);
   assert.equal(verifiedActor(header,"POST","/api/projects/p/comments","wrong"),null);
+  await executeDelivery({id:randomUUID(),actor,method:"POST",url:"/api/projects/p/comments",headers:{"x-workspace-actor":"spoof"},body:""},{directory:path.join(directory,"receipts"),target:"http://127.0.0.1:4317",token:secret,fetcher:async(url,options)=>{
+    assert.deepEqual(verifiedActor(options.headers["x-workspace-actor"],"POST",url.pathname,secret),actor);
+    return new Response("{}",{status:200});
+  }});
   const store=experienceStore(path.join(directory,"experience"));
   await store.recordOperation("p","rev",{actor,method:"POST",url:"/api/projects/p/comments"});
   assert.ok((await store.markdown()).includes(ids[0]));

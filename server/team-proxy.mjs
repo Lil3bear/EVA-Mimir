@@ -4,8 +4,7 @@ import {isIP} from "node:net";
 import path from "node:path";
 import {createGzip} from "node:zlib";
 import express from "express";
-import {installAccess} from "./access.mjs";
-import {actorHeader} from "./actor.mjs";
+import {installAccess,actorHeader} from "./access.mjs";
 import {revisionPDFCache} from "./pdf-cache.mjs";
 import {PullQueue,installPullWorker,installPullBrowser} from "./pull-queue.mjs";
 
