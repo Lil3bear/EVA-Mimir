@@ -1,0 +1,10 @@
+{
+  "id": "paper-rebuttal",
+  "version": "1.1.0",
+  "author": "丁霄汉",
+  "source": "知乎",
+  "url": "https://zhuanlan.zhihu.com/p/602024489",
+  "input": "Full article supplied by the user in conversation on 2026-10-19; original page not independently fetched; no asserted official article title or publication date.",
+  "adaptation": "Independently worded evidence-first response workflow, now including a counterevidence decision worksheet, concern/revision ledger and explicit mapping to the application's eight modules. Personal attacks, selective quotation, assumed reviewer incompetence and unsupported experiments are not adopted. Practical response, counterevidence, chair-note and concrete-revision ideas are retained with explicit scope and evidence safeguards.",
+  "rights": "Copyright remains with the author. Supplied notice requires author permission for commercial reprinting and attribution for noncommercial reprinting. No full article or source examples redistributed; no commercial redistribution license claimed."
+}

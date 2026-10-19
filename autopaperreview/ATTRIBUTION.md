@@ -1,0 +1,13 @@
+# Skills provenance
+
+Reviewed and pinned on 2026-10-16. These are prompt/reference resources, not independent executable AI review services.
+
+| Resource                                                | Pinned revision                          | Integration                                                                                                                                                                                                                                            |
+| ------------------------------------------------------- | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| https://github.com/Leey21/awesome-ai-research-writing   | df0af726a79109b8760c1b80d5dfc36ed44a6f1f | Original evidence-preserving writing adapter in `skills/writing.md`, inspired by the README's translation, polishing and reviewer perspectives. The source README does not expose a license in its root listing; its prompt text is NOT redistributed. |
+| https://github.com/FanBroWell/AI-paper-reviewer         | 5889e77af1a261d9c51c8298543503ad77ebae88 | Vendored with MIT LICENSE. Full-paper review, math notation, double-blind and reproducibility references are loaded by the backend.                                                                                                                    |
+| https://github.com/chantsss/paper-pre-submission-review | 9af17b0687a798f96ee7e36d1e05d1c3f52ba2b1 | Vendored with MIT LICENSE and upstream ATTRIBUTION.md. Scientific evidence, citations, venue rules and LaTeX/PDF references are loaded by the backend.                                                                                                 |
+
+Application adapter overrides upstream over-prescriptive style rules and fixed scoring/checklist claims: no fabricated facts; no universal language bans; no guessed annual conference rules; severity separate from certainty; no claim of external verification without tools; review-only does not edit source; revision requires explicit patch approval; no automatic experiment execution or submission. Citation search and PDF visual review requested by upstream references are unavailable in this app version and must be reported as unverified.
+
+Skills selected in the UI are loaded from their actual local reference files into each model request by `server/skills.mjs`. Turning off a skill omits that reference. Baseline integrity, privacy and exact-patch constraints are always active.

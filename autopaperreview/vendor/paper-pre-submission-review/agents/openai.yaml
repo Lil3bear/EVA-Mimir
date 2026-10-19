@@ -1,0 +1,4 @@
+interface:
+  display_name: "ICLR 投稿前审核"
+  short_description: "合并模拟审稿、实验与引用核验、年度投稿规则及最终 PDF 检查"
+  default_prompt: "使用 $iclr-pre-submission-review 审核这篇论文和附录，按目标年份核验 ICLR 投稿要求，输出有具体位置和修复建议的问题清单。"

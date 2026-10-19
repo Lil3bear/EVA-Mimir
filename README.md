@@ -1,5 +1,7 @@
 # EVA-Mimir — 自动化 CTF 攻防 Agent
 
+> `autoresearch-v0` 分支新增独立的 [Autopaperreview 论文协作系统](autopaperreview/README.md)：源码、写作 Skills、图文指南及[安装部署方法](autopaperreview/docs/INSTALL.md)。原有 EVA-Mimir 代码保持不变；论文系统位于 `autopaperreview/`。
+
 基于大语言模型的自动化 CTF 解题 Agent，支持 Web 漏洞挖掘、多阶段渗透等多种攻防场景。
 
 ## 架构

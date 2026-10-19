@@ -1,0 +1,10 @@
+{
+  "id": "zhihu-paper-readability",
+  "version": "1.1.1",
+  "author": "丁霄汉",
+  "url": "https://zhuanlan.zhihu.com/p/639732057",
+  "input": "User-supplied full article read from the attached text on 2026-10-19; no new independent webpage retrieval asserted.",
+  "sourceAxes": ["逻辑强度", "防御弹性", "迷惑时间", "信息密度"],
+  "extensions": "Diagnostic decision tests, synthetic examples, evidence safeguards, module handoffs and the workspace author's typography preferences are independent adaptations. Suggestions to manufacture citation authority or speculate without evidence are not adopted.",
+  "rights": "Copyright remains with the author; no full article redistributed and no commercial reprinting license asserted."
+}

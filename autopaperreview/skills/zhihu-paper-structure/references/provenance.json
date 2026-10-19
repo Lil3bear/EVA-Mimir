@@ -1,0 +1,10 @@
+{
+  "id": "zhihu-paper-structure",
+  "version": "1.1.0",
+  "author": "丁霄汉",
+  "url": "https://zhuanlan.zhihu.com/p/593195527",
+  "input": "Full article supplied by the user in conversation; no new independent retrieval asserted.",
+  "sourcePrinciples": "Explain the final work rather than discovery chronology, make contribution ownership explicit, introduce the complete method in one place and make the central insight easy to find.",
+  "extensions": "Narrative decision table, section contracts, exact eight-module handoffs and bounded revision tests are independent operational extensions.",
+  "rights": "Copyright remains with the author; no full article redistributed and no commercial reprinting license asserted."
+}
