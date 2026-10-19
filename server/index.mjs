@@ -27,6 +27,7 @@ import { translate } from "./translate.mjs";
 import { bibliography, verifyEntry } from "./bibliography.mjs";
 import { codexStatus } from "./codex.mjs";
 import { Jobs } from "./jobs.mjs";
+import { experienceStore } from "./experience.mjs";
 import { connectOverleaf, pushOverleaf, overleafURL } from "./overleaf.mjs";
 import { overleafCredentials } from "./overleaf-credentials.mjs";
 import {recordSourceCommit,sourceCommitDiff} from "./source-history.mjs";
@@ -117,7 +118,12 @@ const getRevision = async (id, rev) =>
       "utf8",
     ),
   );
-const saveProject = (p) => atomicJSON(projectFile(p.id), p);
+const experience = experienceStore(path.join(dataRoot, "experience"));
+const recordExperience = (p) => experience.record(p).catch(() => console.error("Experience log update failed; project data retained for rebuild"));
+const saveProject = async (p) => {
+  await atomicJSON(projectFile(p.id), p);
+  await recordExperience(p);
+};
 const syncTokens = overleafCredentials(process.env.OVERLEAF_CREDENTIAL_DIR || path.join(homedir(), ".config", "autopaperreview", "overleaf-credentials"));
 const jobs = new Jobs({
   read: (id) =>
@@ -127,6 +133,7 @@ const jobs = new Jobs({
   write: async(id, state) => {
     await atomicJSON(path.join(pid(id),"jobs",`${z.string().uuid().parse(state.id)}.json`),state);
     await atomicJSON(path.join(pid(id), "activity.json"), state);
+    await experience.recordJob(id,state).catch(() => console.error("Experience job log update failed"));
   },
 });
 async function withProjectLock(id, operation, signal) {
@@ -757,6 +764,13 @@ app.get(
       .sendFile(path.basename(file),{root:path.dirname(file)});
   }),
 );
+app.get("/api/experience", wrap(async (req,res) => {
+  for(const entry of await readdir(dataRoot)) {
+    if(!z.string().uuid().safeParse(entry).success)continue;
+    await experience.record(await getProject(entry));
+  }
+  res.type("text/markdown").attachment("experience.md").send(await experience.markdown());
+}));
 app.get(
   "/api/projects/:id/export",
   wrap(async (req, res) => {
