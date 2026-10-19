@@ -32,8 +32,8 @@ selection is preserved: the transport does not silently enable expensive models.
 
 ## Install And Recover
 
-Follow `../docs/INSTALL.md` and build `Dockerfile.gateway`. Recreate only the
-gateway with `TEAM_QUEUE_DIR` and its persistent writable volume. Do not run a
+Follow `../docs/INSTALL.md` and start the Node.js gateway directly with
+`TEAM_QUEUE_DIR` pointing to its persistent private directory. Do not run a
 second independent workspace database against the same team entry point.
 Run `node deploy/install-pull-worker.mjs` on the Mac. Its LaunchAgent is
 `com.autopaperreview.pull-worker`; logs are in the existing private logs directory.

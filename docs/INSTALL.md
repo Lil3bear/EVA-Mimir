@@ -8,8 +8,7 @@ Confirm `git --version`, `node --version`, and `pdflatex --version` work in the
 same environment that starts the app. No existing paper or restored database is
 needed: import the demo or your own Overleaf Source ZIP.
 
-Do not use the repository's other research/exploit scripts to start this web app.
-All commands here run inside `autopaperreview/`.
+All commands here run at the repository root. No container runtime is required.
 
 ## 2. Providers
 
@@ -66,27 +65,22 @@ model credentials. Never commit either file. Use a different username if desired
 On the remote server, clone this branch, then:
 
 ```sh
-cd EVA-Mimir/autopaperreview
-docker build -f deploy/Dockerfile.gateway -t autopaperreview-gateway .
+cd EVA-Mimir
+npm ci
+npm run build
 mkdir -p "$HOME/.config/autopaperreview/queue"
 chmod 700 "$HOME/.config/autopaperreview/queue"
 ```
 
 Transfer only the generated `team-bridge.json` to the remote private directory
 over a secure channel. Do not transfer `~/.codex`, `~/.claude`, model keys, or your
-whole home directory. The container runs as UID 1000; ensure it can read the config
-and write the queue directory (use the appropriate ownership on your server).
+whole home directory. Run the gateway as a dedicated unprivileged user with
+access to its private configuration and queue directory.
 
 ```sh
-docker run -d --name autopaperreview-gateway --restart unless-stopped \
-  --read-only --cap-drop ALL --security-opt no-new-privileges \
-  -p 127.0.0.1:4318:4318 \
-  --mount "type=bind,src=$HOME/.config/autopaperreview/team-bridge.json,dst=/run/team-bridge.json,readonly" \
-  --mount "type=bind,src=$HOME/.config/autopaperreview/queue,dst=/run/execution-queue" \
-  -e TEAM_BRIDGE_CONFIG=/run/team-bridge.json \
-  -e TEAM_GATEWAY_BIND=0.0.0.0 \
-  -e TEAM_QUEUE_DIR=/run/execution-queue \
-  autopaperreview-gateway
+TEAM_GATEWAY_BIND=127.0.0.1 \
+TEAM_QUEUE_DIR="$HOME/.config/autopaperreview/queue" \
+node deploy/run-team-bridge.mjs --remote
 ```
 
 Point your HTTPS reverse proxy/tunnel at `http://127.0.0.1:4318`. Preserve the

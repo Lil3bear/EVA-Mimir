@@ -1,171 +1,120 @@
-# EVA-Mimir — 自动化 CTF 攻防 Agent
+# Autopaperreview / Autoresearch v0
 
-> `autoresearch-v0` 分支新增独立的 [Autopaperreview 论文协作系统](autopaperreview/README.md)：源码、写作 Skills、图文指南及[安装部署方法](autopaperreview/docs/INSTALL.md)。原有 EVA-Mimir 代码保持不变；论文系统位于 `autopaperreview/`。
+An Overleaf-source workspace for reading papers, adding PDF comments, revising
+LaTeX with local model clients, compiling PDFs, and inspecting revision history.
+This branch contains only the self-contained Autopaperreview web application.
 
-基于大语言模型的自动化 CTF 解题 Agent，支持 Web 漏洞挖掘、多阶段渗透等多种攻防场景。
+## Features
 
-## 架构
+- Import a trusted Overleaf source ZIP, compile and scroll through its PDF.
+- Select text for translation and comments; revise the corresponding TeX source.
+- Evidence-grounded writing, review, rebuttal, citation and figure skills.
+- Native Codex / Claude Code adapters and configurable API review providers.
+- Validate patches and compile before publication; retain comments that were not
+  actually addressed. Record model provenance and source Git history.
+- Optional Overleaf Git push, independent of internal version history.
+- Remote team login and a persistent queue polled by your local executor over
+  HTTPS. Visitors do not need ZeroTier or a model client on their own computers.
 
-```
-┌─ Scheduler（多题调度器）────────────────────┐
-│  VPN检测 → 列题 → 按难度排序 → 逐题调度     │
-└────────────────────────────────────────────┘
-         ↓ 每道题
-┌─ SolverAgent（解题主循环）─────────────────┐
-│  ReAct 循环：推理 → 工具调用 → 观察         │
-│  工具：bash / curl / file / grep / search  │
-│  Memory + Ideas 状态管理                    │
-└────────────────────────────────────────────┘
-         ↕
-┌─ ObserverAgent（旁路审查）────────────────┐
-│  每 6 轮自动审查                            │
-│  方向性纠偏 / 死循环检测 / 看板维护          │
-└────────────────────────────────────────────┘
-```
+## Install Locally
 
-**核心特性**：
-- **Solver + Observer 双角色设计**：Solver 专注推进解题，Observer 旁路审查防止死循环
-- **Memory + Ideas 看板**：持久化状态管理，跨轮次复用攻击经验
-- **语义上下文压缩**：解决长题目上下文丢失问题
-- **approach-level 循环检测**：自动检测重复攻击模式并告警
-- **Tsecbench 平台透明接入**：自动检测比赛环境变量，无缝切换
+Requirements: Node.js 22, npm, Git, and a TeX installation (`pdflatex`, `xelatex`
+or `lualatex`, plus `bibtex` as required by your paper). The app reports missing
+TeX packages rather than fabricating a PDF. For ACM papers, install the template's
+dependencies in your TeX distribution, including `textcase` when required.
 
-## 运行环境
-
-- Python 3.10+
-- Docker（本地模式需要）
-- 支持 OpenAI API 兼容接口的 LLM 服务
-
-## 环境变量
-
-### 必需（比赛模式 / Tsecbench 平台自动注入）
-
-| 变量 | 说明 |
-|------|------|
-| `BENCHMARK_BASE_URL` | Tsecbench 平台 API 地址 |
-| `BENCHMARK_TOKEN` | Tsecbench 平台认证令牌 |
-
-### LLM 配置
-
-| 变量 | 说明 | 默认值 |
-|------|------|--------|
-| `LLM_BASE_URL` | LLM API 地址 | — |
-| `LLM_API_KEY` | LLM API 密钥 | — |
-| `LLM_MODEL` | 默认模型名称 | `deepseek-chat` |
-| `LLM_OBSERVER_MODEL` | Observer 模型名称 | 同 `LLM_MODEL` |
-
-### 可选
-
-| 变量 | 说明 | 默认值 |
-|------|------|--------|
-| `SOLVER_MAX_ROUNDS` | 每题最大推理轮次 | `100` |
-| `SOLVER_OBSERVER_EVERY` | Observer 审查间隔（轮） | `6` |
-
-## 快速开始
-
-### 1. 构建 Docker 镜像
-
-```bash
-# 确保 docker/fastcoll 存在（linux/amd64 二进制）
-docker build -t eva-mimir -f docker/Dockerfile .
+```sh
+git clone --branch autoresearch-v0 https://github.com/Lil3bear/EVA-Mimir.git
+cd EVA-Mimir
+npm ci
+npm run build
 ```
 
-### 2. 本地测试（单题模式）
+Install and authenticate the native Codex CLI separately when using the default
+provider. Its credentials stay in your native client configuration. Select a
+model your account actually supports; a model ID in this code is not a guarantee
+that a provider offers it.
 
-```bash
-# 设置环境变量
-export LLM_BASE_URL="https://api.deepseek.com/v1"
-export LLM_API_KEY="your-api-key"
-export LLM_MODEL="deepseek-chat"
-
-# 运行
-python -m host.main --challenge challenges/example.json
+```sh
+AI_PROVIDER=codex OPENAI_MODEL=gpt-6.1-sol \
+LOCAL_REVISION_ONLY=1 ARCHIVE_APPLIED_COMMENTS=1 SETTINGS_LOCKED=1 \
+NODE_ENV=production BIND_HOST=127.0.0.1 PORT=4317 \
+DATA_DIR="$HOME/.local/share/autopaperreview-data" node server/index.mjs
 ```
 
-### 3. Tsecbench 比赛模式
+Open <http://localhost:4317>. Import a demo first, then a trusted Source ZIP.
+The top book icon opens the illustrated guide at `/guide/index.html`.
+Development mode: `npm run dev`. This starts the backend and Vite integration.
 
-当 `BENCHMARK_TOKEN` 和 `BENCHMARK_BASE_URL` 存在时，Agent 自动进入比赛模式：
+For a standard compatible API, set `AI_PROVIDER=openai`, `OPENAI_BASE_URL`,
+`OPENAI_API_KEY`, `OPENAI_MODEL`, and `AI_API_FORMAT` (`responses` or `chat-json`).
+Supply credentials through your own private environment/configuration, never in
+committed files. Native Claude and multi-provider configuration are described in
+[installation and providers](docs/INSTALL.md). No expensive fallback is enabled
+merely by deploying the queue.
 
-```bash
-# 平台会自动注入这两个变量
-export BENCHMARK_BASE_URL="http://..."
-export BENCHMARK_TOKEN="..."
-export LLM_BASE_URL="http://api.deepseek.com.tsecbench.gw/v1"
-export LLM_API_KEY="your-api-key"
+## Share With A Team
 
-# 直接启动
-python -m solver.main
+Follow [docs/INSTALL.md](docs/INSTALL.md) for the Linux gateway, private config,
+HTTPS reverse proxy/tunnel, and the Mac/Linux outbound worker. The architecture is:
+
+```text
+Browser -> authenticated HTTPS gateway -> persistent remote queue
+                                           ^
+                                           | local worker polls HTTPS
+                                           v
+                              local application and native model clients
+                              -> TeX -> compilation -> logs and Git versions
 ```
 
-### 4. 打包上传
+The source of truth stays on the executor machine. Keep it awake and connected.
+Unclaimed writes expire after 24 hours; uncertain executions are not blindly
+replayed. Temporary tunnels and a single personal computer are not high
+availability. See [delivery guarantees](deploy/PULL-EXECUTION.md).
 
-```bash
-docker save -o agent.tar eva-mimir:latest
-gzip agent.tar
-# 上传 agent.tar.gz（需 < 1GB）
+## Test
+
+```sh
+npm test
+npm run build
+npx playwright install chromium
+node scripts/guide-screenshots.mjs
 ```
 
-## 平台网关适配
+Compilation tests need TeX on PATH. Tests use isolated data directories and mock
+model responses. Some optional smoke scripts can call configured models; inspect
+them before running, as those calls may be billable.
 
-Tsecbench 平台沙箱内无法直接访问公网，LLM API 地址需按以下规则改写：
+The ten-user load harness runs against an isolated copy with a mock model:
 
-- 域名后增加 `.tsecbench.gw`
-- `https` 改成 `http`
-
-示例：
-```
-原地址：https://api.deepseek.com/v1
-改后：  http://api.deepseek.com.tsecbench.gw/v1
+```sh
+LOAD_PROJECT_DIR=/absolute/path/to/data/project-uuid \
+LOAD_TEX_FILE=main.tex node scripts/team-load-test.mjs
 ```
 
-通过 `LLM_BASE_URL` 环境变量传入改写后的地址即可，**代码中无需任何修改**。
+It requires an existing compiled trusted project. Never point other smoke tools
+at a private production paper without reviewing their effects.
 
-## 项目结构
+## Included And Excluded
 
-```
-EVA-Mimir/
-├── solver/              # Solver Agent（容器内运行）
-│   ├── agent.py         # 主循环：ReAct + 工具调用
-│   ├── main.py          # 入口：自动检测运行模式
-│   ├── observer/        # Observer 旁路审查
-│   │   ├── agent.py     # Observer 审查逻辑
-│   │   ├── loop.py      # 触发控制
-│   │   └── tools.py     # Observer 专用工具
-│   ├── platform/        # Tsecbench 平台接入
-│   │   ├── tsecbench_client.py  # API 客户端
-│   │   └── scheduler.py         # 多题调度器
-│   └── tools/           # Solver 工具链
-│       ├── bash_tool.py     # Shell 命令执行
-│       ├── bridge_tools.py  # 平台交互（submit/hint/state）
-│       ├── file_tools.py    # 文件操作
-│       ├── search_tool.py   # 安全知识搜索
-│       └── ...
-├── host/                # Host 主进程（本地模式）
-├── shared/              # 共享数据模型
-├── prompts/             # Solver/Observer 提示词
-├── skills/              # 题目类型指南
-├── docker/              # Docker 构建文件
-├── tests/               # 单元测试
-└── challenges/          # 题目配置文件
-```
+Included: frontend, backend, model adapters, queue/worker, tests, dependencies lock,
+skills and reference Markdown, vendored licensed review prompts,
+generic installation instructions and a credential-free illustrated guide.
 
-## 测试
+Not published: papers, PDFs, comments, revision databases, Git credentials, model
+keys, native client sessions, private team passwords, runtime directories, build
+artifacts, and one-off scripts targeting the author's private manuscript or server.
+The private operational manual is deliberately replaced by the safe public guide.
 
-```bash
-python -m unittest discover tests/ -v
-```
+Respect the licenses and attribution in [ATTRIBUTION.md](ATTRIBUTION.md) and
+`vendor/`. Ding Xiaohan's macro structure, micro readability and rebuttal rules
+are independently summarized with source links in their respective skills; the
+original articles are not reproduced.
 
-## 支持的 LLM
+## Security And Backup
 
-通过平台白名单验证的模型：
-
-- DeepSeek（deepseek-chat / deepseek-coder）
-- 通义千问（qwen-max / qwen-plus）
-- 智谱 GLM（glm-4）
-- 豆包、Kimi、百川、MiniMax 等
-
-使用 OpenAI API 兼容接口，通过 `LLM_BASE_URL` 指定。
-
-## License
-
-MIT
+Only import trusted LaTeX. Compilation is not a hardened sandbox for hostile
+multi-tenant uploads. Team authentication is shared, not per-user isolation.
+Do not expose the local backend directly. Back up the local `DATA_DIR`, source
+Git history, private credential directory and gateway queue volume. PDF/source
+exports alone are not full backups. Review revisions before pushing to Overleaf.

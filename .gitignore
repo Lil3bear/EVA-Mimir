@@ -1,31 +1,21 @@
-workspace/
-__pycache__/
-*.pyc
-*.pyo
+node_modules/
+dist/
+data/
+data-local-restored-*/
 .env
-settings.local.json
-
-# 运行日志（可能含敏感信息）
-run_log*.jsonl
-run_log*.txt
-
-# Docker 构建产物
-agent.tar*
-*.tar
-*.tar.gz
-*.tgz
-
-# 调试文件（可能含密钥）
-debug_*.py
-exploit_*.py
-brute_field.py
-gitdump_dl.py
-probe.py
-pty_exploit.py
-test_ssrf.py
-verify_pro_model.py
-nul
-
-# 不提交的文档
-开发记录/
-百度比赛提交材料/
+.env.*
+artifacts/
+output/
+vendor/**/.git/
+runtime/
+tmp/
+.DS_Store
+*.log
+team-bridge.json
+team-login.txt
+execution-receipts/
+execution-queue/
+*.pem
+*.key
+tokenhub.json
+deepseek-official.json
