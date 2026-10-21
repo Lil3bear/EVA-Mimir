@@ -5,6 +5,15 @@ import { createHash } from "node:crypto";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const skills = [
+  {
+    id: "snap-write",
+    name: "Snap Write · 局部学术润色",
+    group: "写作",
+    default: false,
+    source: "作者指定的局部写作规范",
+    files: ["skills/snap-write/SKILL.md"],
+    description: "保留逻辑和信息量，准确使用术语；自然学术表达，避免长难句、机器人碎句和说明书式写法。",
+  },
   ...[
     ["paper-figure-story", "图示 · 动机与创新", "https://github.com/Leey21/awesome-ai-research-writing", "全文证据对齐、Method 审查与图示主张边界。"],
     ["paper-figure-layout", "图示 · 六类布局", "https://paper-banana.org/zh/blog/figure-1-layout-patterns", "按信息关系选择布局，突出动机与创新，检查阅读顺序。"],

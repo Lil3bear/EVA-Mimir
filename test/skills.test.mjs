@@ -7,6 +7,17 @@ import {fileURLToPath} from "node:url";
 import {effectiveSkillIds, skillPrompt, skillManifest, skills,defaultSkillIds,figureSkillIds,coreSkillIds} from "../server/skills.mjs";
 import {peerReviewGuidance} from "../server/peer-review.mjs";
 
+test("snap-write is selectable, reaches prompts and records its exact version without forcing unrelated tasks",async()=>{
+  const content=await readFile(new URL("../skills/snap-write/SKILL.md",import.meta.url),"utf8");
+  assert(skills.some(s=>s.id==="snap-write"&&s.group==="写作"));
+  assert(!defaultSkillIds.includes("snap-write"));
+  assert(!effectiveSkillIds([]).includes("snap-write"));
+  const prompt=await skillPrompt(["snap-write","snap-write"]);
+  assert.equal(prompt.split(content).length-1,1);
+  const manifest=await skillManifest(["snap-write"]);
+  assert.equal(manifest.files.find(f=>f.file==="skills/snap-write/SKILL.md").sha256,createHash("sha256").update(content).digest("hex"));
+});
+
 test("writing foundation is mandatory, deduplicated and unknown selections fail closed", async () => {
   const required=skills.filter(s=>s.required).map(s=>s.id);
   assert.deepEqual(effectiveSkillIds(["latex"]),[...required,"latex"]);
