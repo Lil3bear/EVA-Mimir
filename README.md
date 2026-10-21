@@ -90,7 +90,7 @@ DATA_DIR="$HOME/.local/share/autopaperreview-data" node server/index.mjs
 | 全文对齐 | [writing-ai-paper](skills/writing-ai-paper/SKILL.md)，证据与全篇主张对齐 |
 | 宏观布局 | [zhihu-paper-structure](skills/zhihu-paper-structure/SKILL.md)，贡献归属和叙述主线 |
 | 微观可读性 | [zhihu-paper-readability](skills/zhihu-paper-readability/SKILL.md)，逻辑、用词、理解成本 |
-| 局部润色 | [snap-write](skills/snap-write/SKILL.md)，保留逻辑与信息量，准确使用术语，避免长难句、机器人碎句和防御式写作；在 Skills 的写作分组中手动勾选 |
+| 局部润色与段落论证 | [snap-write](skills/snap-write/SKILL.md)，保留逻辑与信息量，准确使用术语；包含[五步段落论证](skills/snap-write/references/paragraph-argument.md)：定义范围、分类依据、方法机制、证据比较、局限启示。在 Skills 的写作分组中手动勾选，不强制把每段写成五句或五条。 |
 | Rebuttal | [paper-rebuttal](skills/paper-rebuttal/SKILL.md)，反证复核与具体回应 |
 | 图示故事、布局、科学插画、实验图表 | [图示流程](docs/figure-workflow.md)，方法先行，不编造数据 |
 

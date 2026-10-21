@@ -39,6 +39,10 @@ Use this optional step when a term or collocation is uncertain, the author suppl
 
 Learn usage and grammatical patterns, not distinctive sentences to copy. Do not add citations to the manuscript solely because a source informed the phrasing. A routine local polish with clear terminology does not require an external-model call or a literature survey.
 
+## Paragraph Argument Mode
+
+When asked to organize a paragraph or short subsection, especially related work or a literature synthesis, use [the five-part paragraph framework](references/paragraph-argument.md). It connects definition and scope, classification, mechanisms, evidence and comparison, and limitations and implications. This mode permits reorganizing the selected passage, not inventing missing literature or expanding the whole paper. A sentence-only polish does not require all five parts.
+
 ## Local Editing Pass
 
 Before editing, identify the passage's intended claim and logical progression. Draft a restrained revision, then compare original and revision for:

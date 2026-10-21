@@ -16,6 +16,9 @@ test("snap-write is selectable, reaches prompts and records its exact version wi
   assert.equal(prompt.split(content).length-1,1);
   const manifest=await skillManifest(["snap-write"]);
   assert.equal(manifest.files.find(f=>f.file==="skills/snap-write/SKILL.md").sha256,createHash("sha256").update(content).digest("hex"));
+  const helper=await readFile(new URL("../skills/snap-write/references/paragraph-argument.md",import.meta.url),"utf8");
+  assert.equal(prompt.split(helper).length-1,1);
+  assert.equal(manifest.files.find(f=>f.file==="skills/snap-write/references/paragraph-argument.md").sha256,createHash("sha256").update(helper).digest("hex"));
 });
 
 test("writing foundation is mandatory, deduplicated and unknown selections fail closed", async () => {

@@ -11,8 +11,8 @@ export const skills = [
     group: "写作",
     default: false,
     source: "作者指定的局部写作规范",
-    files: ["skills/snap-write/SKILL.md"],
-    description: "保留逻辑和信息量，准确使用术语；自然学术表达，避免长难句、机器人碎句和说明书式写法。",
+    files: ["skills/snap-write/SKILL.md", "skills/snap-write/references/paragraph-argument.md"],
+    description: "局部润色与段落论证：定义范围、分类依据、方法机制、证据比较、局限启示；保留原意，不编造内容。",
   },
   ...[
     ["paper-figure-story", "图示 · 动机与创新", "https://github.com/Leey21/awesome-ai-research-writing", "全文证据对齐、Method 审查与图示主张边界。"],
