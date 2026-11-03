@@ -3,9 +3,14 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "pi": {
+    "extensions": ["pi/extension.ts"],
+    "skills": ["skills/snap-write", "skills/writing-ai-paper", "skills/zhihu-paper-structure", "skills/zhihu-paper-readability"]
+  },
   "scripts": {
     "dev": "LOCAL_REVISION_ONLY=1 node server/index.mjs",
     "build": "vite build",
+    "writing": "node pi/launch.mjs",
     "test": "node --test test/*.test.mjs"
   },
   "dependencies": {

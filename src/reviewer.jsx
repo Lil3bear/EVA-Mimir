@@ -155,16 +155,19 @@ function SelectionTranslation({ selection, client, meta, engine, setEngine, auto
   }
   useEffect(() => {
     generation.current++; setText(""); setError(""); setProgress(""); setPending(false); setCopied(false);
-    if (engine === "browser" || autoCloud) run();
+    if (engine !== "browser" || autoCloud) run();
     return () => { generation.current++; };
   }, [engine, autoCloud]);
   return <section ref={panel} className="r-translation-popup" style={position} role="region" aria-label="划选翻译" onMouseDown={e => e.stopPropagation()}>
     <header><strong><Languages size={16}/>中文译文 <small>p. {selection.page}</small></strong><Icon icon={X} label="关闭翻译" onClick={close}/></header>
     <div className="r-translation-engine"><select aria-label="翻译引擎" value={engine} onChange={e => setEngine(e.target.value)}>
-      <option value="browser">浏览器本地翻译 · 不用模型额度</option><option value="fast" disabled={!meta?.fastTranslation}>快速云翻译 · {meta?.translationModel || "未配置"}</option><option value="quality" disabled={!meta?.ai}>审稿模型精译 · 使用账户额度</option>
+      <option value="browser">浏览器本地翻译 · 不用模型额度</option><option value="fast" disabled={!meta?.fastTranslation}>快速云翻译 · {meta?.translationModel || "未配置"}</option><option value="quality" disabled={!meta?.ai}>审稿模型精译 · {meta?.model || "当前模型"}</option>
     </select><Icon icon={pending ? LoaderCircle : RotateCcw} label="重新翻译" disabled={pending || (engine !== "browser" && !meta?.ai)} onClick={run}/></div>
     <details className="r-translation-source"><summary>查看原文</summary><p>{selection.quote}</p></details>
-    <div className={`r-translation-result ${error ? "r-warning" : ""}`} aria-live="polite">{error || (pending ? <span><LoaderCircle size={14} className="r-spin"/>{progress || "正在翻译选文…"}</span> : text || "点击翻译，将仅发送这段选文。")}</div>
+    <div className={`r-translation-result ${error ? "r-warning" : ""}`} aria-live="polite">{error || (pending ? <span><LoaderCircle size={14} className="r-spin"/>{progress || "正在翻译选文…"}</span> : text || (engine === "browser" ? "点击“开始本地翻译”；首次使用可能下载 Chrome 语言包。" : "点击翻译，将仅发送这段选文。"))}</div>
+    {engine === "browser" && <button className="r-primary r-full" disabled={pending} onClick={run}><Languages size={14}/>开始本地翻译</button>}
+    {engine === "browser" && pending && meta?.fastTranslation && <button className="r-primary r-full" onClick={() => setEngine("fast")}><Languages size={14}/>不等语言包，改用快速云翻译</button>}
+    {engine === "browser" && error && meta?.fastTranslation && <button className="r-primary r-full" onClick={() => setEngine("fast")}><Languages size={14}/>改用快速云翻译</button>}
     {engine !== "browser" && <><p className="r-translation-disclosure">仅选文发送至{meta?.provider === "codex" ? " Codex 云端" : ` ${meta?.apiOrigin || "已配置的模型服务"}`}，使用账户额度；译文和交互保存在完整 JSON 档案。</p>
       {!autoCloud && <button className="r-primary r-full" disabled={pending || !meta?.ai} onClick={run}><Languages size={14}/>同意发送选文并翻译</button>}
       <label className="r-check r-translation-auto"><input type="checkbox" checked={autoCloud} onChange={e => setAutoCloud(e.target.checked)}/><span>本篇后续划选自动云端翻译（使用额度）</span></label></>}

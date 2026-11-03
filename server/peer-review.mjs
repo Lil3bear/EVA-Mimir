@@ -35,6 +35,9 @@ export async function reviewerRegistry(config, filename=process.env.REVIEW_PROVI
       registry.push({id:`tokenhub:${model.id}`,name:model.name||model.id,vendor:"TokenHub",model:model.id,config:{provider:"openai",baseURL:tokenhub.baseURL,apiKey:tokenhub.apiKey,apiFormat:"chat-json",model:model.id,disableThinking:/^deepseek/.test(model.id)||model.id==="glm-5.1",...(/^glm-5\.[23](?:-|$)/.test(model.id)?{reasoningEffort:"low"}:{})}});
     }
   }
+  if(config.provider==="dsh"){
+    registry.push({id:`dsh:${config.model}`,name:`DSH · ${config.model}`,vendor:"DSH",model:config.model,config:{...config,model:config.model}});
+  }
   if(config.provider==="openai" && config.apiKey){
     const models=new URL(config.baseURL).origin==="https://uuapi.io" ? ["claude-sonnet-4-6","claude-opus-4-8",config.model] : [config.model];
     for(const model of new Set(models))registry.push({id:`primary:${model}`,name:model,vendor:new URL(config.baseURL).origin==="https://uuapi.io"?"UUAPI":"当前 API",model,config:{...config,model}});

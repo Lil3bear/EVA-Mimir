@@ -54,7 +54,11 @@ export function experienceStore(directory) {
       for(const p of project.proposals || [])items.push({...common,
         key:`${project.id}:proposal:${p.id}`, kind:"revision-result", proposalId:p.id,
         status:p.status, model:p.model, provider:p.provider, resultRevision:p.resultRevision,
-        appliedAt:p.appliedAt, error:p.lastError, changedFiles:p.changedFiles});
+        appliedAt:p.appliedAt, error:p.lastError, changedFiles:p.changedFiles,
+        sourceRevision:p.revision,transport:p.transport,patches:p.patches,sourceComments:p.sourceComments,
+        skills:p.skills,skillManifest:p.skillManifest,applyAttempts:p.applyAttempts});
+      for (const report of project.reports || []) items.push({...common,
+        key:`${project.id}:report:${report.id}`,kind:"editing-request",report});
       for(const s of project.overleaf?.syncHistory || [])items.push({...common,
         key:`${project.id}:sync:${s.remoteCommit}:${s.revision}`, kind:"overleaf-sync", ...s});
       return enqueue(items);
@@ -62,7 +66,8 @@ export function experienceStore(directory) {
     recordJob(id, job) {
       return enqueue([{key:`${id}:job:${job.id}`, kind:"job", projectId:id,
         jobId:job.id, title:job.title, status:job.status, model:job.model,
-        provider:job.provider, error:job.error}]);
+        provider:job.provider, error:job.error,
+        piSessions:[...new Set((job.events||[]).map(event=>event.piSessionDirectory).filter(Boolean))]}]);
     },
     async markdown() {
       await enqueue([]);

@@ -119,7 +119,9 @@ test(
       await atomicJSON(projectPath,retryProject);
       assert.equal((await request(url)).data.comments[0].id, commentId);
       const skillIds=(await request("/health")).data.skills.map(s=>s.id);
-      assert.equal(skillIds.length,16);
+      assert.equal(skillIds.length,17);
+      assert.equal((await request("/projects/import-overleaf",{method:"POST",body:{url:"https://example.com/project",trusted:true,consent:true}})).status,400);
+      assert.equal((await request("/projects/import-overleaf",{method:"POST",body:{url:"https://git.overleaf.com/abc123",trusted:false,consent:true}})).status,400);
       const automatic=await request(`${url}/automation`,{method:"POST",body:{enabled:true,startNow:false,consent:true,skillIds}});
       assert.equal(automatic.status,200);assert.deepEqual(automatic.data.automation.skillIds,skillIds);
       const failedRun=await request(`${url}/jobs`,{method:"POST",body:{mode:"revise",skillIds,instructions:"test missing credentials",consent:true}});

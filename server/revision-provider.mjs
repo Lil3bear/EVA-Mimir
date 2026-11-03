@@ -18,7 +18,7 @@ export async function revisionProvider(primary, id, filename, officialFile=path.
 
 export function publicRevisionProvider(config) {
   return {model:config.model,displayName:config.modelName||config.model,provider:config.provider,vendor:config.vendor || (config.provider==="codex"?"Codex":"主服务"),
-    apiOrigin:config.localAuth?config.configuredOrigin||null:config.provider==="codex"?null:new URL(config.baseURL).origin,backup:Boolean(config.backup),
+    apiOrigin:config.localAuth?config.configuredOrigin||null:config.provider==="codex"?null:config.provider==="dsh"?"DSH local harness":new URL(config.baseURL).origin,backup:Boolean(config.backup),
     ...(config.localAuth?{localAuth:true}:{}),
     ...(config.teamMode?{teamMode:config.teamMode,excludedModels:config.excludedModels}:{}),
     ...(config.coWriter ? {workflow:config.workflow,collaborator:publicRevisionProvider(config.coWriter)} : {}),

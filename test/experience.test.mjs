@@ -29,3 +29,16 @@ test("experience preserves comment changes, deduplicates retries and excludes cr
     assert.match(await store.markdown(),/REDACTED/);
   } finally {await rm(directory,{recursive:true,force:true});}
 });
+
+test("personal editing evidence preserves rejected candidates, instructions and skill versions",async()=>{
+  const directory=await mkdtemp(path.join(os.tmpdir(),"mimir-evidence-"));
+  try {
+    const store=experienceStore(directory);
+    const p={id:"paper",name:"Demo",comments:[],history:[],reports:[{id:"r",instructions:"Keep the technical claim",skillManifest:{hash:"v1"}}],proposals:[{id:"p",revision:"before",status:"pending",patches:[{before:"old",after:"new",reason:"clarity"}],transport:"pi-cli"}]};
+    await store.record(p);p.proposals[0].status="rejected";await store.record(p);
+    const state=JSON.parse(await readFile(path.join(directory,"events.json")));
+    assert.equal(state.events.filter(e=>e.kind==="revision-result").length,2);
+    assert.equal(state.events.find(e=>e.status==="rejected").patches[0].after,"new");
+    assert.equal(state.events.find(e=>e.kind==="editing-request").report.skillManifest.hash,"v1");
+  } finally {await rm(directory,{recursive:true,force:true});}
+});

@@ -64,8 +64,8 @@ test("patch application is exact, non-mutating, rejects ambiguous or missing sou
   );
   assert.throws(() => applyPatches(files, []));
 });
-test("all twelve skills load actual attributed reference material", async () => {
-  assert.equal(skills.length, 16);
+test("all registered skills load actual attributed reference material", async () => {
+  assert.equal(skills.length, 17);
   for (const skill of skills)
     assert.ok((await skillPrompt([skill.id])).length > 400, skill.id);
   await assert.rejects(skillPrompt(["invented"]));

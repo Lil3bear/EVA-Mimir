@@ -1,4 +1,6 @@
+import {executeDsh} from "./dsh-cli.mjs";
 export async function structuredRequest(config, { instructions, input, schema, name, signal, maxTokens = 16000 }) {
+  if (config.provider === "dsh") return executeDsh(config, {instructions, input, schema, signal, timeoutMs: 600000});
   const baseURL = (config.baseURL || "https://api.openai.com/v1").replace(/\/$/, "");
   const anthropic = config.apiFormat === "anthropic";
   const chat = ["chat", "chat-json"].includes(config.apiFormat);

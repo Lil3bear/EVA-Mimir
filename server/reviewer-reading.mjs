@@ -38,7 +38,7 @@ Return plain readable prose in answer, with short paragraphs and numbered steps 
 async function explain(config, prompt, { signal, onProgress }) {
   if (config.provider === "codex") return executeCodex(`${prompt.instructions}\n\nUNTRUSTED PAPER DATA:\n${prompt.input}`, schema, config.model,
     { signal, onProgress: e => onProgress({ phase: e.phase, message: e.phase === "validating" ? "正在核对解释与原文出处" : "正在结合论文上下文解释" }) });
-  if (!config.apiKey) throw new Error("请先配置模型连接，不会生成模拟解释");
+  if (!config.apiKey && config.provider !== "dsh") throw new Error("请先配置模型连接，不会生成模拟解释");
   onProgress({ phase: "model", message: "正在结合论文上下文解释" });
   return structuredRequest(config, { ...prompt, name: "paper_reading_tutor", signal, maxTokens: 7000 });
 }
@@ -94,7 +94,7 @@ export async function installReadingRoutes(router, { directory, folder, load, sa
     }
     if (input.mode === "explain" && (!input.page || !input.quote.trim())) throw new Error("请先选中 PDF 中不理解的原文");
     const config = { ...getConfig() };
-    if (config.provider !== "codex" && !config.apiKey) throw new Error("请先配置模型连接");
+    if (config.provider !== "codex" && config.provider !== "dsh" && !config.apiKey) throw new Error("请先配置模型连接");
     const prompt = buildReadingPrompt(p, input, conversation);
     const record = { ...input, id: randomUUID(), time: now(), status: "queued", provider: config.provider, model: config.model,
       manuscriptHash: p.hash, prompt, result: null, contextTurns: conversation.length };

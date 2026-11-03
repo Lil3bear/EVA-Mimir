@@ -113,6 +113,36 @@ export function sceneFor(d,kind="diagram") {
   return {width,height,shapes};
 }
 const escape=s=>String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&apos;"}[c]));
+
+const xmlEscape=value=>String(value).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&apos;"}[c]));
+/**
+ * Convert the validated primitive scene into an editable draw.io document.
+ * Rendering stays with the existing PDF/SVG path; this file is for hand edits.
+ */
+export function sceneToDrawio(scene,name="Figure") {
+  const cells=[],w=scene.width,h=scene.height;
+  cells.push(`<mxCell id="0"/>`,`<mxCell id="1" parent="0"/>`);
+  let index=0;
+  for(const shape of scene.shapes){
+    const id=`s${++index}`;
+    if(shape.type==="rect"){
+      cells.push(`<mxCell id="${id}" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=${shape.fill||"#ffffff"};strokeColor=${shape.stroke==="none"?"none":(shape.stroke||"#819198")};" vertex="1" parent="1"><mxGeometry x="${shape.x}" y="${shape.y}" width="${Math.max(1,shape.w)}" height="${Math.max(1,shape.h)}" as="geometry"/></mxCell>`);
+    }else if(shape.type==="text"){
+      const size=shape.size||18,width=Math.max(80,String(shape.text).length*size*0.62),height=Math.ceil(size*1.5);
+      const x=shape.anchor==="middle"?shape.x-width/2:shape.anchor==="end"?shape.x-width:shape.x;
+      cells.push(`<mxCell id="${id}" value="${xmlEscape(shape.text).replace(/\n/g,"&#10;")}" style="text;html=0;whiteSpace=wrap;strokeColor=none;fillColor=none;align=${shape.anchor==="middle"?"center":shape.anchor==="end"?"right":"left"};verticalAlign=middle;fontSize=${size};fontColor=${shape.fill||"#172b32"};" vertex="1" parent="1"><mxGeometry x="${x}" y="${shape.y-height/2}" width="${width}" height="${height}" as="geometry"/></mxCell>`);
+    }else if(shape.type==="line"){
+      cells.push(`<mxCell id="${id}" style="endArrow=none;html=1;rounded=0;strokeColor=${shape.stroke||"#64757e"};strokeWidth=1;" edge="1" parent="1"><mxGeometry relative="1" as="geometry"><mxPoint x="${shape.x1}" y="${shape.y1}" as="sourcePoint"/><mxPoint x="${shape.x2}" y="${shape.y2}" as="targetPoint"/></mxGeometry></mxCell>`);
+    }else if(shape.type==="path"){
+      const points=shape.points||[];
+      if(points.length<2)continue;
+      const middle=points.slice(1,-1).map(([x,y])=>`<mxPoint x="${x}" y="${y}"/>`).join("");
+      cells.push(`<mxCell id="${id}" style="endArrow=${shape.arrow?"block":"none"};html=1;rounded=0;strokeColor=${shape.stroke||"#64757e"};strokeWidth=2;" edge="1" parent="1"><mxGeometry relative="1" as="geometry"><mxPoint x="${points[0][0]}" y="${points[0][1]}" as="sourcePoint"/><mxPoint x="${points.at(-1)[0]}" y="${points.at(-1)[1]}" as="targetPoint"/>${middle?`<Array as="points">${middle}</Array>`:""}</mxGeometry></mxCell>`);
+    }
+  }
+  return `<mxfile host="mimir-pi" agent="mimir-pi" version="24.7.17" type="device"><diagram id="mimir-figure" name="${xmlEscape(name)}"><mxGraphModel dx="${w}" dy="${h}" grid="0" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="${w}" pageHeight="${h}" math="0" shadow="0"><root>${cells.join("")}</root></mxGraphModel></diagram></mxfile>`;
+}
+
 export function sceneSVG(scene) {
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${scene.width}" height="${scene.height}" viewBox="0 0 ${scene.width} ${scene.height}"><defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0 0 L7 3 L0 6" fill="none" stroke="#64757e"/></marker></defs>${scene.shapes.map(s=>s.type==="text"?`<text x="${s.x}" y="${s.y}" font-family="Helvetica,Arial,sans-serif" font-size="${s.size}" text-anchor="${s.anchor}" fill="${s.fill}">${escape(s.text)}</text>`:s.type==="rect"?`<rect x="${s.x}" y="${s.y}" width="${s.w}" height="${s.h}" rx="4" fill="${s.fill}" stroke="${s.stroke}"/>`:s.type==="line"?`<line x1="${s.x1}" y1="${s.y1}" x2="${s.x2}" y2="${s.y2}" stroke="${s.stroke}"/>`:`<polyline points="${s.points.map(p=>p.join(",")).join(" ")}" fill="none" stroke="${s.stroke}" stroke-width="2" marker-end="url(#arrow)"/>`).join("")}</svg>`;
 }

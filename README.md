@@ -1,5 +1,9 @@
 # Autopaperreview
 
+Local Pi package: see [PI-WRITING.md](PI-WRITING.md). Use `/mimir` from Pi to open
+the isolated DeepSeek writing workspace. This local integration is not an
+upstream release and does not change existing website data.
+
 用 PDF 批注驱动 LaTeX 修订，通过本机 Codex 和写作 Skills 检查论文，保存修改理由、模型和版本。此分支只包含审稿网站，不包含 EVA 实验程序或 Docker 文件。
 
 **先讲对，再写顺。** 初稿逻辑不清时，不应反复自动润色。先结合 Related Work 确定 Introduction 主线，再结合真实代码组织 Method，最后逐段修改。

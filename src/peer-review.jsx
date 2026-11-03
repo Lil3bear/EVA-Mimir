@@ -10,7 +10,7 @@ export function PeerReviewPanel({project,anchor,api,activity,onStarted,skillIds}
   useEffect(()=>{setScope(anchor?.quote?"selection":"paper");},[anchor?.quote,project.id]);
   const quote=scope==="selection"?anchor?.quote||"":"";
   const active=activity && ["queued","running","cancelling"].includes(activity.status);
-  useEffect(()=>{let stopped=false;api("/peer-reviewers").then(data=>{if(stopped)return;setModels(data.reviewers);setProfiles(data.profiles||[]);setSelected(data.reviewers.filter(m=>m.vendor==="TokenHub" && m.model==="deepseek-v4-pro").map(m=>m.id));}).catch(e=>{if(!stopped)setError(e.message);});return()=>{stopped=true;};},[]);
+  useEffect(()=>{let stopped=false;api("/peer-reviewers").then(data=>{if(stopped)return;setModels(data.reviewers);setProfiles(data.profiles||[]);setSelected(data.reviewers.slice(0,1).map(m=>m.id));}).catch(e=>{if(!stopped)setError(e.message);});return()=>{stopped=true;};},[]);
   useEffect(()=>{
     let stopped=false,timer;
     setRuns([]);setConsent(false);

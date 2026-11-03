@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import express from "express";
 import {randomUUID} from "node:crypto";
-import {figureInventory,manuscript,validateDiagram,resolveChart,sceneFor,sceneSVG} from "../server/figures.mjs";
+import {figureInventory,manuscript,validateDiagram,resolveChart,sceneFor,sceneSVG,sceneToDrawio} from "../server/figures.mjs";
 import {figureGate,installFigureRoutes,validateMethodAudit,updateFigureCaption,pendingFigureComments} from "../server/figure-routes.mjs";
 import {Jobs} from "../server/jobs.mjs";
 
@@ -35,6 +35,12 @@ test("untrusted scene data cannot introduce scripts, duplicate nodes, invalid ed
   const svg=sceneSVG(sceneFor(d));assert(svg.includes("Memory"));assert(!svg.includes("<script"));
   const escaped=structuredClone(d);escaped.nodes[0].label="<script>";
   assert(!sceneSVG(sceneFor(escaped)).includes("<script>"));
+  const drawio=sceneToDrawio(sceneFor(d),"Figure 1");
+  assert.ok(drawio.startsWith("<mxfile"));
+  assert.ok(drawio.includes("mimir-figure"));
+  assert.ok(drawio.includes("Memory"));
+  assert.ok(!drawio.includes("<script>"));
+  assert.ok(drawio.includes("endArrow=block"));
   const duplicate=structuredClone(d);duplicate.nodes[1].column=0;
   assert.throws(()=>validateDiagram(duplicate,docs),/重复/);
   assert.throws(()=>validateDiagram({...d,edges:[{from:"x",to:"validator",label:"input"}]},docs),/无效/);

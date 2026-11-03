@@ -27,10 +27,12 @@ import { translate } from "./translate.mjs";
 import { bibliography, verifyEntry } from "./bibliography.mjs";
 import { codexStatus } from "./codex.mjs";
 import { Jobs } from "./jobs.mjs";
+import {stopPiRequests} from "./pi-cli.mjs";
 import { experienceStore } from "./experience.mjs";
-import { connectOverleaf, pushOverleaf, overleafURL } from "./overleaf.mjs";
+import { connectOverleaf, pushOverleaf, overleafURL, readOverleafFiles } from "./overleaf.mjs";
 import { overleafCredentials } from "./overleaf-credentials.mjs";
 import {recordSourceCommit,sourceCommitDiff} from "./source-history.mjs";
+import {TRACE_ID,buildTrace,summarizeTrace} from "./traces.mjs";
 import {commentSnapshot,archiveAppliedComments} from "./comment-log.mjs";
 import { installAccess } from "./access.mjs";
 import {verifiedActor} from "./actor.mjs";
@@ -38,6 +40,7 @@ import {AsyncLocalStorage} from "node:async_hooks";
 import { createReviewerRouter } from "./reviewer.mjs";
 import { installPeerReviewRoutes } from "./peer-review.mjs";
 import { installFigureRoutes } from "./figure-routes.mjs";
+import {discoverSections,publicSections,sectionDocuments,reviewSection} from "./sections.mjs";
 import {revisionProvider,publicRevisionProvider,collaborativeRevision} from "./revision-provider.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -74,8 +77,10 @@ const config = {
   localRevisionOnly: process.env.LOCAL_REVISION_ONLY === "1",
   model:
     process.env.OPENAI_MODEL ||
-    (process.env.AI_PROVIDER === "openai" ? "gpt-4.1" : "gpt-6.1-sol"),
+    (process.env.AI_PROVIDER === "dsh" ? "deepseek-flash" : process.env.AI_PROVIDER === "openai" ? "gpt-4.1" : "gpt-6.1-sol"),
 };
+if (config.revisionTransport === "pi-cli") Object.assign(config, {vendor:"DeepSeek via Pi",modelName:`Pi / ${config.model}`});
+if (config.revisionTransport === "dsh-cli" || config.provider === "dsh") Object.assign(config, {vendor:"DSH 本地",modelName:`DSH / ${config.model}`});
 const savedSettings = await readFile(
   path.join(dataRoot, "settings.json"),
   "utf8",
@@ -97,6 +102,18 @@ if(localClaudeAuth && (process.env.SHARED_MODE==="1" || ![undefined,"127.0.0.1",
 const revisionConfig=collaborativeRevision(await revisionProvider(config,process.env.REVISION_REVIEWER),config,process.env.REVISION_COWRITER_MODEL,{localAuth:localClaudeAuth,localOrigin:process.env.CLAUDE_LOCAL_CONFIGURED_ORIGIN,crosscheckModel:process.env.REVISION_CROSSCHECK_MODEL,teamMode:process.env.REVISION_TEAM_MODE});
 const taskConfig=mode=>({... (mode === "revise" ? revisionConfig : config),manuscriptContext:true,archiveComments:mode==="revise"&&process.env.ARCHIVE_APPLIED_COMMENTS==="1"});
 async function aiStatus() {
+  if (config.provider === "dsh") {
+    return {
+      ai: true,
+      hasApiKey: true,
+      provider: "dsh",
+      apiOrigin: "DSH local harness",
+      model: config.model,
+      revision:publicRevisionProvider(revisionConfig),
+      localRevisionOnly: config.localRevisionOnly,
+      cli: {available: true, authenticated: true, message: "本机 DSH headless"},
+    };
+  }
   if (config.provider === "codex") {
     const cli = await codexStatus();
     return {
@@ -252,7 +269,7 @@ async function saveAIResult(p, rev, input, runConfig, result) {
     vendor:runConfig.vendor||null,
     modelName:runConfig.modelName||runConfig.model,
     collaboration:result.collaboration||null,
-    transport:runConfig.provider === "codex" ? "codex-cli" : input.mode === "revise" && runConfig.revisionTransport === "claude-cli" ? "claude-cli" : runConfig.apiFormat,
+    transport:runConfig.provider === "dsh" ? "dsh-cli" : runConfig.revisionTransport === "pi-cli" ? "pi-cli" : runConfig.provider === "codex" ? "codex-cli" : input.mode === "revise" && runConfig.revisionTransport === "claude-cli" ? "claude-cli" : runConfig.apiFormat,
     summary: result.summary,
     coverage: result.coverage,
     outcome:input.mode==="review"?"reviewed":patches.length?"proposed":"no_changes",
@@ -558,9 +575,10 @@ app.get(
       .catch(() => false);
     res.json({
       shared: process.env.SHARED_MODE === "1",
+      ...(process.env.MIMIR_INSTANCE?{mimirInstance:process.env.MIMIR_INSTANCE}:{}),
       settingsLocked: process.env.SETTINGS_LOCKED === "1",
       defaultProjectId:process.env.DEFAULT_PROJECT_ID||null,
-      fastTranslation: Boolean(process.env.TRANSLATION_MODEL && config.provider !== "codex" && config.apiKey),
+      fastTranslation: Boolean(process.env.TRANSLATION_MODEL && config.provider !== "codex" && (config.apiKey || config.provider === "dsh")),
       translationModel: process.env.TRANSLATION_MODEL || null,
       latex,
       ...(await aiStatus()),
@@ -674,6 +692,25 @@ app.post(
     await sendProject(res, p);
   }),
 );
+app.post("/api/projects/import-overleaf", wrap(async (req,res) => {
+  const input = z.object({url:z.string().max(300),token:z.string().max(500).optional(),trusted:z.literal(true),consent:z.literal(true)}).strict().parse(req.body);
+  const url = overleafURL(input.url);
+  const id = randomUUID();
+  try {
+    const repository = await connectOverleaf(pid(id),url,input.token);
+    const files = await readOverleafFiles(repository);
+    const p = {id,name:`Overleaf ${new URL(url).pathname.slice(1)}`,main:detectMain(files),engine:"pdflatex",venue:"",revision:null,pdfRevision:null,comments:[],history:[],proposals:[],reports:[],log:"",trusted:true};
+    const revision = await snapshot(p,files,"导入 Overleaf Git");
+    if (input.token) await syncTokens.set(id,url,input.token);
+    p.overleaf = {...repository,baseRevision:revision.id,autoPush:false,lastSynced:null,lastError:""};
+    await saveProject(p);
+    await sendProject(res,p);
+  } catch (error) {
+    await rm(pid(id),{recursive:true,force:true});
+    await syncTokens.delete(id);
+    throw error;
+  }
+}));
 app.get(
   "/api/projects/:id",
   wrap(async (req, res) => sendProject(res, await getProject(req.params.id))),
@@ -976,6 +1013,74 @@ async function projectJobHistory(id) {
   return records.sort((a,b)=>b.created.localeCompare(a.created));
 }
 app.get("/api/projects/:id/jobs/history",wrap(async(req,res)=>{await getProject(req.params.id);res.json(await projectJobHistory(req.params.id));}));
+const sectionDir = id => path.join(pid(id), "sections");
+async function sectionRecords(id) {
+  const names = await readdir(sectionDir(id)).catch(error => { if (error.code === "ENOENT") return []; throw error; });
+  const rows = [];
+  for (const name of names) if (/^[a-f0-9-]{36}\.json$/.test(name)) rows.push(JSON.parse(await readFile(path.join(sectionDir(id), name), "utf8")));
+  return rows.sort((left, right) => right.created.localeCompare(left.created));
+}
+app.get("/api/projects/:id/sections", wrap(async (req,res) => {
+  const p = await getProject(req.params.id), rev = await getRevision(p.id, p.revision);
+  const sections = discoverSections(p, rev), records = await sectionRecords(p.id);
+  const latest = records.find(record => record.revision === p.revision) || null;
+  res.json({
+    revision: p.revision, model: config.model, provider: config.vendor || config.provider,
+    enabled: config.provider === "codex" || config.provider === "dsh" || Boolean(config.apiKey),
+    sections: publicSections(sections), latest,
+  });
+}));
+app.post("/api/projects/:id/sections/review", wrap(async (req,res) => {
+  const input = z.object({revision:z.string().uuid(),sectionIds:z.array(z.string()).max(40).optional(),consent:z.literal(true)}).strict().parse(req.body);
+  const p = await getProject(req.params.id);
+  if (p.revision !== input.revision) throw Error("论文版本已变化，请刷新后再运行章节对齐");
+  const rev = await getRevision(p.id, p.revision), all = discoverSections(p, rev);
+  const wanted = new Set(input.sectionIds || all.map(section => section.id));
+  const chosen = all.filter(section => wanted.has(section.id));
+  if (!chosen.length) throw Error("没有可运行的章节");
+  const documents = sectionDocuments(rev);
+  const record = {id:randomUUID(),revision:p.revision,created:new Date().toISOString(),status:"running",
+    model:config.model,provider:config.vendor||config.provider,
+    sections:chosen.map(({text,...rest})=>rest),results:[]};
+  const file = path.join(sectionDir(p.id), `${record.id}.json`);
+  await atomicJSON(file, record);
+  const job = jobs.enqueue(p.id, async ({signal,progress}) => {
+    try {
+      for (const [index,section] of chosen.entries()) {
+        signal.throwIfAborted();
+        progress({phase:"model",model:config.model,provider:config.vendor||config.provider,
+          message:`章节 ${index+1}/${chosen.length} · ${section.title} · ${section.files.join(", ")}`});
+        const result = await reviewSection({project:p,section,sections:all,documents,config,signal});
+        record.results.push(result);
+        await atomicJSON(file, record);
+      }
+      record.status = "completed";
+      record.completed = new Date().toISOString();
+      await atomicJSON(file, record);
+      return {outcome:"proposed",message:`章节对齐完成：${chosen.length} 个章节`,recordId:record.id};
+    } catch (error) {
+      record.status = signal.aborted ? "cancelled" : "failed";
+      record.error = error.message;
+      await atomicJSON(file, record);
+      throw error;
+    }
+  }, {title:"章节对齐", model:config.model, provider:config.vendor||config.provider});
+  res.status(202).json({job, recordId:record.id});
+}));
+const piSessionRoot = () => process.env.MIMIR_PI_SESSION_DIR || path.join(dataRoot, "pi-sessions");
+app.get("/api/projects/:id/traces", wrap(async (req,res) => {
+  const p = await getProject(req.params.id);
+  const trace = await buildTrace(p, await projectJobHistory(p.id), {dataRoot, sessionRoot: null, includeRemote: false});
+  res.json({traces: [summarizeTrace(trace)]});
+}));
+app.get("/api/projects/:id/traces/:traceId", wrap(async (req,res) => {
+  if (req.params.traceId !== TRACE_ID) throw new Error("轨迹不存在");
+  const p = await getProject(req.params.id);
+  const trace = await buildTrace(p, await projectJobHistory(p.id), {dataRoot, sessionRoot: piSessionRoot()});
+  const after = Number(req.query.after || 0);
+  const events = Number.isFinite(after) && after > 0 ? trace.events.filter(event => event.seq > after) : trace.events;
+  res.json({...trace, events});
+}));
 app.post("/api/projects/:id/history/git",locked(async(req,res)=>{
   const p=await getProject(req.params.id);await ensureGitHistory(p);
   const previous=await jobs.get(p.id);
@@ -1150,6 +1255,7 @@ installFigureRoutes(app,{pid,getProject,getRevision,saveProject,snapshot,compile
 app.use("/api/reviewer", await createReviewerRouter({
   directory: path.join(dataRoot, "reviewer"), getConfig: () => config, status: aiStatus,
 }));
+app.get("/api/execution-queue", (req, res) => res.json({ online: false, requests: [] }));
 app.use("/api", (req, res) => res.status(404).json({ error: "API 不存在" }));
 app.get(["/review", "/review/"], (req, res, next) => {
   if (process.env.NODE_ENV !== "production") return next();
@@ -1180,3 +1286,17 @@ app.use((err, req, res, next) => {
 httpServer.listen(port, process.env.BIND_HOST || "127.0.0.1", () =>
   console.log(`Autopaperreview: http://localhost:${port}`),
 );
+if (config.revisionTransport === "pi-cli") {
+  let closing = false;
+  for (const signal of ["SIGTERM","SIGINT"]) process.on(signal, () => {
+    if (closing) return;
+    closing = true;
+    for (const id of jobs.entries.keys()) jobs.cancel(id);
+    stopPiRequests();
+    httpServer.close();
+    setTimeout(async () => {
+      await Promise.all([...jobs.entries.values()].map(entry=>entry.saved.catch(()=>{})));
+      process.exit();
+    },500).unref();
+  });
+}

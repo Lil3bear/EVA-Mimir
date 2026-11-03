@@ -38,6 +38,7 @@ import {
   LogOut,
   Users,
   Image,
+  Layers,
 } from "lucide-react";
 import "./style.css";
 import { citationEntry } from "./citation-links.mjs";
@@ -45,6 +46,8 @@ import { createTranslationClient } from "./translation-client.mjs";
 import { placeReaderPopup } from "./reader-popup.mjs";
 import { PeerReviewPanel } from "./peer-review.jsx";
 import { FigurePanel } from "./figure-panel.jsx";
+import { TraceView } from "./trace-view.jsx";
+import { SectionPanel } from "./section-panel.jsx";
 import {loadPDF,pdfErrorMessage} from "./pdf-load.mjs";
 import {pageAtReadingLine} from "./pdf-scroll.mjs";
 pdfjs.GlobalWorkerOptions.workerSrc = worker;
@@ -435,7 +438,8 @@ function App({member}) {
     [error, setError] = useState(""),
     [failureLog, setFailureLog] = useState(""),
     [modal, setModal] = useState(""),
-    [tab, setTab] = useState("comments");
+    [tab, setTab] = useState("comments"),
+    [traceOpen, setTraceOpen] = useState(false);
   useEffect(() => {
     if (tab !== "changes" || !project || project.detailsLoaded !== false) return;
     let stopped=false;
@@ -463,6 +467,7 @@ function App({member}) {
   const [uploadFile, setUploadFile] = useState(null),
     [trusted, setTrusted] = useState(false),
     [aiMode, setAiMode] = useState("review");
+  const [gitURL,setGitURL] = useState(""), [gitToken,setGitToken] = useState("");
   const [revisionCommentIds,setRevisionCommentIds]=useState(null);
   const [activity, setActivity] = useState(null),
     [activityError, setActivityError] = useState(""),
@@ -532,7 +537,7 @@ function App({member}) {
     }
   }
   useEffect(() => {
-    if (readerPopup?.mode === "translate" && passage) translateSelection();
+    if (readerPopup?.mode === "translate" && passage && translationEngine !== "browser") translateSelection();
   }, [readerPopup?.mode, passage, translationEngine, project?.revision]);
   useEffect(() => {setReaderPopup(null);}, [project?.id, project?.pdfRevision]);
   const backgroundActive =
@@ -587,6 +592,8 @@ function App({member}) {
             (p) => p.id === localStorage.getItem("autopaperreview-project"),
           )?.id || list.find(p=>p.id===h.defaultProjectId)?.id || list[0].id,
         );
+      const remote = new URLSearchParams(location.search).get("overleaf");
+      if (remote) {setGitURL(remote);setTrusted(false);setModal("import-git");history.replaceState(null,"",location.pathname);}
     });
   }, []);
   useEffect(() => {
@@ -669,6 +676,13 @@ function App({member}) {
     localStorage.setItem("autopaperreview-project", p.id);
     setModal("");
     setUploadFile(null);
+    await refreshProjects();
+    await compile(p);
+  }
+  async function importGit() {
+    const p = await api("/projects/import-overleaf", {method:"POST",body:{url:gitURL.trim(),...(gitToken?{token:gitToken}:{}),trusted,consent:true}});
+    setGitToken("");setProject(p);setModal("");
+    localStorage.setItem("autopaperreview-project",p.id);
     await refreshProjects();
     await compile(p);
   }
@@ -792,6 +806,7 @@ function App({member}) {
           </span>
         </div>
         <div className="project-actions">
+          <IconButton icon={GitCompareArrows} label="导入 Overleaf Git" disabled={!!busy} onClick={()=>{setTrusted(false);setGitToken("");setModal("import-git");}}/>
           <button
             className="secondary"
             disabled={!!busy}
@@ -1153,6 +1168,19 @@ function App({member}) {
               label="版本历史"
               onClick={() => setModal("history")}
             />
+            <IconButton
+              icon={Activity}
+              label="对话与轨迹"
+              disabled={!project}
+              onClick={() => setTraceOpen(true)}
+            />
+            <IconButton
+              icon={Layers}
+              label="章节对齐"
+              className={`icon-button ${tab==="sections"?"active":""}`}
+              disabled={!project}
+              onClick={() => setTab("sections")}
+            />
             <button className={tab === "reviewers" ? "active" : ""} onClick={()=>setTab("reviewers")}><Users size={15}/>审稿人</button>
             <IconButton icon={Image} label="图示工作区" className={`icon-button ${tab==="figures"?"active":""}`} onClick={()=>setTab("figures")}/>
           </div>
@@ -1277,6 +1305,8 @@ function App({member}) {
                 )}
               </div>
             </>
+          ) : tab === "sections" ? (
+            project && <SectionPanel project={project} api={api} activity={activity} onStarted={setActivity}/>
           ) : tab === "figures" ? (
             project && <FigurePanel project={project} api={api} activity={activity} onStarted={setActivity} onApplied={()=>openProject(project.id)}/>
           ) : tab === "reviewers" ? (
@@ -1471,13 +1501,22 @@ function App({member}) {
             <select aria-label="翻译引擎" value={translationEngine} onChange={e=>setTranslationEngine(e.target.value)}>
               <option value="browser">本地翻译 · 不用模型额度</option>
               <option value="fast" disabled={!health?.fastTranslation}>快速云翻译 · {health?.translationModel || "未配置"}</option>
-              <option value="quality">论文模型精译 · 使用额度</option>
+              <option value="quality">论文模型精译 · {health?.model || "当前模型"}</option>
             </select>
             <IconButton icon={translating ? LoaderCircle : RotateCcw} label="重新翻译" disabled={!passage || translating} onClick={translateSelection}/>
           </div>
           <p className={translationError ? "warning-text" : "translation-text"} aria-live="polite">
-            {translationError || (translating ? translationProgress || "正在翻译…" : translation) || "待翻译"}
+            {translationError || (translating ? translationProgress || "正在翻译…" : translation) || (translationEngine === "browser" ? "点击“开始本地翻译”。首次使用可能下载 Chrome 语言包。" : "待翻译")}
           </p>
+          {translationEngine === "browser" && !translating && !translation && (
+            <button className="secondary" onClick={translateSelection}><Languages size={14}/>开始本地翻译</button>
+          )}
+          {translationEngine === "browser" && translating && health?.fastTranslation && (
+            <button className="secondary" onClick={() => setTranslationEngine("fast")}><Languages size={14}/>不等语言包，改用快速云翻译</button>
+          )}
+          {translationEngine === "browser" && translationError && health?.fastTranslation && (
+            <button className="secondary" onClick={() => setTranslationEngine("fast")}><Languages size={14}/>改用快速云翻译</button>
+          )}
           <button className="popup-comment-action" onClick={() => setReaderPopup({...readerPopup,mode:"comment"})}><MessageSquare size={14}/> 添加修改意见</button>
           <button className="popup-comment-action" onClick={() => {setTab("reviewers");setReaderPopup(null);}}><Users size={14}/> 请审稿人看这段</button>
         </> : <div className="composer">
@@ -1823,7 +1862,7 @@ function App({member}) {
       )}
       {modal === "settings" && (
         <Modal title="模型设置" close={() => setModal("")}>
-          {health?.settingsLocked ? <div><p>模型由团队管理员配置。</p><p>{health.apiOrigin} · {health.model}</p>{revisionAI?.backup && <p>备用修订：{revisionAI.vendor} · {revisionAI.displayName||revisionAI.model}（{revisionAI.model}）</p>}<p>快速翻译：{health.translationModel || "未配置"}</p><p className="disclosure">云端请求会将选定内容发送至上述第三方服务，并使用团队额度。API Key 不会返回浏览器。</p></div> : <form
+          {health?.settingsLocked ? <div><p>模型由团队管理员配置。</p><p>{health.apiOrigin} · {health.model}</p>{revisionAI?.backup && <p>备用修订：{revisionAI.vendor} · {revisionAI.displayName||revisionAI.model}（{revisionAI.model}）</p>}<p>翻译：{health.translationModel || "未配置"}</p><p className="disclosure">云端请求会将选定内容发送至上述第三方服务，并使用团队额度。API Key 不会返回浏览器。</p></div> : <form
             onSubmit={(e) => {
               e.preventDefault();
               act("保存模型设置", async () => {
@@ -1928,6 +1967,16 @@ function App({member}) {
               导入并编译
             </button>
           </div>
+        </Modal>
+      )}
+      {modal === "import-git" && (
+        <Modal title="导入 Overleaf Git" close={()=>{setGitToken("");setModal("");}}>
+          <form onSubmit={e=>{e.preventDefault();act("导入 Overleaf Git",importGit);}}>
+            <label>Git URL<input type="url" required value={gitURL} onChange={e=>setGitURL(e.target.value)} placeholder="https://git.overleaf.com/PROJECT_ID"/></label>
+            <label>Git token（可选）<input type="password" autoComplete="off" value={gitToken} onChange={e=>setGitToken(e.target.value)}/></label>
+            <label className="checkbox-row"><input type="checkbox" checked={trusted} onChange={e=>setTrusted(e.target.checked)}/><span>我信任此项目源码，同意本机读取并编译。仅导入，不自动推送。</span></label>
+            <div className="modal-actions"><button className="primary" disabled={!trusted||!!busy}><GitCompareArrows size={14}/>导入并编译</button></div>
+          </form>
         </Modal>
       )}
       {modal === "ai" && (
@@ -2179,6 +2228,13 @@ function App({member}) {
             </a>
           </div>
         </Modal>
+      )}
+      {traceOpen && project && (
+        <TraceView
+          projectId={project.id}
+          api={api}
+          onClose={() => setTraceOpen(false)}
+        />
       )}
     </div>
   );

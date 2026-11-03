@@ -10,10 +10,12 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 test("only credential-free Overleaf Cloud HTTPS Git URLs are accepted", () => {
-  assert.equal(
-    overleafURL("https://git.overleaf.com/abc123"),
-    "https://git@git.overleaf.com/abc123",
-  );
+  const expected = "https://git@git.overleaf.com/abc123";
+  assert.equal(overleafURL("https://git.overleaf.com/abc123"), expected);
+  assert.equal(overleafURL("https://git.overleaf.com/abc123/"), expected);
+  assert.equal(overleafURL("https://git@git.overleaf.com/abc123"), expected);
+  assert.equal(overleafURL("https://www.overleaf.com/project/abc123"), expected);
+  assert.equal(overleafURL("https://www.overleaf.com/project/abc123/"), expected);
   for (const url of [
     "file:///tmp/repo",
     "https://example.com/a",

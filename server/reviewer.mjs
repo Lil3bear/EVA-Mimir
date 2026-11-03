@@ -57,7 +57,7 @@ export async function createReviewerRouter({ directory, getConfig, status, gener
   await installReadingRoutes(router, { directory, folder, load, save, locked, event, publicPaper, getConfig, readPaper });
   const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 40 * 1024 * 1024, files: 1 } });
   router.get("/meta", wrap(async (req, res) => res.json({
-    lenses, ...(await status()), fastTranslation: Boolean(translationModel && getConfig().provider !== "codex" && getConfig().apiKey), translationModel: translationModel || null,
+    lenses, ...(await status()), fastTranslation: Boolean(translationModel && getConfig().provider !== "codex" && (getConfig().apiKey || getConfig().provider === "dsh")), translationModel: translationModel || null,
     venue: "ICLR 2027", policyURL: "https://iclr.cc/Conferences/2027/AIPolicyForReviewers",
     rubricStatus: "ICLR 常用字段；2027 数字评分图例需以分配到的 OpenReview 表单核对。",
     sources: [
@@ -155,10 +155,10 @@ export async function createReviewerRouter({ directory, getConfig, status, gener
     const current = await jobs.get(p.id);
     if (["queued", "running", "cancelling"].includes(current?.status)) return res.status(409).json({ error: "已有审稿任务正在运行" });
     const config = { ...getConfig() };
-    if (config.provider !== "codex" && !config.apiKey) throw new Error("请先在模型设置中配置 API Key");
+    if (config.provider !== "codex" && config.provider !== "dsh" && !config.apiKey) throw new Error("请先在模型设置中配置 API Key");
     const prompt = await buildReviewRequest(p, input);
     const run = { id: randomUUID(), time: now(), status: "queued", model: config.model, provider: config.provider,
-      apiOrigin: config.provider === "codex" ? "Codex cloud" : new URL(config.baseURL || "https://api.openai.com/v1").origin,
+      apiOrigin: config.provider === "codex" ? "Codex cloud" : config.provider === "dsh" ? "DSH local harness" : new URL(config.baseURL || "https://api.openai.com/v1").origin,
       request: input, prompt, manuscriptHash: p.hash, originalAssessment: p.initialAssessment, result: null };
     p.runs.unshift(run); p.aiStarted = true; event(p, "ai", `AI 审稿：${config.model}`); await save(p);
     const job = jobs.enqueue(p.id, async ({ signal, progress }) => {

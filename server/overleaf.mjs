@@ -2,10 +2,20 @@ import { spawn } from "node:child_process";
 import { mkdir, rm } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { safePath } from "./core.mjs";
+import { safePath, importZip } from "./core.mjs";
 
 export function overleafURL(value) {
-  const url = new URL(value);
+  const raw = String(value ?? "").trim();
+  const url = new URL(raw);
+  // The browser project URL is what people usually copy; translate it to the
+  // Git endpoint instead of rejecting a valid project.
+  if (url.hostname === "www.overleaf.com") {
+    const project = /^\/project\/([a-zA-Z0-9]+)\/?$/.exec(url.pathname);
+    if (!project || url.port || url.username || url.password || url.search || url.hash)
+      throw new Error("仅支持不含 token 的 Overleaf 项目地址");
+    return overleafURL(`https://git.overleaf.com/${project[1]}`);
+  }
+  const pathname = url.pathname.replace(/\/+$/, "");
   if (
     url.protocol !== "https:" ||
     url.hostname !== "git.overleaf.com" ||
@@ -14,9 +24,10 @@ export function overleafURL(value) {
     (url.username && url.username !== "git") ||
     url.search ||
     url.hash ||
-    !/^\/[a-zA-Z0-9]+$/.test(url.pathname)
+    !/^\/[a-zA-Z0-9]+$/.test(pathname)
   )
     throw new Error("仅支持不含 token 的 Overleaf Cloud Git 地址");
+  url.pathname = pathname;
   url.username = "git";
   return url.toString();
 }
@@ -154,6 +165,22 @@ export async function connectOverleaf(directory, value, token) {
     await rm(temporary, { recursive: true, force: true });
     throw error;
   }
+}
+
+export async function readOverleafFiles(repository, execute = git) {
+  const options = {cwd:repository.directory};
+  const entries = (await execute(["ls-tree","-rz",repository.head],options)).toString().split("\0").filter(Boolean);
+  if (entries.length > 1200) throw new Error("Overleaf project has too many files");
+  let total = 0;
+  for (const entry of entries) {
+    const match = /^(100644|100755) blob ([a-f0-9]+)\t(.+)$/.exec(entry);
+    if (!match) throw new Error("Unsupported Overleaf file type");
+    safePath(match[3]);
+    const size = Number((await execute(["cat-file","-s",match[2]],options)).toString().trim());
+    if (!Number.isSafeInteger(size) || size < 0 || size > 20*1024*1024 || (total += size) > 80*1024*1024)
+      throw new Error("Overleaf project is too large");
+  }
+  return importZip(await execute(["archive","--format=zip",repository.head],options));
 }
 
 export async function prepareSync(

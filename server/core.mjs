@@ -139,10 +139,12 @@ export async function compileFiles(
     path.basename(main),
   ];
   let log = "";
-  for (let i = 0; i < 3; i++) {
+  // lineno's column positions can lag one pass behind bibliography-driven layout.
+  const passes = 4;
+  for (let i = 0; i < passes; i++) {
     onProgress({
       phase: "compiling",
-      message: `${main} · LaTeX 第 ${i + 1}/3 轮编译`,
+      message: `${main} · LaTeX 第 ${i + 1}/${passes} 轮编译`,
     });
     const result = await run(engine, args, { cwd, env, signal });
     log += result.output;

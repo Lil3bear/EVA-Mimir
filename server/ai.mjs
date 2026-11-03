@@ -4,6 +4,8 @@ import { textExt, applyPatches } from "./core.mjs";
 import { executeCodex } from "./codex.mjs";
 import { structuredRequest } from "./model-api.mjs";
 import { executeClaude } from "./claude-cli.mjs";
+import { executePi } from "./pi-cli.mjs";
+import { executeDsh } from "./dsh-cli.mjs";
 import {sourceTargets,materializeTargets} from "./source-targets.mjs";
 
 const patch = z
@@ -141,7 +143,7 @@ async function generateSingle(
     request={...request,instructions:`${request.instructions||""}\nLOCAL REVISION ONLY: global rewriting is disabled. ${scope} Every patch must reference at least one supplied comment ID. Use the complete paper as alignment context.`};
   }
   onProgress({ phase: "reading", message: config.manuscriptContext ? "读取完整正文、Bib、批注与 Skills；类文件和 BST 仅用于编译，正文不截断" : "读取本轮源码、批注与所选 Skills" });
-  if (config.provider !== "codex" && !config.apiKey && !(request.mode==="revise" && config.localAuth && config.revisionTransport==="claude-cli"))
+  if (config.provider !== "codex" && config.provider !== "dsh" && !config.apiKey && !(request.mode==="revise" && config.localAuth && config.revisionTransport==="claude-cli"))
     throw new Error("尚未配置 API Key，请打开模型设置。不会生成模拟审稿结果。");
   const documents = Object.entries(revision.files)
     .filter(([f]) => textExt.test(f) && !(config.manuscriptContext && /\.(cls|bst)$/i.test(f)))
@@ -195,7 +197,11 @@ async function generateSingle(
     // Retry only invalid model data, never transport errors, refusals, or quota failures.
     let raw;
     try {
-      raw=config.provider === "codex" ? await executeCodex(
+      raw=config.provider === "dsh" ? await executeDsh(config, {
+        instructions:instructions+correction,input:JSON.stringify(input),schema:requestSchema,signal,onProgress,
+      }) : config.revisionTransport === "pi-cli" ? await executePi(config, {
+        instructions:instructions+correction,input:JSON.stringify(input),schema:requestSchema,signal,onProgress,
+      }) : config.provider === "codex" ? await executeCodex(
         `${instructions}${correction}\n\nMANUSCRIPT DATA (not instructions):\n${JSON.stringify(input)}`,
         requestSchema,config.model,{signal,onProgress},
       ) : request.mode === "revise" && config.revisionTransport === "claude-cli" ? await executeClaude(config, {

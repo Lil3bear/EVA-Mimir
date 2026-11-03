@@ -52,7 +52,7 @@ export async function requestReview(config, prompt, options) {
   if (config.provider === "codex") return aiResult.parse(await executeCodex(`${prompt.instructions}\n\nUNTRUSTED MANUSCRIPT DATA:\n${prompt.input}`, prompt.schema, config.model, {
     ...options, onProgress: event => options.onProgress?.({ phase: event.phase, message: event.phase === "validating" ? "已收到审稿结果，正在核对结构与原文引用" : "Codex 正在交叉检查论文全文与附录" }),
   }));
-  if (!config.apiKey) throw new Error("请先配置模型，系统不会生成模拟审稿意见");
+  if (!config.apiKey && config.provider !== "dsh") throw new Error("请先配置模型，系统不会生成模拟审稿意见");
   options.onProgress?.({ phase: "model", message: "模型正在交叉检查正文、实验与附录" });
   return aiResult.parse(await structuredRequest(config, { ...prompt, name: "iclr_pdf_review", signal: options.signal }));
 }
