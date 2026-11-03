@@ -1,10 +1,14 @@
-# Autopaperreview
+# Autopaperreview / mimir-pi
 
-Local Pi package: see [PI-WRITING.md](PI-WRITING.md). Use `/mimir` from Pi to open
-the isolated DeepSeek writing workspace. This local integration is not an
-upstream release and does not change existing website data.
+用 PDF 批注驱动 LaTeX 修订。当前版本以**本机 DeepSeek Harness** 为模型后端，通过 DSH 的 `/mimir` 打开本地写作工作区；mimir 不再保存独立的 DeepSeek key。
 
-用 PDF 批注驱动 LaTeX 修订，通过本机 Codex 和写作 Skills 检查论文，保存修改理由、模型和版本。此分支只包含审稿网站，不包含 EVA 实验程序或 Docker 文件。
+## 快速安装
+
+下载 [轻量 macOS 包](https://github.com/Lil3bear/EVA-Mimir/releases/tag/mimir-lite-v0.1.0)，解压后双击 `install.command`，完全退出并重启 DSH，然后输入 `/mimir`。详细步骤见 [INSTALL.md](INSTALL.md)。
+
+包内已包含 Web 构建、运行时依赖和全部写作/审稿/章节/图示 skills；不需要 Node、npm 或构建。LaTeX 仅编译 PDF 时需要。
+
+以下 Codex / Pi 章节保留为旧版交互式工作流说明；DSH 轻量版的安装与后端以 [INSTALL.md](INSTALL.md) 和 [PI-WRITING.md](PI-WRITING.md) 为准。
 
 **先讲对，再写顺。** 初稿逻辑不清时，不应反复自动润色。先结合 Related Work 确定 Introduction 主线，再结合真实代码组织 Method，最后逐段修改。
 
