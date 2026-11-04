@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Autopaperreview · 图文操作指南</title>
+<style>
+:root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif;color:#243832;background:#fff;font-size:16px;line-height:1.65}*{box-sizing:border-box}body{margin:0}header{border-bottom:1px solid #d8e1de;padding:20px 28px;display:flex;justify-content:space-between;gap:20px;align-items:center}header strong{font-size:20px}a{color:#176747;text-underline-offset:4px}button{font:inherit;background:white;border:1px solid #bccdc6;padding:6px 12px;cursor:pointer}nav{padding:12px 28px;background:#eff5f2;display:flex;gap:20px;flex-wrap:wrap}main{max-width:1140px;margin:auto;padding:12px 28px 48px}section{padding:25px 0 34px;border-bottom:1px solid #d8e1de}h1{font-size:28px;margin:0 0 12px}h2{font-size:24px;margin:0 0 12px}h3{font-size:17px;margin:15px 0 7px}p{margin:8px 0}ol,ul{padding-left:24px;margin:8px 0}li{margin:6px 0}.meta,figcaption{color:#60716b;font-size:13px}figure{margin:18px 0 10px}figure img{width:100%;height:auto;display:block;border:1px solid #d8e1de}figcaption{margin-top:6px}.steps{display:grid;grid-template-columns:1fr 1fr;gap:24px}.notice{border-left:3px solid #d99b38;padding:8px 14px;background:#fffaf0}.flow{font-weight:600;color:#176747}.example{padding-left:15px;border-left:2px solid #a8c6b7}table{border-collapse:collapse;width:100%;font-size:14px}td,th{text-align:left;padding:9px 12px;border-bottom:1px solid #d8e1de;vertical-align:top}th{background:#eff5f2}footer{margin-top:20px;color:#60716b;font-size:13px}code{font-family:monospace;overflow-wrap:anywhere}@media(max-width:700px){header{align-items:flex-start;flex-direction:column}main{padding:10px 16px}.steps{grid-template-columns:1fr;gap:4px}h1{font-size:24px}h2{font-size:21px}nav{gap:12px;padding:12px 16px}table{font-size:13px}td,th{padding:7px}}
+@page{size:A4 portrait;margin:12mm}@media print{header,nav,.screen-only{display:none}main{max-width:none;padding:0}section{break-after:page;border:0;padding:0}section:last-of-type{break-after:auto}h1{font-size:21px}h2{font-size:20px}body{font-size:12px;line-height:1.5}figure{margin:10px 0 6px;text-align:center}figure img{width:auto;max-width:100%;max-height:135mm;margin:auto}figcaption{font-size:10px}.meta{font-size:11px}p{margin:5px 0}li{margin:3px 0}.steps{gap:18px}footer{font-size:10px}table{font-size:12px}}
+</style>
+</head>
+<body>
+<header><strong>Autopaperreview · 图文操作指南</strong><div><a href="/">返回工作区</a>　<button onclick="window.print()">打印 / 另存 PDF</button></div></header>
+<nav aria-label="目录"><a href="#start">导入与阅读</a><a href="#comments">翻译与批注</a><a href="#skills">Skills 与审稿</a><a href="#history">修改与回溯</a><a href="#export">导出</a><a href="#overleaf">Overleaf 同步</a><a href="#team">多人协作与排错</a></nav>
+<main>
+<section id="start">
+<h1>01 · 从源码到可修改的论文</h1>
+<p class="meta">更新：2026-10-19。截图来自隔离的演示项目，不包含正式论文、登录密码、Git token 或 API Key；截图制作未调用模型。</p>
+<p class="flow">导入源码 → 编译 PDF → 留批注 → 修订与编译 → 对照检查 → 导出或同步</p>
+<figure><img src="images/01-workspace.png" alt="工作区全貌：左侧源码文件、中间 PDF、右侧批注和修订入口"><figcaption>左侧选择源码和编译配置；中间滚动阅读 PDF；右侧查看批注、修订日志与任务状态。</figcaption></figure>
+<div class="steps"><div><h3>第一次打开</h3><ol><li>向管理员索取当前公网链接和团队登录信息。伙伴不需要安装 ZeroTier。</li><li>在 Overleaf 下载 Source ZIP。只上传 PDF 不能修改 TeX 正文。</li><li>点击右上角「导入 Overleaf」，上传可信 ZIP。</li></ol></div><div><h3>生成阅读稿</h3><ol><li>在左下角核对主文件，例如 <code>main.tex</code>，以及编译引擎。</li><li>点击「编译 PDF」，成功后用鼠标滚动翻页。</li><li>编译失败先看左下角「编译日志」，不要把旧 PDF 当成新稿。</li></ol></div></div>
+</section>
+<section id="comments">
+<h2>02 · 选中文本，写清楚要改什么</h2>
+<p>划选正文显示翻译浮窗；对选文右键打开批注框。需要修改具体句子时，优先保留选文定位，而不是只写全文意见。</p>
+<figure><img src="images/02-comment.png" alt="选中 PDF 文本后打开的修改意见浮窗"><figcaption>示例批注只要求简化表达，同时约束原意、数字和引用；此截图中的文字尚未提交。</figcaption></figure>
+<div class="steps"><div><h3>建议这样写</h3><p class="example">“请简化这句话，保留原意、72.5% 和原引用，不新增实验结论。”</p><p class="example">“请让这段回应 Introduction 的第二项贡献，只改过渡和措辞。”</p></div><div><h3>提交前确认</h3><ul><li>选文和页码对应你要改的内容。</li><li>开启「保存批注后自动修订」需要明确授权；未开启时先保存，再手动启动局部批注修改。</li><li>浏览器本地翻译不调用论文模型，但可能需要下载语言包；云翻译须手动选择，并可能产生费用。</li></ul></div></div>
+</section>
+<section id="skills">
+<h2>03 · 用 Skills 约束写作，而不是代替证据</h2>
+<p>点击页眉「审稿 Skills」查看本轮规则及出处。系统要求始终启用或被其他规则依赖的条目不能随意取消；可用条目以当前页面为准。</p>
+<figure><img src="images/03-skills.png" alt="审稿 Skills 面板，展示写作、证据及其他检查规则"><figcaption>宏观结构、微观可读性与 Rebuttal 是不同用途的规则，不应混为“把语言写复杂”。</figcaption></figure>
+<div class="steps"><div><h3>写作与局部修改</h3><ul><li>宏观结构：问题、贡献、方法和证据是否对齐。</li><li>微观可读性：句子简洁、术语清楚、避免夸张及拗口表述。</li><li>事实与引用：不凭空增加结果、数字、参考文献或实现细节。</li></ul></div><div><h3>审稿与答辩</h3><p>进入右侧「审稿人」选择模型，先评审再决定哪些意见需要修改。审稿不是自动改稿，也不能证明实验正确。</p><p>丁霄汉的三类规则保留作者与出处：<a href="https://zhuanlan.zhihu.com/p/593195527">宏观布局</a>、<a href="https://zhuanlan.zhihu.com/p/639732057">微观可读性</a>、<a href="https://zhuanlan.zhihu.com/p/602024489">Rebuttal</a>。实际模型以任务日志为准，不默认启用昂贵模型。</p></div></div>
+</section>
+<section id="history">
+<h2>04 · 核对修改，并能回到旧版本</h2>
+<p>AI 修改的是 <code>.tex</code> 源码，PDF 来自重新编译。查看右侧「修订日志」核对原文、改后、原因与模型；点击旁边的历史图标查看版本。</p>
+<figure><img src="images/04-history.png" alt="版本历史面板，展示真实演示项目的导入及手动编辑版本"><figcaption>截图中的版本来自实际导入与手动编辑，不是伪造的 AI 成功记录。</figcaption></figure>
+<div class="steps"><div><h3>什么才算完成</h3><ul><li>「已修改」：源码确实改变，且编译、保存成功，仍需作者复核。</li><li>「待确认」：建议尚未应用；「未修改」或「失败」不能当成完成。</li><li>已处理意见可移入修订日志；仍不满意时恢复到批注，继续修改。</li></ul></div><div><h3>安全恢复</h3><ol><li>先核对版本时间和 Git 差异，必要时导出当前稿。</li><li>恢复旧版会创建一个新版本，保留之前的历史，并恢复相应源码与 PDF。</li><li>恢复影响整个共享项目，不只是你的浏览器；先与伙伴确认。不会自动发布到 Overleaf。</li></ol></div></div>
+</section>
+<section id="export">
+<h2>05 · 导出可交付文件</h2>
+<p>点击顶部下载图标打开「导出项目」。交稿前先核对 PDF 是否与当前源码同步，再检查版式、图表、引用和页数。</p>
+<figure><img src="images/05-export.png" alt="导出项目对话框，包含源码、PDF 和审稿记录选项"><figcaption>导出的文件作用不同；只有 PDF 不能还原可编辑的 LaTeX 项目。</figcaption></figure>
+<div class="steps"><div><h3>给作者或合作伙伴</h3><ul><li><strong>源码 ZIP：</strong>保留 TeX、Bib、图片和模板，用于后续编辑或上传 Overleaf。</li><li><strong>PDF：</strong>用于阅读和投稿前版式检查，需确认是当前编译版本。</li><li><strong>审稿记录 JSON：</strong>用于保存批注、修订及可用的追溯信息。</li></ul></div><div><h3>给管理员</h3><p>源码 ZIP 不等于完整系统备份。应另行备份项目数据目录、版本记录和 Git 仓库。</p><p>登录配置、模型密钥与 Overleaf 凭据是敏感数据，必须独立保护，不能加入可分享的论文包或本指南。</p></div></div>
+</section>
+<section id="overleaf">
+<h2>06 · Overleaf Git 是可选同步，不是导入的前提</h2>
+<p>不连接 Overleaf 也能批注、修改与导出。需要同步时点击顶部「Overleaf 同步」图标，并由项目负责人完成认证。</p>
+<figure><img src="images/06-overleaf.png" alt="空白 Overleaf Git 连接设置，未填写项目地址或 token"><figcaption>演示截图没有凭据。认证成功不等于已经推送，必须分别核对连接状态与同步结果。</figcaption></figure>
+<div class="steps"><div><h3>连接与推送</h3><ol><li>从自己的 Overleaf 项目取得 Git 地址，核对项目归属。</li><li>仅在密码框填写 Git token，不发到聊天或截图中。</li><li>首次建议关闭自动同步，连接成功后点击「同步已编译版本」，再到 Overleaf 核对结果。</li></ol></div><div><h3>避免冲突</h3><ul><li>保存凭据后通常无需每次登录重填；撤销、过期或丢失私有凭据目录后需要重新认证。</li><li>同步方向是本系统源码到 Overleaf，不是实时双向编辑。</li><li>两端有冲突时先备份并人工合并，不强制覆盖。系统 Git 历史与 Overleaf 提交是两套记录。</li></ul></div></div>
+</section>
+<section id="team">
+<h2>07 · 多人协作与常见问题</h2>
+<p class="notice">这是可信团队共享工作区，不是逐用户隔离的个人空间。成员共用论文和模型额度；不能用共享登录记录精确证明每次操作属于哪位成员。</p>
+<h3>十个人协作时怎么用</h3>
+<ol><li>每个人保存自己的明确批注；系统会刷新其他人的变化。</li><li>同一篇文章只执行一个 AI 修订任务。不要十个人反复点击启动；开启自动修订时，新批注按轮次合并处理。</li><li>直接改源码遇到版本冲突，先重新读取当前文件，再合并自己的修改。被拒绝的冲突请求没有覆盖他人的版本。</li><li>网络超时先看任务和版本记录，不能把“没收到回复”当成“没执行”。不要因重试而重复消耗模型额度。</li></ol>
+<table><thead><tr><th>现象</th><th>你应该做什么</th></tr></thead><tbody>
+<tr><td>网页打开，但论文一直加载</td><td>顶部查看执行端状态；管理员检查本机主动连接公网队列的服务。本机需开机联网，访问者不需要安装模型客户端。</td></tr>
+<tr><td>提交后显示排队</td><td>请求保存在远端，恢复连接后由本机领取。展开顶部执行队列查看状态或取消尚未领取的请求；不要重复提交。交付结束不等于论文修改完成，仍需核对修订日志。</td></tr>
+<tr><td>PDF 提示 503 或加载失败</td><td>使用「重新加载 PDF」，不要重新提交修订。当前主动领取模式中，论文和 PDF 仍由本机工作区提供。</td></tr>
+<tr><td>已有后台任务 / 409</td><td>先保存批注，等本轮结束。源码冲突则重新打开文件后合并，不能直接覆盖。</td></tr>
+<tr><td>模型 400、402、拒绝或超时</td><td>保留时间、模型名、请求编号和错误文字，交管理员核查；不代表源码已修改。</td></tr>
+<tr><td>修改位置失效、找不到原句</td><td>基于当前 PDF 重新选文，核对当前 TeX，不使用模糊替换掩盖冲突。</td></tr>
+<tr><td>缺少 .sty、字体、图片</td><td>提供编译日志中的首个实质错误和编译引擎，不要只截最后一行失败信息。</td></tr>
+<tr><td>修改后内容不满意</td><td>先看修订差异，恢复相关批注；需要整稿回退时使用版本历史，并通知其他成员。</td></tr>
+</tbody></table>
+<h3>分享边界</h3><p>本指南可分享给获准使用的伙伴，但登录密码请由管理员单独发送。不要公开未发表论文、token、API Key 或内部项目截图。AI 建议必须由作者核实，尤其是数据、实验、创新性和投稿要求。</p>
+<footer>Autopaperreview 图文操作指南 · 演示界面截图 · 本机客户端也会连接配置的模型服务，并非离线或免费推理。公网临时隧道和本机网络不具备高可用保证。</footer>
+</section>
+</main></body></html>

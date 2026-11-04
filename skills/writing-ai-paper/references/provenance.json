@@ -1,0 +1,19 @@
+{
+  "id": "writing-ai-paper",
+  "version": "1.1.2",
+  "upstream": "https://github.com/hzwer/WritingAIPaper",
+  "commit": "ab1d5a359702583df09eaa8d6b0f8ac2146b1f60",
+  "accessed": "2026-10-19",
+  "authors": ["hzwer", "DingXiaoH"],
+  "localAuthorPreferences": {"date":"2026-10-19", "source":"Explicit user instruction in this workspace", "scope":"Minimal comment-driven edits; plain direct prose; avoid unnecessary dash chains, hyphenated labels, code typography and quotation marks. Not attributed to external authors."},
+  "sources": [
+    {"path": "README.md", "blob": "42af02c9f9c24d243f908c5b24971dfb62317b41", "use": "Writing structure, readability, presentation and submission-check themes"},
+    {"path": "NotGoodIdeas.md", "blob": "fa4bbcd30ee50b0098938110cd2ae7e0d83e2b2d", "use": "Cautionary experimental-integrity checks, not recommended practices"}
+  ],
+  "additionalSources": [
+    {"author":"丁霄汉", "title":"顶会论文写作建议（上）：宏观布局，避免 hard to follow", "url":"https://zhuanlan.zhihu.com/p/593195527", "input":"User-pasted article in conversation on 2026-10-19; page not independently fetched", "use":"Final-method presentation, explicit contribution ownership, component/evidence alignment and jump-reading checks"},
+    {"author":"丁霄汉", "title":"顶会论文写作建议（下）：可读性", "url":"https://zhuanlan.zhihu.com/p/639732057", "input":"User attachment 已粘贴的文本.txt on 2026-10-19; descriptive title, page not independently fetched", "use":"Connective semantics, scoped evidence, local definitions, comparison clarity and information density"}
+  ],
+  "license": "Upstream repository: no LICENSE file or explicit license found in the pinned tree. User-supplied Zhihu articles retain the author's copyright; supplied notice requires permission for commercial reprinting and attribution for noncommercial reprinting. Only independently worded operational guidance is included, not full articles, images or source examples; this is not a claim of a commercial redistribution license.",
+  "adaptation": "Independently worded operational checklist with Autopaperreview evidence, scope, logging and source-edit safeguards. Upstream advice is community guidance, not official WWW rules or peer-reviewed evidence. Historical calendar/rate tables, external linked articles and anecdotes are not imported."
+}

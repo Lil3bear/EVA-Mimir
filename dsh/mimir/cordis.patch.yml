@@ -1,0 +1,16 @@
+# Inserts the Mimir workspace command into the current Harness profile.
+# packageDir is the checkout this bundle lives in; update it if the repo moves.
+- insert:
+    - id: dsh-mimir
+      name: '@local/dsh-mimir'
+      config:
+        packageDir: /Users/mz/Documents/New project 2/mimir-pi
+    - id: dsh-mimir-skills
+      name: '@deepseek-ai/dsh-skill-filesystem'
+      config:
+        providerName: mimir
+        includeDefaultRoots: false
+        customSkillDirs:
+          - /Users/mz/Documents/New project 2/mimir-pi/dsh/mimir/skills
+          - /Users/mz/Documents/New project 2/mimir-pi/skills/sections
+          - /Users/mz/Documents/New project 2/mimir-pi/skills

@@ -1,0 +1,53 @@
+{
+  "retrieved_on": "2026-09-26",
+  "files": [
+    {
+      "upstream": "paper-review",
+      "repo": "jam-cc/paper-review.skill",
+      "commit": "bb9900ff7a95e6a28092ab0a9e1d81098f41634e",
+      "path": "SKILL.md",
+      "url": "https://raw.githubusercontent.com/jam-cc/paper-review.skill/bb9900ff7a95e6a28092ab0a9e1d81098f41634e/SKILL.md",
+      "sha256": "05c1684c7769fa7170633c04e4c1a1dcf64b3fe51065407466c2465f5a1e66df"
+    },
+    {
+      "upstream": "paper-review",
+      "repo": "jam-cc/paper-review.skill",
+      "commit": "bb9900ff7a95e6a28092ab0a9e1d81098f41634e",
+      "path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/jam-cc/paper-review.skill/bb9900ff7a95e6a28092ab0a9e1d81098f41634e/LICENSE",
+      "sha256": "c87970eee79041554cc1d8c149985a5d24e36a20f316efc4a90989579c1f099e"
+    },
+    {
+      "upstream": "paper-review",
+      "repo": "jam-cc/paper-review.skill",
+      "commit": "bb9900ff7a95e6a28092ab0a9e1d81098f41634e",
+      "path": "references/hallucination-patterns.md",
+      "url": "https://raw.githubusercontent.com/jam-cc/paper-review.skill/bb9900ff7a95e6a28092ab0a9e1d81098f41634e/references/hallucination-patterns.md",
+      "sha256": "405828690473d2b2d9236e82619716891908abe95fbde869c99058613d8012df"
+    },
+    {
+      "upstream": "ml-paper-writing",
+      "repo": "Orchestra-Research/AI-Research-SKILLs",
+      "commit": "773a52944ba4747a18bd4ae9ade53fff041adcbc",
+      "path": "20-ml-paper-writing/ml-paper-writing/SKILL.md",
+      "url": "https://raw.githubusercontent.com/Orchestra-Research/AI-Research-SKILLs/773a52944ba4747a18bd4ae9ade53fff041adcbc/20-ml-paper-writing/ml-paper-writing/SKILL.md",
+      "sha256": "96733e6d758642d792ed15b7c08eb90548d4775099368cd72a8312127f2fe911"
+    },
+    {
+      "upstream": "ml-paper-writing",
+      "repo": "Orchestra-Research/AI-Research-SKILLs",
+      "commit": "773a52944ba4747a18bd4ae9ade53fff041adcbc",
+      "path": "20-ml-paper-writing/ml-paper-writing/references/writing-guide.md",
+      "url": "https://raw.githubusercontent.com/Orchestra-Research/AI-Research-SKILLs/773a52944ba4747a18bd4ae9ade53fff041adcbc/20-ml-paper-writing/ml-paper-writing/references/writing-guide.md",
+      "sha256": "ed5ff6960a04bd385b6a28577a26428056e35920001b1916240a4eb563f54709"
+    },
+    {
+      "upstream": "ml-paper-writing",
+      "repo": "Orchestra-Research/AI-Research-SKILLs",
+      "commit": "773a52944ba4747a18bd4ae9ade53fff041adcbc",
+      "path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/Orchestra-Research/AI-Research-SKILLs/773a52944ba4747a18bd4ae9ade53fff041adcbc/LICENSE",
+      "sha256": "80b5899a9ab121a2d4aae63724f0c11defba7f23da487086932bb9abfb0f2a00"
+    }
+  ]
+}

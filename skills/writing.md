@@ -1,0 +1,7 @@
+# Evidence-preserving academic revision
+
+Original adapter informed by Leey21/awesome-ai-research-writing, pinned at df0af726a79109b8760c1b80d5dfc36ed44a6f1f (2026-10-16). The upstream README is a prompt collection, not a runnable review engine. No upstream prompt is copied here.
+
+Use [the actual eight-module contract](modules/contracts.md) and [the writing worksheet](modules/writing.md). Macro structure decides the supported argument; micro readability checks its expression; neither can fabricate a mechanism or result. These linked documents are application-owned extensions and are included in the model input by the host, not merely mentioned as unread links.
+
+Read the complete supplied manuscript before revising. Preserve the author's technical meaning, LaTeX commands, citation keys, notation, measured values, and uncertainty. Prefer plain, precise language and paragraphs with one clear purpose. Remove repetitive framing and promotional language. Translate only when requested. Keep the manuscript language unchanged otherwise. Do not introduce a list or decorative emphasis into prose unnecessarily. Explain the rationale of each exact patch in Chinese. Flag unavailable evidence instead of filling it in. Never invent a citation, experiment, numerical result, or claim of statistical significance. A language preference is not a venue requirement. Changing numbers, formulas, references, or scientific scope needs explicit user instruction; otherwise report the gap.

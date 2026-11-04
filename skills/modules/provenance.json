@@ -1,0 +1,21 @@
+{
+  "version": "2.0.1",
+  "updated": "2026-10-19",
+  "kind": "Independent Autopaperreview operating worksheets",
+  "coreIds": ["writing", "review", "claims", "citations", "math", "blind", "venue", "latex"],
+  "specialists": {
+    "zhihu-paper-structure": ["writing", "claims", "review"],
+    "zhihu-paper-readability": ["writing", "claims", "math", "citations"],
+    "paper-rebuttal": ["review", "writing", "claims", "citations", "math", "blind", "venue", "latex"]
+  },
+  "sources": [
+    "https://github.com/Leey21/awesome-ai-research-writing",
+    "https://github.com/FanBroWell/AI-paper-reviewer",
+    "https://github.com/chantsss/paper-pre-submission-review",
+    "https://zhuanlan.zhihu.com/p/593195527",
+    "https://zhuanlan.zhihu.com/p/639732057",
+    "https://zhuanlan.zhihu.com/p/602024489"
+  ],
+  "attribution": "Ding Xiaohan (丁霄汉) owns the cited Zhihu articles. Their full text and original examples are not redistributed. Module contracts, decision tables, synthetic examples, completion checks and the author's local prose preferences are independently written extensions, not claimed quotations or official venue requirements.",
+  "integration": "The host loads selected module files into the actual prompt and records SHA-256 hashes. The venue adapter is target-specific; ICLR guidance does not become WWW policy. Multiple Skills do not imply multiple model calls."
+}
