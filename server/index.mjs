@@ -418,7 +418,7 @@ async function runAIJob(id, request, automatic, { signal, progress }) {
       (p.automation.workflow||null) !== (runConfig.workflow||null) ||
       p.automation.model !== runConfig.model
     )
-      throw new Error("模型配置已改变，请重新开启自动修订以确认授权");
+      throw new Error(`模型配置已改变（${p.automation.provider}/${p.automation.model}/${p.automation.workflow||"单模型"} → ${runConfig.provider}/${runConfig.model}/${runConfig.workflow||"单模型"}）；请重新开启自动修订以确认授权`);
     p.comments = p.comments.filter(
       (c) => c.author === "you" && c.status === "open" && !c.addressed && !c.archivedAt,
     );

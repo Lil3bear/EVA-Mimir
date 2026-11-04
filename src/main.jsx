@@ -651,6 +651,11 @@ function App({member}) {
   }, [backgroundActive]);
   const base = project ? `/projects/${project.id}` : "";
   const revisionProvider=health?.revision || health;
+  const automationMismatch=Boolean(project?.automation?.enabled && revisionProvider && (
+    project.automation.provider!==revisionProvider.provider ||
+    (project.automation.workflow||null)!==(revisionProvider.workflow||null) ||
+    project.automation.model!==revisionProvider.model
+  ));
   const revisionAI=revisionProvider?.collaborator ? {...revisionProvider,
     displayName:`${revisionProvider.displayName} → ${revisionProvider.collaborator.vendor} ${revisionProvider.collaborator.displayName} → ${revisionProvider.finalReviewer?`${revisionProvider.finalReviewer.vendor} ${revisionProvider.finalReviewer.displayName}`:"交叉复核"}`,
     apiOrigin:[revisionProvider.apiOrigin,revisionProvider.collaborator.provider==="codex"?"本机 Codex（ChatGPT 账户）":revisionProvider.collaborator.localAuth?`本机 Claude Code（${revisionProvider.collaborator.apiOrigin||"沿用本机服务配置"}）`:revisionProvider.collaborator.apiOrigin,revisionProvider.finalReviewer?"本机 Codex（ChatGPT 账户）":null].filter(Boolean).join(" 和 "),
@@ -1444,6 +1449,7 @@ function App({member}) {
                 }}
               />
             </label>
+            {automationMismatch && <button className="secondary" onClick={() => {setAutoConsent(false);setStartExisting(true);setModal("automation");}}>重新授权自动修订</button>}
             <div className="skill-summary">
               <span>
                 <span className="status-dot green" />
@@ -1631,6 +1637,7 @@ function App({member}) {
       )}
       {modal === "automation" && (
         <Modal title="自动按批注修订" close={() => setModal("")}>
+          {automationMismatch && <p className="warning-text">模型配置已改变：此前授权的是 {project.automation.provider} / {project.automation.model} / {project.automation.workflow || "单模型"}；当前是 {revisionProvider.provider} / {revisionProvider.model} / {revisionProvider.workflow || "单模型"}。需要重新勾选下方同意并开启，之前的自动授权不会沿用。</p>}
           <p className="disclosure">
             开启后，新保存的用户批注会在后台合并处理。源码、批注及日志将发送到{" "}
             {revisionAI?.provider === "codex" ? "Codex 云端模型" : revisionAI?.apiOrigin || "兼容 API"}
