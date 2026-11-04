@@ -6,6 +6,7 @@ import { structuredRequest } from "./model-api.mjs";
 import { executeClaude } from "./claude-cli.mjs";
 import { executePi } from "./pi-cli.mjs";
 import { executeDsh } from "./dsh-cli.mjs";
+import { executeGemini } from "./gemini.mjs";
 import {sourceTargets,materializeTargets} from "./source-targets.mjs";
 
 const patch = z
@@ -115,7 +116,7 @@ export async function generate(project, revision, request, config, options = {})
       if (options.signal?.aborted) throw error;
       throw new Error(`联合修订 ${role}（${model.vendor} ${model.model}）未通过：${error.message}。未应用任何联合修改。`);
     }
-    stages.push({role,provider:model.provider,vendor:model.vendor,model:model.model,transport:model.revisionTransport==="claude-cli"?"claude-cli":model.apiFormat,
+    stages.push({role,provider:model.provider,vendor:model.vendor,model:model.model,transport:model.revisionTransport==="claude-cli"?"claude-cli":model.provider==="dsh"?"dsh-cli":model.provider==="gemini"?"gemini-api":model.apiFormat,
       ...(model.localAuth?{localAuth:true,configuredOrigin:model.configuredOrigin||null,...(model.reasoningEffort?{reasoningEffort:model.reasoningEffort}:{}),...(model.nativeStructuredOutput===false?{outputMode:"json-text"}:{})}:{}),
       summary:result.summary,coverage:result.coverage,patches:result.patches,findings:result.findings});
     if(model.provider==="codex")stages.at(-1).transport="codex-cli";
@@ -143,7 +144,7 @@ async function generateSingle(
     request={...request,instructions:`${request.instructions||""}\nLOCAL REVISION ONLY: global rewriting is disabled. ${scope} Every patch must reference at least one supplied comment ID. Use the complete paper as alignment context.`};
   }
   onProgress({ phase: "reading", message: config.manuscriptContext ? "读取完整正文、Bib、批注与 Skills；类文件和 BST 仅用于编译，正文不截断" : "读取本轮源码、批注与所选 Skills" });
-  if (config.provider !== "codex" && config.provider !== "dsh" && !config.apiKey && !(request.mode==="revise" && config.localAuth && config.revisionTransport==="claude-cli"))
+  if (config.provider !== "codex" && config.provider !== "dsh" && config.provider !== "gemini" && !config.apiKey && !(request.mode==="revise" && config.localAuth && config.revisionTransport==="claude-cli"))
     throw new Error("尚未配置 API Key，请打开模型设置。不会生成模拟审稿结果。");
   const documents = Object.entries(revision.files)
     .filter(([f]) => textExt.test(f) && !(config.manuscriptContext && /\.(cls|bst)$/i.test(f)))
@@ -198,6 +199,8 @@ async function generateSingle(
     let raw;
     try {
       raw=config.provider === "dsh" ? await executeDsh(config, {
+        instructions:instructions+correction,input:JSON.stringify(input),schema:requestSchema,signal,onProgress,
+      }) : config.provider === "gemini" ? await executeGemini(config, {
         instructions:instructions+correction,input:JSON.stringify(input),schema:requestSchema,signal,onProgress,
       }) : config.revisionTransport === "pi-cli" ? await executePi(config, {
         instructions:instructions+correction,input:JSON.stringify(input),schema:requestSchema,signal,onProgress,

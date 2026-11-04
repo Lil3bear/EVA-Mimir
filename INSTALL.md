@@ -21,6 +21,22 @@
 - LaTeX 可选：没有 `pdflatex` 仍可编辑、批注、审稿和翻译；编译 PDF 需要 MacTeX / TeX Live。
 - Overleaf 同步需要有效 Git token；token 不要发到聊天里。
 
+## 可选：Gemini 联合修订
+
+安装包本身不包含 Gemini key。要让 DSH 和 Gemini 一起修改：
+
+1. 在 <https://aistudio.google.com/apikey> 建 key。
+2. 保存到 `~/.config/autopaperreview/gemini.json`（权限 0600）：
+
+```json
+{"apiKey":"...","model":"gemini-3.5-flash"}
+```
+
+3. 重启 mimir / DSH。修订会变成三个阶段：DSH 起草 → Gemini 复核 → DSH 终检；仍走提案、定位校验和编译，不会自动应用。
+4. 不需要 Gemini 时，移走这个文件并重启，或设置 `MIMIR_GEMINI_COWRITER=0`。
+
+不要把 key 发到聊天、源码或 README。
+
 ## 数据位置
 
 ```text

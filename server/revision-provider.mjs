@@ -18,7 +18,7 @@ export async function revisionProvider(primary, id, filename, officialFile=path.
 
 export function publicRevisionProvider(config) {
   return {model:config.model,displayName:config.modelName||config.model,provider:config.provider,vendor:config.vendor || (config.provider==="codex"?"Codex":"主服务"),
-    apiOrigin:config.localAuth?config.configuredOrigin||null:config.provider==="codex"?null:config.provider==="dsh"?"DSH local harness":new URL(config.baseURL).origin,backup:Boolean(config.backup),
+    apiOrigin:config.localAuth?config.configuredOrigin||null:config.provider==="codex"?null:config.provider==="dsh"?"DSH local harness":config.provider==="gemini"?"Gemini API":new URL(config.baseURL).origin,backup:Boolean(config.backup),
     ...(config.localAuth?{localAuth:true}:{}),
     ...(config.teamMode?{teamMode:config.teamMode,excludedModels:config.excludedModels}:{}),
     ...(config.coWriter ? {workflow:config.workflow,collaborator:publicRevisionProvider(config.coWriter)} : {}),
@@ -26,6 +26,10 @@ export function publicRevisionProvider(config) {
 }
 
 export function collaborativeRevision(writer, primary, model, {localAuth=false,localOrigin,crosscheckModel,teamMode}={}) {
+  if(process.env.MIMIR_GEMINI_COWRITER==="1" && writer.provider==="dsh") {
+    const geminiModel=process.env.GEMINI_MODEL || model || "gemini-3.5-flash";
+    return {...writer,workflow:`dsh-gemini-v1:${geminiModel}`,coWriter:{provider:"gemini",vendor:"Gemini",model:geminiModel,modelName:"3.5 Flash",apiFormat:"gemini-json",revisionTransport:"gemini-api",localRevisionOnly:writer.localRevisionOnly}};
+  }
   if(teamMode==="dual") {
     if(!localAuth || primary.provider!=="codex" || crosscheckModel!=="gpt-6.1-sol" || writer.vendor!=="DeepSeek 官方" || writer.baseURL!=="https://api.deepseek.com/v1" || writer.model!=="deepseek-flash")
       throw Error("双模型修订仅支持明确授权的官方 DeepSeek 与本机 GPT 6.1");

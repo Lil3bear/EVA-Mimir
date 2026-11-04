@@ -269,7 +269,7 @@ async function saveAIResult(p, rev, input, runConfig, result) {
     vendor:runConfig.vendor||null,
     modelName:runConfig.modelName||runConfig.model,
     collaboration:result.collaboration||null,
-    transport:runConfig.provider === "dsh" ? "dsh-cli" : runConfig.revisionTransport === "pi-cli" ? "pi-cli" : runConfig.provider === "codex" ? "codex-cli" : input.mode === "revise" && runConfig.revisionTransport === "claude-cli" ? "claude-cli" : runConfig.apiFormat,
+    transport:runConfig.provider === "dsh" ? "dsh-cli" : runConfig.provider === "gemini" ? "gemini-api" : runConfig.revisionTransport === "pi-cli" ? "pi-cli" : runConfig.provider === "codex" ? "codex-cli" : input.mode === "revise" && runConfig.revisionTransport === "claude-cli" ? "claude-cli" : runConfig.apiFormat,
     summary: result.summary,
     coverage: result.coverage,
     outcome:input.mode==="review"?"reviewed":patches.length?"proposed":"no_changes",

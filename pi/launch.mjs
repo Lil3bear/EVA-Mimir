@@ -29,8 +29,9 @@ export async function dshBackendConfig() {
     if (error.code === "ENOENT") return {};
     throw new Error("本地模型配置无法读取");
   });
-  // Model choice only. Authentication is owned by the local Harness.
-  return {model: saved.model || "deepseek-flash"};
+  const gemini = await readFile(path.join(homedir(), ".config/autopaperreview/gemini.json"), "utf8").then(JSON.parse).catch(() => ({}));
+  // Model choices only. Authentication is owned by the local Harness / Gemini.
+  return {model: saved.model || "deepseek-flash", gemini: Boolean(gemini.apiKey), geminiModel: gemini.model || "gemini-3.5-flash"};
 }
 
 async function freePort() {
@@ -45,7 +46,7 @@ async function freePort() {
 }
 
 export async function startWriting({directory = dataRoot, onExit = () => {}, execPath = process.execPath, env: extraEnv = null} = {}) {
-  const {model} = await dshBackendConfig();
+  const {model, gemini, geminiModel} = await dshBackendConfig();
   await mkdir(directory,{recursive:true,mode:0o700});
   const lock = path.join(directory,"writer.json"), instance = randomUUID();
   for (let attempt=0;attempt<2;attempt++) {
@@ -88,6 +89,7 @@ export async function startWriting({directory = dataRoot, onExit = () => {}, exe
     SETTINGS_LOCKED: "1", AI_PROVIDER: "dsh", OPENAI_BASE_URL: "https://api.deepseek.com/v1",
     OPENAI_MODEL: model,
     AI_API_FORMAT: "chat-json", REVISION_TRANSPORT: "dsh-cli", LOCAL_REVISION_ONLY: "1",
+    MIMIR_GEMINI_COWRITER: gemini ? "1" : "0", GEMINI_MODEL: geminiModel,
     ARCHIVE_APPLIED_COMMENTS: "0", TRANSLATION_MODEL: process.env.TRANSLATION_MODEL || model, PI_CODING_AGENT_DIR: agent,
     MIMIR_PI_SESSION_DIR: path.join(directory, "pi-sessions"),
     OVERLEAF_CREDENTIAL_DIR: path.join(directory, "credentials/overleaf"),

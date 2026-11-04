@@ -655,11 +655,13 @@ function App({member}) {
     displayName:`${revisionProvider.displayName} → ${revisionProvider.collaborator.vendor} ${revisionProvider.collaborator.displayName} → ${revisionProvider.finalReviewer?`${revisionProvider.finalReviewer.vendor} ${revisionProvider.finalReviewer.displayName}`:"交叉复核"}`,
     apiOrigin:[revisionProvider.apiOrigin,revisionProvider.collaborator.provider==="codex"?"本机 Codex（ChatGPT 账户）":revisionProvider.collaborator.localAuth?`本机 Claude Code（${revisionProvider.collaborator.apiOrigin||"沿用本机服务配置"}）`:revisionProvider.collaborator.apiOrigin,revisionProvider.finalReviewer?"本机 Codex（ChatGPT 账户）":null].filter(Boolean).join(" 和 "),
   } : revisionProvider;
-  const revisionLimits=revisionProvider?.collaborator?.model==="claude-opus-5-5"?"八分钟，客户端费用估算上限为 4 美元":revisionProvider?.collaborator?.model==="claude-fable-5-1"?"八分钟，客户端费用估算上限为 6 美元":"四分钟，客户端费用估算上限为 2 美元";
+  const revisionLimits=revisionProvider?.collaborator?.provider==="gemini"?"八分钟，Gemini 与 DSH 的额度分别计算":revisionProvider?.collaborator?.model==="claude-opus-5-5"?"八分钟，客户端费用估算上限为 4 美元":revisionProvider?.collaborator?.model==="claude-fable-5-1"?"八分钟，客户端费用估算上限为 6 美元":"四分钟，客户端费用估算上限为 2 美元";
   const revisionLocalNotice=revisionProvider?.collaborator?.localAuth?"协作阶段沿用本机 Claude Code 的认证和服务配置；如果本机配置了 UUAPI，仍会经过该网关。不把登录凭据发往云端，但论文内容会发送给所选模型服务。":"";
-  const revisionDisclosure=revisionProvider?.teamMode==="dual"
+  const revisionDisclosure=revisionProvider?.collaborator?.provider==="gemini"
+    ? `联合修订发送完整正文与 Bib：DSH 起草，Gemini 独立复核并改写补丁，DSH 再做终检。共三个阶段；两个服务的额度分别计算，${revisionLimits}。任一阶段失败都不应用。`
+    : revisionProvider?.teamMode==="dual"
     ? "双模型修订发送完整正文与 Bib：官方 DeepSeek 起草，本机 GPT 6.1 经 Codex 独立复核；Claude 因额度不足未参与。GPT 单次最多十分钟。"
-    : `联合修订发送完整正文与 Bib，不截断正文；类文件和 BST 只用于编译。共三个阶段，Claude 单次调用最多三轮推理、${revisionLimits}（非实际账单或订阅用量保证）。${revisionLocalNotice}${revisionProvider?.finalReviewer?"GPT 6.1 经本机 Codex 交叉复核，单次最多十分钟。":""}`;
+    : `联合修订发送完整正文与 Bib，不截断正文；类文件和 BST 只用于编译。共三个阶段，${revisionLimits}（非实际账单或订阅用量保证）。${revisionLocalNotice}${revisionProvider?.finalReviewer?"GPT 6.1 经本机 Codex 交叉复核，单次最多十分钟。":""}`;
   const dialogAI=aiMode === "revise" ? revisionAI : health;
   const openCount =
     project?.comments.filter((c) => c.status === "open"&&!c.archivedAt).length || 0;
