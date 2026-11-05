@@ -48,6 +48,37 @@ export function planSync(base, local, remote) {
   return changes;
 }
 
+
+/**
+ * Remote-only changes are pulled into the local file map. If both sides changed
+ * the same file, stop before touching either copy.
+ */
+export function planPull(base, local, remote) {
+  const next = {...local}, pulled = [], conflicts = [];
+  for (const name of new Set([...Object.keys(base), ...Object.keys(local), ...Object.keys(remote)])) {
+    safePath(name);
+    const b = base[name], l = local[name], r = remote[name];
+    if (r === b || r === l) continue;
+    if (l === b) {
+      if (r === undefined) delete next[name];
+      else next[name] = r;
+      pulled.push(name);
+    } else conflicts.push(name);
+  }
+  if (conflicts.length)
+    throw new Error(`Overleaf 与本地同时修改了这些文件，未拉取或推送任何内容：${conflicts.join("、")}`);
+  return {files: next, pulled};
+}
+
+export async function pullOverleaf(repository, base, files, token, {signal, execute = git} = {}) {
+  const options = {cwd: repository.directory, token, signal};
+  await execute(["fetch", "origin", repository.branch], options);
+  const head = (await execute(["rev-parse", "FETCH_HEAD"], options)).toString().trim();
+  const remote = await readOverleafFiles({...repository, head}, execute);
+  const {files: next, pulled} = planPull(base, files, remote);
+  return {head, files: next, pulled, remote};
+}
+
 export function git(args, { cwd, token, input, signal, index } = {}) {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) return reject(signal.reason);

@@ -3,12 +3,31 @@ import assert from "node:assert/strict";
 import {
   overleafURL,
   planSync,
+  planPull,
   git,
   pushOverleaf,
 } from "../server/overleaf.mjs";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+test("pull aligns remote-only changes without overwriting local-only edits", () => {
+  const result = planPull(
+    {"main.tex": "base", "local.tex": "base", "gone.tex": "old"},
+    {"main.tex": "base", "local.tex": "local edit", "gone.tex": "old"},
+    {"main.tex": "remote edit", "local.tex": "base"},
+  );
+  assert.deepEqual(result.pulled.sort(), ["gone.tex", "main.tex"]);
+  assert.equal(result.files["main.tex"], "remote edit");
+  assert.equal(result.files["local.tex"], "local edit");
+  assert.equal("gone.tex" in result.files, false);
+});
+test("pull refuses a same-file two-sided edit", () => {
+  assert.throws(
+    () => planPull({"main.tex": "base"}, {"main.tex": "local"}, {"main.tex": "remote"}),
+    /同时修改/,
+  );
+});
+
 test("only credential-free Overleaf Cloud HTTPS Git URLs are accepted", () => {
   const expected = "https://git@git.overleaf.com/abc123";
   assert.equal(overleafURL("https://git.overleaf.com/abc123"), expected);

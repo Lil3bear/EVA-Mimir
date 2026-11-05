@@ -1739,8 +1739,8 @@ function App({member}) {
             />
           </label>
           <p className="disclosure">
-            仅向这个 Overleaf
-            项目同步已成功编译的源文件，不同步批注和登录信息。检测到同一文件在两端都有修改时停止同步，不强制覆盖。token
+            先拉取这个 Overleaf
+            项目的最新源文件，把远端单独修改对齐进本地，再推送本地修改；同一文件在两端都修改时停止同步，不强制覆盖。不同步批注和登录信息。token
             经认证后加密保存在服务器独立凭据目录，不写入项目、不发送给模型；退出登录或服务重启后仍可复用。团队成员可复用本项目凭据进行同步。凭据失效或撤销后需重新认证。
           </p>
           {project?.overleaf && <p className="disclosure">{project.overleafCredentialSaved ? "已加密保存 Git token，无需重复填写。" : "尚未保存 Git token；若系统 Git 凭据不可用，请填写一次并连接。"}</p>}
@@ -1750,7 +1750,7 @@ function App({member}) {
               checked={autoPush}
               onChange={(e) => setAutoPush(e.target.checked)}
             />
-            <span>每次自动修订并编译成功后，自动同步至此 Overleaf 项目</span>
+            <span>每次自动修订并编译成功后，自动拉取远端修改、对齐并同步</span>
           </label>
           <label className="checkbox-row">
             <input
@@ -1817,7 +1817,7 @@ function App({member}) {
               }
             >
               <CloudUpload size={14} />
-              同步已编译版本
+              拉取、对齐并同步
             </button>
           </div>
         </Modal>

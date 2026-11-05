@@ -29,7 +29,7 @@ import { codexStatus } from "./codex.mjs";
 import { Jobs } from "./jobs.mjs";
 import {stopPiRequests} from "./pi-cli.mjs";
 import { experienceStore } from "./experience.mjs";
-import { connectOverleaf, pushOverleaf, overleafURL, readOverleafFiles } from "./overleaf.mjs";
+import { connectOverleaf, pushOverleaf, pullOverleaf, overleafURL, readOverleafFiles } from "./overleaf.mjs";
 import { overleafCredentials } from "./overleaf-credentials.mjs";
 import {recordSourceCommit,sourceCommitDiff} from "./source-history.mjs";
 import {TRACE_ID,buildTrace,summarizeTrace} from "./traces.mjs";
@@ -381,22 +381,32 @@ async function syncProject(p, options = {}) {
     throw new Error("请先成功编译当前版本，再同步至 Overleaf");
   const base = await getRevision(p.id, p.overleaf.baseRevision);
   const rev = await getRevision(p.id, p.revision);
+  const token = await syncTokens.get(p.id, p.overleaf.url);
   try {
+    options.progress?.({phase:"syncing", message:"拉取 Overleaf 最新版本并对齐远端修改"});
+    const pulled = await pullOverleaf(p.overleaf, base.files, rev.files, token, options);
+    let current = rev;
+    if (pulled.pulled.length) {
+      options.progress?.({phase:"syncing", message:`拉取 ${pulled.pulled.length} 个远端修改，正在编译对齐后的版本`, files:pulled.pulled});
+      const compiled = await compile(p, pulled.files, {signal:options.signal});
+      current = await snapshot(p, pulled.files, "从 Overleaf 拉取并对齐", compiled, {provenance:{kind:"overleaf-pull"}});
+      p.overleaf.head = pulled.head;
+    }
     const result = await pushOverleaf(
       p.overleaf,
       base.files,
-      rev.files,
-      await syncTokens.get(p.id, p.overleaf.url),
-      {...options,revisionMetadata:{revision:rev.id,sourceCommit:rev.gitCommit||null,provider:rev.provenance?.provider||null,model:rev.provenance?.model||null}},
+      current.files,
+      token,
+      {...options,revisionMetadata:{revision:current.id,sourceCommit:current.gitCommit||null,provider:current.provenance?.provider||null,model:current.provenance?.model||null}},
     );
     Object.assign(p.overleaf, {
-      baseRevision: rev.id,
+      baseRevision: current.id,
       head: result.head,
       lastSynced: new Date().toISOString(),
       lastError: "",
     });
     p.overleaf.syncHistory ||= [];
-    p.overleaf.syncHistory.push({revision:rev.id,sourceCommit:rev.gitCommit||null,remoteCommit:result.head,time:p.overleaf.lastSynced,model:rev.provenance?.model||null,provider:rev.provenance?.provider||null});
+    p.overleaf.syncHistory.push({revision:current.id,sourceCommit:current.gitCommit||null,remoteCommit:result.head,time:p.overleaf.lastSynced,model:current.provenance?.model||null,provider:current.provenance?.provider||null});
     await saveProject(p);
     return result;
   } catch (error) {
