@@ -248,6 +248,36 @@ export async function prepareSync(
   return { head, modes, changes: planSync(base, files, remote) };
 }
 
+
+/**
+ * Replace the remote tree with the supplied local files while keeping the
+ * remote commit as the parent. This is a fast-forward push, not a force push;
+ * Overleaf history still contains the previous tree.
+ */
+export async function replaceOverleaf(repository, files, token, {signal, progress = () => {}, execute = git, revisionMetadata = null} = {}) {
+  const options = {cwd: repository.directory, token, signal};
+  await execute(["fetch", "origin", repository.branch], options);
+  const head = (await execute(["rev-parse", "FETCH_HEAD"], options)).toString().trim();
+  const index = path.join(repository.directory, `replace-${randomUUID()}.index`);
+  const indexOptions = {...options, index};
+  try {
+    await execute(["read-tree", "--empty"], indexOptions);
+    for (const name of Object.keys(files)) {
+      safePath(name);
+      const hash = (await execute(["hash-object", "-w", "--stdin"], {...indexOptions, input: Buffer.from(files[name], "base64")})).toString().trim();
+      await execute(["update-index", "--add", "--cacheinfo", "100644", hash, name], indexOptions);
+    }
+    const tree = (await execute(["write-tree"], indexOptions)).toString().trim();
+    const commit = (await execute(["-c", "user.name=Autopaperreview", "-c", "user.email=autopaperreview@localhost", "commit-tree", tree, "-p", head], {...indexOptions, input: `Autopaperreview: replace Overleaf source with local workspace\n${revisionMetadata ? "\n" + JSON.stringify(revisionMetadata) + "\n" : ""}`})).toString().trim();
+    progress({phase:"syncing", message:`以本地源文件替换 Overleaf（保留远端历史，${Object.keys(files).length} 个文件）`});
+    await execute(["push", "origin", `${commit}:${repository.branch}`], indexOptions);
+    return {head: commit, files: Object.keys(files), message: `已用 ${Object.keys(files).length} 个本地文件替换 Overleaf`};
+  } finally {
+    await rm(index, {force:true});
+    await rm(`${index}.lock`, {force:true});
+  }
+}
+
 export async function pushOverleaf(
   repository,
   base,

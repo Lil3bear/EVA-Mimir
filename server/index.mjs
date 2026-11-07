@@ -29,7 +29,7 @@ import { codexStatus } from "./codex.mjs";
 import { Jobs } from "./jobs.mjs";
 import {stopPiRequests} from "./pi-cli.mjs";
 import { experienceStore } from "./experience.mjs";
-import { connectOverleaf, pushOverleaf, pullOverleaf, overleafURL, readOverleafFiles } from "./overleaf.mjs";
+import { connectOverleaf, pushOverleaf, pullOverleaf, replaceOverleaf, overleafURL, readOverleafFiles } from "./overleaf.mjs";
 import { overleafCredentials } from "./overleaf-credentials.mjs";
 import {recordSourceCommit,sourceCommitDiff} from "./source-history.mjs";
 import {TRACE_ID,buildTrace,summarizeTrace} from "./traces.mjs";
@@ -383,22 +383,29 @@ async function syncProject(p, options = {}) {
   const rev = await getRevision(p.id, p.revision);
   const token = await syncTokens.get(p.id, p.overleaf.url);
   try {
-    options.progress?.({phase:"syncing", message:"拉取 Overleaf 最新版本并对齐远端修改"});
-    const pulled = await pullOverleaf(p.overleaf, base.files, rev.files, token, options);
-    let current = rev;
-    if (pulled.pulled.length) {
-      options.progress?.({phase:"syncing", message:`拉取 ${pulled.pulled.length} 个远端修改，正在编译对齐后的版本`, files:pulled.pulled});
-      const compiled = await compile(p, pulled.files, {signal:options.signal});
-      current = await snapshot(p, pulled.files, "从 Overleaf 拉取并对齐", compiled, {provenance:{kind:"overleaf-pull"}});
+    let current = rev, pulled = null;
+    if (!options.replace) {
+      options.progress?.({phase:"syncing", message:"拉取 Overleaf 最新版本并对齐远端修改"});
+      pulled = await pullOverleaf(p.overleaf, base.files, rev.files, token, options);
+      if (pulled.pulled.length) {
+        options.progress?.({phase:"syncing", message:`拉取 ${pulled.pulled.length} 个远端修改，正在编译对齐后的版本`, files:pulled.pulled});
+        const compiled = await compile(p, pulled.files, {signal:options.signal});
+        current = await snapshot(p, pulled.files, "从 Overleaf 拉取并对齐", compiled, {provenance:{kind:"overleaf-pull"}});
+      }
       p.overleaf.head = pulled.head;
     }
-    const result = await pushOverleaf(
-      p.overleaf,
-      base.files,
-      current.files,
-      token,
-      {...options,revisionMetadata:{revision:current.id,sourceCommit:current.gitCommit||null,provider:current.provenance?.provider||null,model:current.provenance?.model||null}},
-    );
+    const metadata = {revision:current.id,sourceCommit:current.gitCommit||null,provider:current.provenance?.provider||null,model:current.provenance?.model||null};
+    if (options.pullOnly) {
+      const head = pulled?.head || p.overleaf.head;
+      Object.assign(p.overleaf, {baseRevision:current.id, head, lastSynced:new Date().toISOString(), lastError:""});
+      p.overleaf.syncHistory ||= [];
+      p.overleaf.syncHistory.push({revision:current.id,sourceCommit:current.gitCommit||null,remoteCommit:head,time:p.overleaf.lastSynced,model:current.provenance?.model||null,provider:current.provenance?.provider||null,pullOnly:true});
+      await saveProject(p);
+      return {head, files:pulled?.pulled||[], message:`已从 Overleaf 拉取 ${pulled?.pulled.length||0} 个文件，未推送`};
+    }
+    const result = options.replace
+      ? await replaceOverleaf(p.overleaf, current.files, token, {...options, revisionMetadata:metadata})
+      : await pushOverleaf(p.overleaf, base.files, current.files, token, {...options, revisionMetadata:metadata});
     Object.assign(p.overleaf, {
       baseRevision: current.id,
       head: result.head,
@@ -662,6 +669,29 @@ Compilation checks do not establish scientific validity. Source-level review doe
 \section{Conclusion}
 Versioned annotations and explicit patch approval make the revision process inspectable. Scientific decisions and final acceptance of changes remain with the author.
 \end{document}`;
+
+const folderAllowed = /\.(tex|bib|sty|cls|bst|txt|md|csv|pdf|png|jpe?g|eps|svg|otf|ttf)$/i;
+async function readFolderFiles(root) {
+  const files = {}, total = {size:0};
+  async function walk(dir) {
+    for (const entry of await readdir(dir, {withFileTypes:true})) {
+      if (entry.name.startsWith(".")) continue;
+      const full = path.join(dir, entry.name);
+      const rel = path.relative(root, full);
+      if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) throw new Error("目录路径越界");
+      if (entry.isSymbolicLink()) throw new Error(`不允许符号链接：${rel}`);
+      if (entry.isDirectory()) { await walk(full); continue; }
+      if (!entry.isFile() || !folderAllowed.test(rel)) continue;
+      const info = await stat(full);
+      total.size += info.size;
+      if (info.size > 20*1024*1024 || total.size > 80*1024*1024) throw new Error("本地目录文件过大");
+      files[rel.split(path.sep).join("/")] = (await readFile(full)).toString("base64");
+    }
+  }
+  await walk(root);
+  if (!Object.keys(files).some(name => /\.tex$/i.test(name))) throw new Error("目录中没有 LaTeX 源文件");
+  return files;
+}
 app.post(
   "/api/projects/import",
   upload.single("file"),
@@ -699,6 +729,23 @@ app.post(
       trusted: true,
     };
     await snapshot(p, files, "导入项目");
+    await sendProject(res, p);
+  }),
+);
+
+app.post(
+  "/api/projects/:id/import-folder",
+  locked(async (req, res) => {
+    const input = z.object({path:z.string().min(1), consent:z.literal(true)}).parse(req.body);
+    if (!path.isAbsolute(input.path)) throw new Error("需要绝对路径");
+    const root = path.resolve(input.path);
+    const info = await stat(root);
+    if (!info.isDirectory()) throw new Error("不是目录");
+    const files = await readFolderFiles(root);
+    const p = await getProject(req.params.id);
+    p.main = files[p.main] ? p.main : detectMain(files);
+    const compiled = await compile(p, files);
+    await snapshot(p, files, "从本地目录导入并编译", compiled, {provenance:{kind:"folder-import", source:root}});
     await sendProject(res, p);
   }),
 );
@@ -1227,7 +1274,7 @@ app.delete("/api/projects/:id/overleaf/credentials", locked(async (req,res) => {
 app.post(
   "/api/projects/:id/overleaf/push",
   wrap(async (req, res) => {
-    z.object({ consent: z.literal(true) }).parse(req.body);
+    const input = z.object({ consent: z.literal(true), replace: z.boolean().default(false), pullOnly: z.boolean().default(false) }).parse(req.body);
     await getProject(req.params.id);
     const job = jobs.enqueue(
       req.params.id,
@@ -1235,7 +1282,7 @@ app.post(
         withProjectLock(
           req.params.id,
           async () =>
-            syncProject(await getProject(req.params.id), { signal, progress }),
+            syncProject(await getProject(req.params.id), { signal, progress, replace: input.replace, pullOnly: input.pullOnly }),
           signal,
         ),
       { title: "同步至 Overleaf" },

@@ -33,6 +33,7 @@ import {
   ZoomOut,
   Activity,
   Square,
+  CloudDownload,
   CloudUpload,
   Languages,
   LogOut,
@@ -1792,6 +1793,21 @@ function App({member}) {
             >
               <ExternalLink size={14} />
               连接 / 保存设置
+            </button>
+            <button
+              className="secondary"
+              disabled={!project?.overleaf || !syncConsent || !!busy || !!backgroundActive}
+              onClick={() =>
+                act("拉取线上版本", async () => {
+                  setActivity(
+                    (await api(`${base}/overleaf/push`, {method:"POST", body:{consent:true,pullOnly:true}})).job,
+                  );
+                  setModal("");
+                })
+              }
+            >
+              <CloudDownload size={14} />
+              仅拉取线上版本
             </button>
             <button
               className="primary"
