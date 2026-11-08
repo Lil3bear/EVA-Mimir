@@ -135,7 +135,7 @@ export function git(args, { cwd, token, input, signal, index } = {}) {
     const timer = setTimeout(() => {
       timedOut = true;
       stop();
-    }, 90000);
+    }, 180000);
     signal?.addEventListener("abort", stop, { once: true });
     child.stdin.on("error", () => {});
     child.stdout.on("data", (chunk) => {
